@@ -103,6 +103,22 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   rank's shard, labeled by rank). Nothing about the dataset is written to disk
   or into `report.html`: the shareable artifact stays dataset-free, and the
   live view dies with the trainer process.
+- `realtime_chat.py` — interactive demo of REAL-TIME (inference-time)
+  training: one loaded model chats through the normal generator AND trains
+  its LoRA adapter in place (`exllamav3.training.RealtimeQLoRA`). `/learn
+  <corrected reply>` retrains the last exchange, `/ingest file.jsonl` feeds a
+  batch of samples, `/lr` sets the constant learning rate live, `/unload`
+  compares against the base model. The coordinator alternates serving and
+  training under a readers/writer lock, pushes updated adapter weights into
+  the runtime LoRA slots in memory after every ingest (no save/load
+  round-trip), nukes the generator's page table on each update (cached KV is
+  stale after a weight change; target only `q/o/gate/up/down_proj` for an
+  adapter-free KV cache instead), and writes timestamped rollback
+  checkpoints (ordinary PEFT dirs — they load everywhere the offline
+  trainers' adapters do). The script doubles as the reference wiring for
+  server backends (e.g. tabbyAPI's `backends/exllamav3/model.py`); the
+  `[integration]`-marked lines are the complete glue. CPU-tested in
+  `tests/test_realtime.py`.
 - `qlora_validate_native.py` — the correctness gates: compares the
   differentiable training forward against exllamav3's own inference forward.
   Run this FIRST on any new model/architecture.

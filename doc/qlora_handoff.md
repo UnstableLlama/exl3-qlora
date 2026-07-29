@@ -4566,6 +4566,87 @@ KL all-reduce; simpo needs nothing extra).
 
 ---
 
+### Session 49 — real-time (inference-time) training: `RealtimeQLoRA` serve-and-train coordinator
+
+> 2026-07-29. Branch `claude/exllama-realtime-training-429cz5`.
+> Container-verified (new `tests/test_realtime.py` CPU suite passes, plus
+> chat_turns/chat_jinja/preference/run_report regression); **nothing
+> box-verified yet** — smoke list below. Pure addition: one new package
+> module, one new script, no shared code paths changed.
+
+**The idea** (pineapple's request): one loaded EXL3 model both serves
+generation and trains its LoRA adapter, alternating — "keeping the adapter +
+optimizer loaded, like sampling during training, but inverted." The two
+critical enablers already existed: the training forward reconstructs the
+decoder over the *same* loaded modules the inference forward uses (no second
+model copy), and `NativeLlamaQLoRA.apply_to_native()` pushes trained A/B into
+the native runtime LoRA slots in memory (no save/load round-trip). This
+session added the coordination layer.
+
+**What was built:**
+- `exllamav3/training/realtime.py` — `RealtimeQLoRA` + `RealtimeConfig`
+  (exported from `exllamav3.training`). Owns a `NativeLlamaQLoRA` + AdamW +
+  global step counter, kept alive across calls. `ingest(samples)` trains
+  through an array of samples at the configured batch/grad-accum
+  (token-weighted accumulation, same math as the trainer's `--ga-loss token`)
+  until depleted, then `apply_to_native()` + fires update callbacks and
+  returns to serving. Readers/writer lock with writer preference: generation
+  holds `with rt.inference():`, ingest is the writer — in-flight requests
+  drain, new ones wait, a busy server can't starve training.
+  `attach_generator(gen)` registers `gen.pagetable.reset_page_table()` as the
+  update callback (KV nuked on every weight update — decision per pineapple;
+  the config alternative is targeting only `q/o/gate/up/down_proj` so the KV
+  is adapter-free and nothing needs invalidating) and gives ingest a
+  belt-and-suspenders drain check on `num_remaining_jobs()`. Constant lr,
+  externally settable (`rt.lr = 5e-5` or `ingest(..., lr=...)`) — a stream
+  has no epochs, so no schedule. Timestamped checkpoints
+  (`ckpt-YYYYmmdd-HHMMSS-stepN`, per pineapple's naming ask) every
+  `checkpoint_every` steps with `keep_checkpoints` pruning; each is a normal
+  PEFT adapter dir (+ optimizer state + meta json), so it loads in the
+  offline trainers / `LoRA.from_directory` / PEFT, and
+  `RealtimeQLoRA(..., adapter_dir=...)` resumes it (optimizer state
+  included). Sample forms: pre-tokenized ids/labels, `{"text"}`,
+  `{"prompt","response"}` (separately tokenized, exact mask boundary), and
+  `{"messages"}` via a pluggable `render_segments` callable (the
+  chat_turns/chat_jinja `[(text, supervised)]` contract — kept pluggable
+  because chat_jinja lives in `training/`, not the package; promoting it into
+  the package is the natural follow-up if tabby wants messages ingestion
+  without vendoring).
+- `training/realtime_chat.py` — interactive demo + the reference server
+  wiring (`[integration]`-marked lines are what a backend like tabbyAPI's
+  `backends/exllamav3/model.py` adds). Chats through the model's own Jinja
+  template; `/learn <corrected reply>` retrains the last exchange in place,
+  `/ingest file.jsonl` batch-feeds samples, `/lr`, `/checkpoint`, `/unload`,
+  `/again` for before/after comparison.
+- `tests/test_realtime.py` — CPU suite (stub net/tokenizer): lock semantics
+  incl. writer preference, all encode forms + BOS normalization/truncation,
+  in-order batching + windowing + callback firing, token-weighted mean loss,
+  ingest-blocks-inference threading test, checkpoint naming/cadence/prune +
+  optimizer-state resume, lr control, unload/reload.
+
+**Design decisions (from the pineapple thread, 2026-07-29):** KV nuked on
+every update via `reset_page_table()` with the adapter-free-KV target set as
+the config alternative; constant externally-controllable lr; ingestion =
+array of samples trained to depletion then back to serving; timestamped
+checkpoint names; tabby (`backends/exllamav3/model.py`) is the first
+integration target — OAI-compatible serving is the want; single-GPU (16 GB)
+first, so the coordinator doesn't touch the layer-split/DDP paths at all
+(the underlying net supports split; untested in this mode).
+
+**Box list for next session:**
+1. Smoke `training/realtime_chat.py` on a small model (Llama-3.2-1B EXL3):
+   chat → `/learn` a distinctive correction → `/again` shows it stuck →
+   `/unload` shows base behavior back. Watch VRAM: cache + activations +
+   Adam moments must coexist (seq_len 1–2k, batch 1 on 16 GB).
+2. Latency numbers: wall time of a 1-sample ingest (the "correction" UX
+   case) and of the page-table nuke's re-prefill cost on a warm chat.
+3. The tabby glue: subclass/wrap their exl3 backend, `attach_generator`,
+   read-lock the iterate loop, POST endpoint → `ingest` in an executor
+   thread. (The wrapper deliberately re-implements none of `Model`'s API, so
+   the backend keeps its own loading/config path.)
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
