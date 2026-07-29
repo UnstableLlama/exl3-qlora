@@ -22,11 +22,18 @@ Methods:
   --method dpo   Paired data: each row has a prompt, a CHOSEN completion and a
                  REJECTED completion (--prompt-key/--chosen-key/--rejected-key,
                  TRL "explicit prompt" format; conversational values -- lists of
-                 {role, content} -- are accepted too). One micro-batch of
-                 ``--batch`` pairs runs as 2*batch sequences per forward.
+                 {role, content} -- are accepted too, and a multi-turn prompt
+                 keeps its FULL history as masked context, so completions score
+                 against the turn they answer. Multi-turn prompts need an
+                 explicit --prompt-format; auto is single-turn only). One
+                 micro-batch of ``--batch`` pairs runs as 2*batch sequences per
+                 forward.
   --method kto   UNPAIRED data: each row has a prompt, one completion, and a
                  bool/int label -- True/1 = desirable (--prompt-key/
-                 --completion-key/--label-key). The KL reference point is
+                 --completion-key/--label-key; conversational/multi-turn
+                 prompts as for dpo -- only the final completion is rewarded,
+                 per-step supervision is just one row per assistant turn with
+                 the history-so-far as prompt). The KL reference point is
                  estimated per micro-batch from mismatched prompt/completion
                  pairs (TRL's +1-offset rotation), which needs --batch >= 2.
   --method simpo Paired data, same format/keys as dpo. Reference-free,
@@ -73,11 +80,14 @@ from qlora_train_native import (  # noqa: E402
     ThroughputMeter, StepTimer, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
-    format_prompt_and_eot, extract_single_turn, encode_prompt_response,
+    format_prompt_and_eot,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
     load_dataset_split,
     _FAIL_CTX, _log_failure,
 )
+from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
+                        make_segment_builder, encode_segments,
+                        encode_completion, AUTO_SINGLE_TURN_HINT)
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
@@ -97,16 +107,47 @@ def _load_rows(dataset_name, split, config_name=None):
     return load_dataset_split(dataset_name, split, config_name)
 
 
-def _prompt_text(value):
-    """Prompt column -> (system_text, user_text). Accepts a plain string or a
-    TRL-conversational list of {role, content} messages (last user turn wins;
-    a leading system turn is folded into the chat template)."""
+def _prompt_turns(value):
+    """Prompt column -> normalized turns list. A plain string is a bare user
+    turn; a TRL-conversational list keeps its FULL history -- the whole
+    conversation becomes masked context, so the completion is scored against
+    the turn it actually answers. (The old extract_single_turn collapse broke
+    at the first assistant turn, silently pairing completions with a user turn
+    from the middle of the history.)"""
     if isinstance(value, str):
-        return "", value.strip()
+        v = value.strip()
+        return [{"role": "user", "content": v}] if v else []
     if isinstance(value, list):
-        sys_text, user_text, _ = extract_single_turn(value)
-        return sys_text, user_text
-    return "", ""
+        return extract_turns(value)
+    return []
+
+
+def _encode_prompt_ids(tokenizer, turns, build_prompt, seg_builder):
+    """Render + tokenize a prompt/history as fully-masked context ending with
+    the assistant turn opener. Single-turn shapes ([system?] user) keep the
+    original single-string path, bit-for-bit; multi-turn histories render
+    turn-by-turn (prior assistant turns stay masked -- only the separately
+    encoded completion is ever scored, the TRL semantic). Returns None for a
+    history the format can't render (caller skips and counts the row)."""
+    single = single_turn_shape(turns, need_assistant=False)
+    if single is not None:
+        sys_text, user, _ = single
+        prompt_text = build_prompt(user, system=sys_text or None)
+        ids = tokenizer.encode(
+            prompt_text, add_bos=False, encode_special_tokens=True)[0].tolist()
+        bos = tokenizer.bos_token_id
+        if bos is not None:
+            while len(ids) >= 2 and ids[0] == bos and ids[1] == bos:
+                ids = ids[1:]
+        return ids
+    if seg_builder is None:
+        raise SystemExit(AUTO_SINGLE_TURN_HINT)
+    try:
+        segments = seg_builder(turns, add_generation_prompt=True)
+    except ValueError:
+        return None
+    ids, _ = encode_segments(tokenizer, [(t, False) for t, _ in segments])
+    return ids
 
 
 def _completion_text(value):
@@ -149,19 +190,24 @@ def build_dpo_examples(model, tokenizer, dataset_name, split, seq_len,
         ds = ds.select(range(max_samples))
 
     build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
+    seg_builder = make_segment_builder(prompt_format,
+                                       bos_token=tokenizer.bos_token,
+                                       eos_token=tokenizer.eos_token)
     examples, skipped = [], 0
     for row in ds:
-        sys_text, user = _prompt_text(row.get(prompt_key))
+        turns = _prompt_turns(row.get(prompt_key))
         chosen = _completion_text(row.get(chosen_key))
         rejected = _completion_text(row.get(rejected_key))
-        if not user or not chosen or not rejected:
+        if not turns or not chosen or not rejected:
             skipped += 1
             continue
-        prompt_text = build_prompt(user, system=sys_text or None)
-        prompt_ids, chosen_ids = encode_prompt_response(
-            tokenizer, prompt_text, chosen, eot)
-        _, rejected_ids = encode_prompt_response(
-            tokenizer, prompt_text, rejected, eot)
+        prompt_ids = _encode_prompt_ids(tokenizer, turns, build_prompt,
+                                        seg_builder)
+        if prompt_ids is None:
+            skipped += 1
+            continue
+        chosen_ids = encode_completion(tokenizer, chosen, eot)
+        rejected_ids = encode_completion(tokenizer, rejected, eot)
         chosen_ids = _fit(prompt_ids, chosen_ids, seq_len)
         rejected_ids = _fit(prompt_ids, rejected_ids, seq_len)
         if chosen_ids is None or rejected_ids is None:
@@ -188,17 +234,23 @@ def build_kto_examples(model, tokenizer, dataset_name, split, seq_len,
         ds = ds.select(range(max_samples))
 
     build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
+    seg_builder = make_segment_builder(prompt_format,
+                                       bos_token=tokenizer.bos_token,
+                                       eos_token=tokenizer.eos_token)
     examples, skipped = [], 0
     for row in ds:
-        sys_text, user = _prompt_text(row.get(prompt_key))
+        turns = _prompt_turns(row.get(prompt_key))
         completion = _completion_text(row.get(completion_key))
         label = row.get(label_key)
-        if not user or not completion or label is None:
+        if not turns or not completion or label is None:
             skipped += 1
             continue
-        prompt_text = build_prompt(user, system=sys_text or None)
-        prompt_ids, comp_ids = encode_prompt_response(
-            tokenizer, prompt_text, completion, eot)
+        prompt_ids = _encode_prompt_ids(tokenizer, turns, build_prompt,
+                                        seg_builder)
+        if prompt_ids is None:
+            skipped += 1
+            continue
+        comp_ids = encode_completion(tokenizer, completion, eot)
         comp_ids = _fit(prompt_ids, comp_ids, seq_len)
         if comp_ids is None:
             skipped += 1

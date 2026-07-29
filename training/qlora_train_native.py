@@ -59,6 +59,10 @@ from exllamav3.training.native_llama import NativeLlamaQLoRA
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_report import (RunLogger, decode_example_docs,  # noqa: E402
                         start_live_monitor)
+from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
+                        trim_trailing_context, make_segment_builder,
+                        encode_segments, encode_completion,
+                        AUTO_SINGLE_TURN_HINT)
 
 
 class ThroughputMeter:
@@ -512,17 +516,15 @@ def clean_style_text(s):
 
 def extract_single_turn(messages):
     """Pull (system_text, user_text, assistant_text) from an OpenAI-style
-    ``messages`` list.
+    ``messages`` list. LEGACY: superseded by chat_turns.extract_turns /
+    single_turn_shape -- kept for the comparison arms' identical copies and
+    any external callers.
 
     For single-turn rows (e.g. UnstableLlama/semancy: one user, one assistant,
-    no system message) this is exact. We take the last user turn that precedes
-    the first assistant turn as the prompt and that assistant turn as the
-    target, so the completion-only mask still supervises only the answer. The
-    first system message (if any) is returned separately so the caller can
-    fold it into the chat template via ``build_prompt(user, system=...)``;
-    rows with no system message get ``""`` and behave exactly as before.
-    ``user_text``/``asst_text`` come back ``""`` if either turn is missing so
-    the caller can skip the row.
+    no system message) this is exact. On multi-turn input it silently keeps
+    only the first exchange (it breaks at the FIRST assistant turn, so it can
+    also pick a user turn from the middle of a history) -- which is why the
+    trainers no longer call it.
     """
     sys_text, user_text, asst_text = "", "", ""
     for m in messages or []:
@@ -735,6 +737,41 @@ def load_dataset_split(dataset_name, split, config_name=None):
     return load_dataset(dataset_name, split=split)
 
 
+def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
+                              clean_text, min_response_words,
+                              uppercase_response):
+    """Segment-render one multi-turn conversation into an (input_ids, labels)
+    example with only the assistant turns supervised. Returns
+    ``(example, None)`` or ``(None, reason)`` where reason is a short skip
+    label for the caller's counter (``malformed`` / ``short`` /
+    ``unrenderable`` / ``truncated``)."""
+    if clean_text:
+        turns = [dict(t, content=(t["content"] if t["role"] == "system"
+                                  else clean_style_text(t["content"])))
+                 for t in turns]
+        turns = [t for t in turns if t["content"]]
+    turns = trim_trailing_context(turns)
+    roles = [t["role"] for t in turns]
+    if "user" not in roles or "assistant" not in roles:
+        return None, "malformed"
+    asst_words = sum(len(t["content"].split()) for t in turns
+                     if t["role"] == "assistant")
+    if asst_words < min_response_words:
+        return None, "short"
+    if uppercase_response:
+        turns = [dict(t, content=t["content"].upper())
+                 if t["role"] == "assistant" else t for t in turns]
+    try:
+        segments = seg_builder(turns)
+    except ValueError:
+        return None, "unrenderable"
+    input_ids, labels = encode_segments(tokenizer, segments)
+    input_ids, labels = input_ids[:seq_len], labels[:seq_len]
+    if all(l == -100 for l in labels):
+        return None, "truncated"
+    return {"input_ids": input_ids, "labels": labels}, None
+
+
 def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        instruction_key="instruction", context_key="context",
                        response_key="response", split="train",
@@ -753,12 +790,19 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     Two input layouts are supported:
       * flat columns -- instruction_key / context_key / response_key (Alpaca,
         Dolly, ...); context_key may be absent in the dataset (treated as empty).
-      * OpenAI ``messages`` -- pass ``messages_key`` (e.g. "messages") for
-        single-turn user/assistant rows (UnstableLlama/semancy); the user turn
-        becomes the prompt and the assistant turn the supervised response. When
-        set it takes precedence over the flat-column keys. A leading ``system``
-        message, if present, is folded into the chat template's system turn
-        (see :func:`extract_single_turn`); rows without one are unaffected.
+      * OpenAI ``messages`` -- pass ``messages_key`` (e.g. "messages"). When
+        set it takes precedence over the flat-column keys. Single-turn rows
+        ([system?] user assistant, e.g. UnstableLlama/semancy) tokenize
+        exactly as before: user turn -> prompt, assistant turn -> supervised
+        response. Multi-turn rows render EVERY turn via the per-format segment
+        builder (chat_turns.make_segment_builder) and supervise ONLY the
+        assistant turns -- system/user turns and assistant headers are masked
+        to -100, with exact boundaries because each segment is tokenized
+        separately. Multi-turn data needs an explicit --prompt-format (auto's
+        per-arch default_chat_prompt is single-turn only; such rows fail fast
+        with a pointer instead of being silently truncated). Rows with roles
+        the format can't render (e.g. ``tool``) or with no user turn are
+        skipped and counted.
 
     clean_text strips stage directions / inline actions and normalizes
     whitespace (helps play-script style sets like the Shakespeare default, whose
@@ -786,11 +830,35 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         ds = ds.select(range(max_samples))
 
     build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
+    seg_builder = make_segment_builder(prompt_format,
+                                       bos_token=tokenizer.bos_token,
+                                       eos_token=tokenizer.eos_token)
 
     examples = []
+    n_multi, skipped = 0, {}
     for ex in ds:
         if messages_key:
-            sys_text, instr, resp = extract_single_turn(ex.get(messages_key))
+            # Trailing non-assistant turns supervise nothing; trimming them
+            # first also lets a [user, assistant, user] row keep the exact
+            # single-turn path it always took.
+            turns = trim_trailing_context(extract_turns(ex.get(messages_key)))
+            if not any(t["role"] == "assistant" for t in turns):
+                continue  # nothing to supervise (same skip as before)
+            single = single_turn_shape(turns)
+            if single is None:
+                # Genuine multi-turn (or oddly-shaped) row -> segment renderer.
+                if seg_builder is None:
+                    raise SystemExit(AUTO_SINGLE_TURN_HINT)
+                built, reason = _build_multi_turn_example(
+                    tokenizer, seg_builder, turns, seq_len, clean_text,
+                    min_response_words, uppercase_response)
+                if built is None:
+                    skipped[reason] = skipped.get(reason, 0) + 1
+                else:
+                    n_multi += 1
+                    examples.append(built)
+                continue
+            sys_text, instr, resp = single
             ctx = ""
         else:
             sys_text = ""
@@ -802,8 +870,6 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                                 clean_style_text(resp))
         if not resp or len(resp.split()) < min_response_words:
             continue
-        if messages_key and not instr:
-            continue  # malformed messages row: no user turn to prompt with
         # Smoke test: a maximally dense+consistent transform (every token of every
         # response changes), so there's no low-loss path that ISN'T uppercased and
         # it must surface in generation. Only the response is transformed, so it
@@ -827,6 +893,11 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
             continue  # response got truncated away; skip
         examples.append({"input_ids": input_ids, "labels": labels})
 
+    if (n_multi or skipped) and int(os.environ.get("RANK", "0") or 0) == 0:
+        note = ", ".join(f"{v} {k}" for k, v in sorted(skipped.items()))
+        print(f" -- messages: {n_multi} multi-turn rows rendered "
+              f"(assistant turns supervised, user/system masked)"
+              + (f"; skipped {sum(skipped.values())} ({note})" if skipped else ""))
     return examples
 
 
@@ -1315,10 +1386,13 @@ def _run_main():
                     help="Column holding the target response (Alpaca: 'output', "
                          "Dolly: 'response')")
     ap.add_argument("--messages-key", default=None,
-                    help="Column holding OpenAI-style single-turn messages (e.g. "
-                         "'messages' for UnstableLlama/semancy). When set, the "
-                         "user turn is the prompt and the assistant turn the "
-                         "supervised response; --instruction/context/response-key "
+                    help="Column holding OpenAI-style messages (e.g. 'messages' "
+                         "for UnstableLlama/semancy). Single-turn rows: user turn "
+                         "-> prompt, assistant turn -> supervised response, as "
+                         "before. Multi-turn rows: every turn is rendered and "
+                         "ONLY assistant turns are supervised (user/system masked "
+                         "to -100); needs an explicit --prompt-format (auto is "
+                         "single-turn only). --instruction/context/response-key "
                          "are ignored.")
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
@@ -1833,16 +1907,31 @@ def _run_main():
             eot_id = eot_id[1:]
         for i, ex in enumerate(examples[:args.inspect]):
             ids, labs = ex["input_ids"], ex["labels"]
-            n_prompt = sum(1 for l in labs if l == -100)
+            n_masked = sum(1 for l in labs if l == -100)
             sup = [t for t, l in zip(ids, labs) if l != -100]
-            prompt_ids = ids[:n_prompt]
             dec = lambda seq: tokenizer.decode(torch.tensor([seq]),
                                                decode_special_tokens=True)
             ends_eot = bool(eot_id) and sup[-len(eot_id):] == eot_id
             print(f"\n===== example {i} | {len(ids)} tokens "
-                  f"({n_prompt} prompt / {len(sup)} supervised) =====")
-            print(f"  PROMPT  (masked, -100): {dec(prompt_ids)!r}")
-            print(f"  RESPONSE(supervised)  : {dec(sup)!r}")
+                  f"({n_masked} masked / {len(sup)} supervised) =====")
+            # Decode contiguous masked/supervised spans in order: a single-turn
+            # row is one prompt span + one response span (the old two-line
+            # output); a multi-turn row interleaves several, and showing each
+            # span makes every mask boundary eyeball-able.
+            spans = []
+            for t, l in zip(ids, labs):
+                is_sup = l != -100
+                if spans and spans[-1][0] == is_sup:
+                    spans[-1][1].append(t)
+                else:
+                    spans.append((is_sup, [t]))
+            if len(spans) <= 2:
+                print(f"  PROMPT  (masked, -100): {dec(ids[:n_masked])!r}")
+                print(f"  RESPONSE(supervised)  : {dec(sup)!r}")
+            else:
+                for is_sup, seq in spans:
+                    tag = "SUPERVISED" if is_sup else "masked    "
+                    print(f"  [{tag}] {dec(seq)!r}")
             print(f"  ends with turn-end token ({eot!r})? {ends_eot}"
                   + ("" if ends_eot else
                      "   <-- WARNING: response truncated by --seq-len; "

@@ -83,6 +83,9 @@ max_grad_norm: 1.0
 #   is accepted for each). e.g. trl-lib/ultrafeedback_binarized.
 # kto: unpaired rows -> prompt_key / completion_key / label_key (truthy =
 #   desirable). e.g. trl-lib/kto-mix-14k.
+# A conversational prompt keeps its FULL multi-turn history as masked context
+# (only the completion is ever scored); multi-turn prompts need an explicit
+# prompt_format (auto is single-turn only).
 # `dataset` takes a HF Hub id or a local .jsonl/.json/.parquet/.csv path.
 # ---------------------------------------------------------------------------
 dataset: trl-lib/ultrafeedback_binarized
