@@ -34,6 +34,17 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
 - `qlora_train_native.py` — the single-GPU / layer-split SFT trainer (plain
   PyTorch, no transformers). Also home to the shared data/tokenization helpers
   the other trainers import.
+- `chat_turns.py` — multi-turn chat rendering with exact loss-mask
+  segmentation, shared by the SFT and preference trainers. OpenAI-style
+  `messages` conversations (SFT `--messages-key`, DPO/KTO conversational
+  prompt columns) render turn-by-turn with ONLY assistant turns supervised —
+  user/system/tool turns and assistant headers are masked to -100 by default,
+  with exact boundaries because each segment is tokenized separately (no
+  Unsloth-style template-marker search). Multi-turn data needs an explicit
+  `--prompt-format` (`auto`'s per-arch default prompt is single-turn only —
+  such rows fail fast instead of being silently truncated, which is what the
+  old `extract_single_turn` path did). CPU-tested in
+  `tests/test_chat_turns.py`.
 - `qlora_train_native_ddp.py` — the multi-GPU DDP variant (run under
   `torchrun`).
 - `qlora_train_pref.py` — DPO / KTO / SimPO preference training on the native

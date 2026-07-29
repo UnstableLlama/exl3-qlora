@@ -6,7 +6,7 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
-from .quant.exl3_lib import quantize_exl3
+from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
@@ -69,6 +69,7 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
         post_scale: float = 1.0,
+        weight_scale: float = 1.0,
         transposed_load: bool = True,
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
@@ -99,6 +100,7 @@ class Linear(Module):
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
         self.out_dtype = out_dtype
         self.post_scale = post_scale
+        self.weight_scale = weight_scale
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
         self.ftranspose_after_load = ftranspose_after_load
@@ -186,13 +188,17 @@ class Linear(Module):
                 scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                 scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                 assert scale is None or scale_inv is None
-                no_defer = scale is not None or scale_inv is not None
+                no_defer = scale is not None or scale_inv is not None or self.weight_scale != 1.0
                 weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
-                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
+                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
                     weight = self.apply_fp8_scales_inv_(weight, scale_inv)
+                if self.weight_scale != 1.0:
+                    weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                    if bias is not None:
+                        bias = (bias.float() * self.weight_scale).to(bias.dtype)
 
             self.inner = LinearFP16(
                 self.in_features,
@@ -234,6 +240,8 @@ class Linear(Module):
                 weight = weight.T.contiguous()
             # pad_out expects (in_features, out_features) orientation
             weight = self.pad_out(weight)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -282,6 +290,10 @@ class Linear(Module):
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
             bias = self.pad_out(bias)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                if bias is not None:
+                    bias = (bias.float() * self.weight_scale).to(bias.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -345,15 +357,21 @@ class Linear(Module):
         if not self.is_exl3_storage(key):
             return False
         self.used_alt_key = key == self.alt_key
-        scale = self.config.stc.get_tensor(key + ".scale", self.device, optional = True)
-        su = self.config.stc.get_tensor(key + ".su", self.device, optional = True, no_defer = True)
-        suh = self.config.stc.get_tensor(key + ".suh", self.device, optional = True)
-        sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True, no_defer = True)
-        svh = self.config.stc.get_tensor(key + ".svh", self.device, optional = True)
-        trellis = self.config.stc.get_tensor(key + ".trellis", self.device)
-        mcg = self.config.stc.get_tensor(key + ".mcg", "cpu", optional = True)
-        mul1 = self.config.stc.get_tensor(key + ".mul1", "cpu", optional = True)
-        bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
+        # Probe the header before fetching: most formats ship only a subset of these tensors,
+        # and the misses otherwise add up to a significant share of bulk-load Python overhead
+        stc = self.config.stc
+        def opt(subkey, device, **kwargs):
+            k = key + subkey
+            return stc.get_tensor(k, device, optional = True, **kwargs) if stc.has_tensor(k) else None
+        scale = opt(".scale", self.device)
+        su = opt(".su", self.device, no_defer = True)
+        suh = opt(".suh", self.device)
+        sv = opt(".sv", self.device, no_defer = True)
+        svh = opt(".svh", self.device)
+        trellis = stc.get_tensor(key + ".trellis", self.device)
+        mcg = opt(".mcg", "cpu")
+        mul1 = opt(".mul1", "cpu")
+        bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
             self.in_features,
@@ -746,3 +764,51 @@ class Linear(Module):
         assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)
+
+
+def convert_exl3_group(
+    linears: list,
+    H_datas: list[dict],
+    quant_args_list: list[dict],
+    progress_str: str | None = None,
+):
+    """
+    Convert a group of Linear modules to EXL3 in one batched quantization pass (see quantize_exl3_batch for
+    the grouping requirements: shared Hessian with equal in_features, or same-shape tensors with individual
+    Hessians, all at the same bitrate).
+
+    :return:
+        list of proxy errors, one per module; each module's quant_args dict in quant_args_list is updated
+        the same way Linear.convert_exl3 updates its quant_args
+    """
+    weights = []
+    biases = []
+    for linear in linears:
+        assert isinstance(linear.inner, LinearFP16), \
+            "Inner layer is already quant type"
+        weights.append(linear.inner.get_weight_tensor().float())
+        biases.append(linear.inner.get_bias_tensor())
+        linear.inner = None
+
+    results = quantize_exl3_batch(weights, H_datas, quant_args_list, progress_str)
+
+    proxy_errs = []
+    for linear, bias, (proxy_err, out_tensors) in zip(linears, biases, results):
+        linear.inner = LinearEXL3(
+            linear.config,
+            linear.in_features,
+            linear.out_features,
+            out_tensors.get("scale"),
+            out_tensors.get("su"),
+            out_tensors.get("sv"),
+            out_tensors.get("suh"),
+            out_tensors.get("svh"),
+            out_tensors.get("trellis"),
+            out_tensors.get("mcg"),
+            out_tensors.get("mul1"),
+            bias,
+            linear.out_dtype,
+            key = linear.key
+        )
+        proxy_errs.append(proxy_err)
+    return proxy_errs

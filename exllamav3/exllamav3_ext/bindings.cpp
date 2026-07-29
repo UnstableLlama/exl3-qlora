@@ -22,6 +22,9 @@
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
+#include "quant/exl3_gemv_int8.cuh"
+#include "cpu/moe_mul1.h"
+#include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -105,6 +108,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+    m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+    m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
+    m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
+    m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
+    m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
+    m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
+    m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
+    m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");
@@ -119,6 +135,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
     m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
     m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
+    m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
@@ -129,6 +146,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

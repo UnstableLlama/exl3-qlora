@@ -71,12 +71,23 @@ also *unfused* from the batched MGEMM when each matrix is wide enough to fill th
 own — see the two thresholds below. The graphed decode paths (BC modules) handle both the fused
 and unfused configurations.
 
-### `EXL3_MGEMM_K_THRESHOLD` (default: `6`), `EXL3_MGEMM_N_THRESHOLD` (default: `8192`)
+### `EXL3_INT8_GEMV_MAX_K` (default: per-arch)
+
+Highest bitrate K the int8 GEMV path accepts; above it the regular fp16 kernel runs instead.
+The default is 6 on Hopper and Blackwell and 5 elsewhere: Ampere is DRAM-bound from K = 6 up,
+where the int8 path's reduced per-weight compute no longer helps (and Ada is marginal there),
+but on Hopper the fp16 kernel is throughput-bound at K = 6 as well. Values up to 8 can be forced
+to test the crossover on unmeasured parts; the MGEMM unfusing threshold below follows this cap
+automatically.
+
+### `EXL3_MGEMM_K_THRESHOLD` (default: per-arch), `EXL3_MGEMM_N_THRESHOLD` (default: `8192`)
 
 Unfusing heuristics applied when the int8 GEMV mode is enabled, to mul1 tensor pairs only: keep
 the fused MGEMM when the bitrate K is at or above the K threshold (the int8 path declines those
 anyway), or when the matrices are narrower than the N threshold (too narrow for separate GEMV
-calls to fill the GPU; batching is what restores utilization there).
+calls to fill the GPU; batching is what restores utilization there). The K threshold defaults
+to one above the int8 path's per-arch K cap (see `EXL3_INT8_GEMV_MAX_K`); setting it explicitly
+pins it on every device.
 
 ### `EXLLAMAV3_TUNE_CACHE` (default: platform cache dir)
 
@@ -98,6 +109,142 @@ token id rather than sorted position, so individual seeds map to different sampl
 same distribution. Stacks the collapse does not recognize fall back to the step-by-step path by
 design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
 reference implementation.
+
+## CPU MoE offload
+
+Experimental: `-mcl`/`--moe_cpu_offload` (main model) and `-dmcl`/`--draft_moe_cpu_layers`
+(draft model or MTP head) run the routed experts of the first N block-sparse MoE layers on the
+CPU, expert weights resident in system RAM, freeing the VRAM those layers' experts would have
+used. Layer-split mode only; requires mul1-codebook experts, K ≤ 8, and uniform per-expert
+biases (all or none — ineligible layers fall back to the GPU as usual). A spawned worker process
+per model component (main / draft / MTP) owns its own expert weights and a job ring in pinned
+shared memory; the parent's forward pass never blocks on the CPU. During prefill, hot experts
+additionally stream their weights to the GPU and run there (via the fused kernel or per-expert
+dequant, by size) while the CPU works the remaining tail — see `-mclt`/`-dmclt` below for 
+thread configuration, and the knobs below for tuning the split.
+
+These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
+from the environment at import); for a same-process sweep, mutate fields on the module-level
+`TUNING` singleton before constructing a model instead of setting env vars.
+
+### `-mclt` / `--moe_cpu_threads`, `-dmclt` / `--draft_moe_cpu_threads` (CLI, not env)
+
+Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /
+`draft_moe_cpu_threads`. Takes precedence over `EXL3_MOE_CPU_THREADS` below when set.
+
+### `EXL3_MOE_CPU_THREADS` (default: `cpu_count // 2`)
+
+Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
+
+### `EXL3_MOE_CPU_SLOTS` (default: `4`), `EXL3_MOE_CPU_SLOT_ROWS` (default: `64`)
+
+Compute job-ring depth and rows per slot (the CPU-tail chunk size). Each slot holds one
+in-flight chunk of the D2H-staged input, selected experts and routing weights, and the
+H2D-staged fp32 output.
+
+### `EXL3_MOE_CPU_WSLOTS` (default: `2`), `EXL3_MOE_CPU_WSLOT_MB` (default: `32`)
+
+Depth and per-slot size of the pinned/VRAM weight-staging ring used by GPU-streamed prefill.
+Each slot must be large enough to hold a batch of streamed experts' packed weights (see
+`EXL3_MOE_STREAM_BATCH_EXPERTS`); if not, the batch is capped by capacity instead.
+
+### `EXL3_MOE_CPU_STAGE_THREADS` (default: `4`)
+
+Memcpy threads used by the worker's dedicated stager (which packs streamed experts' weights
+into the pinned staging ring, concurrently with the compute pool working the CPU tail). A few
+threads saturate host memcpy bandwidth; raising this mainly helps wide streamed batches on
+models with many small experts (see issue trace on Qwen3.6-35B-A3B).
+
+### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
+
+Minimum per-expert token-assignment count (in a prefill chunk) for an expert's weights to be
+streamed to the GPU instead of computed on the CPU tail. Unset, the effective threshold scales
+inversely with the measured pinned→device bandwidth (probed once per device): a chipset-attached
+x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. Setting
+this explicitly pins the threshold on every device and disables the bandwidth scaling.
+
+### `EXL3_MOE_STREAM_FUSED_T` (default: `512`)
+
+Maximum per-expert assignment count eligible for the fused `exl3_moe` GPU kernel (one launch
+covers a whole batch of experts); above this an expert still streams but runs through the
+per-expert reconstruct path instead. Same eligibility as the GPU-resident fused path otherwise
+(mul1, silu/gelu gated or relu2 gateless, no per-expert biases, no padded dims); ineligible
+layers use the reconstruct path for every streamed expert regardless of count.
+
+### `EXL3_MOE_STREAM_MIN_ROWS` (default: `32`)
+
+Prefill chunk size floor below which GPU streaming never engages and every expert runs on the
+CPU tail as usual (decode, at 1 row per pass, always stays under this).
+
+### `EXL3_MOE_STREAM_BATCH_EXPERTS` (default: `24`, max `256`)
+
+Experts packed per weight-staging batch (one stage job, one DMA, and — below
+`EXL3_MOE_STREAM_FUSED_T` — one fused-kernel launch). Further capped by staging-slot capacity
+(`EXL3_MOE_CPU_WSLOT_MB` divided by one expert's packed byte size). The hard ceiling of 256 is
+the structural size of the job descriptor's expert-id array; raising the ceiling itself costs
+only a small amount of shared-memory overprovisioning, not runtime.
+
+### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
+
+Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, or `vnni`/`avx512`, for testing
+a lower-tier kernel path on hardware that supports better. Never upgrades past what the CPU
+actually supports; unrecognized values are ignored. Read once per process (parent and worker
+independently), so it must be set before either is started.
+
+### `EXL3_MOE_MEMOPS` (default: `1`)
+
+The parent enqueues its wait/publish handshake with the worker as CUDA stream memory operations
+(`cuStreamWaitValue32`/`WriteValue32`, front-end executed: no SM occupancy, no per-op launch
+cost) rather than the older spin-wait kernels. Set to `0` to force the kernel fallback — kept
+around specifically because the memop path is not yet exercised on Windows. The kernel path's
+30-second stall timeout does not apply to the memop path; a dead worker there is instead detected
+by a host-side watchdog that unblocks any pending wait.
+
+### `EXL3_MOE_STREAM_DEBUG` (default: `0`)
+
+Print per-layer and per-batch engagement: streamed bandwidth probe result and threshold, expert
+counts, streamed-vs-tail assignment split, and fused-vs-reconstruct tier split within each
+streamed batch.
+
+### `EXL3_MOE_CPU_PROF` (default: `0`)
+
+Accumulate per-phase wall time in the CPU compute pool and report every 512 jobs. Enabled once
+per worker at startup.
+
+### `EXL3_MOE_ARENA_DEBUG` (default: `0`)
+
+Print each hugepage-arena chunk allocation (size, running total) as the CPU worker loads expert
+weights, and confirmation when the end-of-load `MADV_COLLAPSE` pass (see
+`EXL3_MOE_ARENA_HUGEPAGE`) is issued. The worker copies loaded expert tensors into a small
+number of large (1 GiB) anonymous mappings instead of leaving them as many separate small
+(sub-2MB) allocations — confirmed via `/proc/<pid>/smaps` that the latter cannot be backed by
+transparent huge pages even under system-wide THP=always, since each is its own VMA.
+
+### `EXL3_MOE_ARENA_HUGEPAGE` (default: `1`)
+
+Whether to attempt hugepage promotion for the arena chunks described above. This is done as a
+single `MADV_COLLAPSE` (Linux 6.1+) pass over each chunk *after* all expert weights for every
+offloaded layer have been loaded — deliberately not via a live `MADV_HUGEPAGE` hint during the
+per-layer writes: on hosts where `/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, that
+hint makes the kernel do *synchronous* compaction on first touch of a hinted region once
+easily-compactable free memory runs low, which turns into multi-second stalls per offloaded
+layer partway through a large model's load. Set to `0` to skip hugepage promotion entirely.
+
+### `EXL3_MOE_CPU_PIN` (default: `1`)
+
+Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
+SMT siblings last, instead of leaving placement to the OS scheduler. On an SMT host, unpinned
+placement is a real source of run-to-run throughput variance — two workers can land on the same
+physical core (contending for its execution resources) on one run and not the next; measured on
+a 24-core/48-thread SMT2 box, this swung matrix-decode throughput 61–105 GB/s run to run,
+pinned flat at ~105 GB/s (88% of the box's measured 24-thread DRAM read bandwidth). Set to `0`
+to disable, e.g. on a shared/multi-tenant host where fixed placement may fight the scheduler's
+own balancing across other processes. Falls back to no pinning if the CPU topology can't be
+read.
+
+### `EXL3_MOE_HANDOFF_PROF` (default: unset)
+
+Enable GPU/CPU handoff profiling, for debug purposes. 
 
 ## Multi-GPU
 

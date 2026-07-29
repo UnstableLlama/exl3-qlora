@@ -232,9 +232,12 @@ instruction_key: instruction  # column with the prompt/instruction (Alpaca: inst
 context_key: input            # optional extra-context column, prepended to the prompt when present
                               #   (Alpaca: input, Dolly: context); missing columns are ignored
 response_key: output          # column with the SUPERVISED response (Alpaca: output, Dolly: response)
-messages_key: null            # column of OpenAI-style single-turn messages (e.g. messages). When set,
-                              #   the user turn is the prompt, the assistant turn the supervised
-                              #   response, and the three *_key columns above are ignored
+messages_key: null            # column of OpenAI-style messages (e.g. messages). When set, the three
+                              #   *_key columns above are ignored. Single-turn rows: user turn ->
+                              #   prompt, assistant turn -> supervised response. Multi-turn rows:
+                              #   every turn is rendered and ONLY assistant turns are supervised
+                              #   (user/system masked to -100); multi-turn needs an explicit
+                              #   prompt_format below (auto is single-turn only)
 prompt_format: auto           # chat template the pairs are rendered into. auto = the model's native
                               #   one (Llama-3 headers, Mistral [INST], ChatML for qwen3/3.5, ...).
                               #   Explicit: mistral, metharme, gemma4-nothink (thought span pre-closed

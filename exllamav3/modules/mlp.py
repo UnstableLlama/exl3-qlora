@@ -13,6 +13,8 @@ from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
 
+MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+
 class MLP(Module):
 
     def __init__(
@@ -641,6 +643,7 @@ class GatedMLP(Module):
                 self.gates[load_slice].inner.K,
                 self.gates[load_slice].out_features,
                 self.gates[load_slice].inner.mul1 and self.ups[load_slice].inner.mul1,
+                self.device,
             )
         ):
             self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
@@ -660,9 +663,10 @@ class GatedMLP(Module):
             if mgu is not None or can_separate:
                 out_f = mgu.out_features if mgu is not None else g0.out_features
                 self.bsz1_pa_args = [
-                    (device, (2, 1, self.hidden_size), self.interm_dtype, "gu"),
-                    (device, (2, 1, out_f), self.interm_dtype, "a1"),
-                    (device, (1, 1, 1, out_f), torch.half, "a2")
+                    (device, (2, MAX_BSZN, self.hidden_size), self.interm_dtype, "gu"),
+                    (device, (2, MAX_BSZN, out_f), self.interm_dtype, "a1"),
+                    (device, (1, MAX_BSZN, out_f), torch.half, "a2"),
+                    (device, (1, MAX_BSZN, out_f), torch.half, "down_xh"),
                 ]
                 self.bc = ext.BC_GatedMLP(
                     *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
@@ -729,11 +733,13 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz == 1 and q_len == 1 \
+                # Fused/graph path reads base trellis weights only and never sees a runtime
+                # LoRA — fall back to the torch path while one is loaded.
+                if self.bc is not None and bsz * q_len <= MAX_BSZN \
                         and not (gu_lora or down_lora):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     x = x.view(1, bsz * q_len, dim)
-                    self.bc.run_bsz1(x, d.view(x.shape))
+                    self.bc.run_bszN(x, d.view(x.shape))
 
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
@@ -765,7 +771,8 @@ class GatedMLP(Module):
                         self.multi_gu[s].mul1,
                         -1,
                         -1,
-                        0
+                        0,
+                        1
                     )
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)

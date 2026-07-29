@@ -181,6 +181,7 @@ class Attention(Module):
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
         full_gate: bool = False,
+        gate_softplus: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
         qbits_key: str = "bits"
@@ -207,6 +208,9 @@ class Attention(Module):
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
         self.full_gate = full_gate
+        self.gate_softplus = gate_softplus
+        assert not gate_softplus or not (full_gate or interleaved_gate), \
+            "Attn: gate_softplus is only implemented for the headwise gate"
         self.key_sinks = key_sinks
         self.sinks = None
 
@@ -439,6 +443,7 @@ class Attention(Module):
             self.config.infer_params.use_mgemm(
                 self.k_proj.inner.K, self.k_proj.out_features,
                 self.k_proj.inner.mul1 and self.v_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
@@ -460,6 +465,7 @@ class Attention(Module):
             self.config.infer_params.use_mgemm(
                 self.q_proj.inner.K, self.q_proj.out_features,
                 self.q_proj.inner.mul1 and self.g_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
@@ -595,7 +601,8 @@ class Attention(Module):
                 self.multi_qg.mul1,
                 -1,
                 -1,
-                0
+                0,
+                1
             )
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
@@ -638,7 +645,8 @@ class Attention(Module):
                 self.multi_kv.mul1,
                 -1,
                 -1,
-                0
+                0,
+                1
             )
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
@@ -793,7 +801,9 @@ class Attention(Module):
             dispatch_cache = self.dispatch_cache,
         )
 
-        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
+        if self.headwise_gate:
+            if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+            else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
@@ -920,7 +930,9 @@ class Attention(Module):
             dispatch_cache = self.dispatch_cache,
         )
 
-        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
+        if self.headwise_gate:
+            if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+            else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 

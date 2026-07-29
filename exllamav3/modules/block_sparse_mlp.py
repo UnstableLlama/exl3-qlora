@@ -18,6 +18,7 @@ from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
+MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
 class RoutingCFG:
@@ -246,6 +247,7 @@ class BlockSparseMLP(Module):
         activation_fn: str = "silu",
         act_limit: float = 0.0,
         interm_dtype: torch.dtype = None,
+        interm_div: float = 1.0,
         router_type: str = "std",
         routing_gate: Linear | None = None,
         shared_gate: Linear | None = None,
@@ -274,6 +276,11 @@ class BlockSparseMLP(Module):
         super().__init__(config, key, None)
 
         self.interm_dtype = interm_dtype
+        self.interm_div = interm_div
+        if interm_div != 1.0:
+            assert router_type in ("dots", "ds3"), \
+                "interm_div requires a router type that folds routed_scaling_factor into the routing weights"
+            routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.intermediate_size_padded = (intermediate_size + 127) // 128 * 128
@@ -406,6 +413,7 @@ class BlockSparseMLP(Module):
                     frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
                     qbits_key = qbits_key,
+                    weight_scale = 1.0 / interm_div,
                 )
                 down = Linear(
                     config = config,
@@ -509,6 +517,7 @@ class BlockSparseMLP(Module):
         self.register_submodule(self.routed_post_norm)
 
         self.bc = None
+        self.cpu_offload = False
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
 
@@ -524,6 +533,114 @@ class BlockSparseMLP(Module):
             return [s, [g + u, d]]
         else:
             return [[g + u, d]]
+
+
+    def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:
+        """
+        Experimental CPU expert offload: register the layer with the persistent CPU MoE worker
+        (which loads the expert weights itself, concurrently with GPU loading) and load
+        everything else (router, norms, shared experts) on the GPU as usual. Eligibility here
+        uses header metadata only; the parent never fetches expert data. Returns False without
+        side effects when the layer is ineligible (non-mul1 codebook, K > 8, or mixed per-expert
+        biases), in which case the caller falls back to the normal path.
+        """
+        stc = self.config.stc
+        cpu = torch.device("cpu")
+        experts = self.gates + self.ups + self.downs
+
+        # Eligibility probe on the first expert of each projection before fetching bulk data
+        probe = ([self.gates[0]] if self.gated else []) + [self.ups[0], self.downs[0]]
+        for l in probe:
+            if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
+                print(f" !! {self.key}: experts are not mul1, CPU offload skipped")
+                return False
+
+        def hdr_shape(l):
+            return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
+        for l in probe:
+            if hdr_shape(l)[-1] // 16 > 8:
+                print(f" !! {self.key}: K > 8, CPU offload skipped")
+                return False
+        def bias_keys(ls):
+            has = [(l.key + ".bias") in stc.tensor_file_map for l in ls]
+            if any(has) and not all(has):
+                print(f" !! {self.key}: mixed expert biases, CPU offload skipped")
+                return None
+            return all(has)
+        checks = [bias_keys(ls) for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]]
+        if any(c is None for c in checks):
+            return False
+
+        self.device = torch.device(device)
+        expert_set = set(experts)
+        for module in self.modules:
+            if module not in expert_set:
+                module.load(device, **kwargs)
+        if self.e_score_correction_bias_key:
+            for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
+                self.e_score_correction_bias = self.config.stc.get_tensor(
+                    f"{self.key}.{k}", self.device, optional = True, float2half = True)
+                if self.e_score_correction_bias is not None:
+                    break
+        if self.per_expert_scale_key:
+            self.per_expert_scale = self.config.stc.get_tensor(
+                f"{self.key}.{self.per_expert_scale_key}", self.device, optional = True, allow_bf16 = True)
+        self.load_routing(**kwargs)
+
+        from ..model.moe_cpu_host import MoeCpuHost
+        # One worker per component: an MTP head shares the config but loads after the main
+        # model's worker has started, so it gets its own child (which loads only its own
+        # layers from the same checkpoint)
+        comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
+        hosts = getattr(self.config, "moe_cpu_hosts", None)
+        if hosts is None:
+            hosts = {}
+            self.config.moe_cpu_hosts = hosts
+        host = hosts.get(comp)
+        if host is None:
+            host = MoeCpuHost(self.config)
+            hosts[comp] = host
+        self.cpu_host = host
+        self.cpu_component = comp
+        def dims_of(l):
+            s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
+            return (s[0] * 16, s[1] * 16, s[2] // 16)
+        gd = dims_of(self.gates[0]) if self.gated else None
+        ud = dims_of(self.ups[0])
+        dd = dims_of(self.downs[0])
+        hi, ho = ud[0], dd[1]
+
+        # Small per-expert tensors resident on the GPU for the streamed-prefill dequant path
+        # (lists, not stacks: the fetches may be deferred and fill in place)
+        def fetch_aux(ls, suffix, optional = False):
+            out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
+                                  float2half = True) for l in ls]
+            return out if not optional or out[0] is not None else None
+        aux = dict(
+            suh_u = fetch_aux(self.ups, ".suh"), svh_u = fetch_aux(self.ups, ".svh"),
+            suh_d = fetch_aux(self.downs, ".suh"), svh_d = fetch_aux(self.downs, ".svh"),
+            bias_u = fetch_aux(self.ups, ".bias", True),
+            bias_d = fetch_aux(self.downs, ".bias", True),
+        )
+        if self.gated:
+            aux["suh_g"] = fetch_aux(self.gates, ".suh")
+            aux["svh_g"] = fetch_aux(self.gates, ".svh")
+            aux["bias_g"] = fetch_aux(self.gates, ".bias", True)
+
+        self.cpu_layer_idx = host.register_layer(
+            self.key,
+            [l.key for l in self.gates] if self.gated else [],
+            [l.key for l in self.ups],
+            [l.key for l in self.downs],
+            {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
+            float(self.act_limit or 0.0),
+            hi, ho, self.num_experts_per_tok,
+            proj_dims = dict(g = gd, u = ud, d = dd),
+            aux = aux,
+        )
+        self.cpu_offload = True
+        print(f" -- CPU-offloaded experts (worker): {self.key}")
+        return True
 
 
     def load_local(self, **kwargs):
@@ -595,31 +712,42 @@ class BlockSparseMLP(Module):
         I = self.intermediate_size_padded
         device = self.device
 
-        temp_hidden = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, Hi), torch.half, "moe1_temp_hidden")
-        temp_interm = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, I), self.interm_dtype, "moe1_temp_interm")
-        temp_activa = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, I), torch.half, "moe1_temp_activa")
-        temp_output = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, Ho), torch.float, "moe1_temp_output")
+        # bszn_rows bounds the multi-row graph path (BC_BlockSparseMLP.run_bszN, bsz 1..MAX_BSZN,
+        # bszm = num_tokens * numex slots); buffers grow to whichever of that or the single-expert
+        # graph loop's TEMP_ROWS_GRAPH requirement is larger, sharing the one cache entry per name
+        # (g_tensor_cache is exact-shape-keyed and never evicts -- growing a differently-shaped
+        # second entry under the same name would silently double memory forever)
+        bszn_rows = MAX_BSZN * numex
 
-        yh = temp_hidden[:numex].view(numex, 1, Hi)
-        interm_g = temp_interm[:numex].view(numex, 1, I)
-        interm_u = temp_interm[numex:numex*2].view(numex, 1, I)
-        interm_a = temp_activa[:numex].view(numex, 1, I)
+        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+        temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
+        temp_activa = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
+        temp_output = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")
+
+        yh = temp_hidden[:bszn_rows].view(bszn_rows, 1, Hi)
+        interm_g = temp_interm[:bszn_rows].view(bszn_rows, 1, I)
+        interm_u = temp_interm[bszn_rows:bszn_rows*2].view(bszn_rows, 1, I)
+        interm_a = temp_activa[:bszn_rows].view(bszn_rows, 1, I)
         yh2 = temp_hidden
         interm_gu = temp_interm
         interm_a2 = temp_activa
-        out_d = temp_output[:numex].view(numex, 1, Ho)
+        out_d = temp_output[:bszn_rows].view(bszn_rows, 1, Ho)
         out_d2 = temp_output
+
+        # Static scratch for the num_tokens > 1 gathered input (BC_BlockSparseMLP.run_bszN); each
+        # of num_tokens*numex slots holds a copy of its token's row, built via index_select
+        a_gather = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_a_gather")
 
         # Expert interval for split module (-1, -1) indicate no split
         mine, maxe = self.routing_first, self.routing_last
         if mine is None or maxe - mine == self.num_experts:
             mine, maxe = -1, -1
 
-        # Exact-width bsz-1 output when the down projection is padded (the BC graph copies the
-        # trimmed columns out of the padded reduction)
+        # Exact-width output when the down projection is padded (the BC graph copies the trimmed
+        # columns out of the padded reduction); sized for up to MAX_BSZN rows
         out_trim = None
         if Ho != H:
-            out_trim = g_tensor_cache.get(device, (1, H), torch.float, "moe1_out_trim")
+            out_trim = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_trim")
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -651,7 +779,7 @@ class BlockSparseMLP(Module):
             ):
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
-                sh_exp_t = torch.empty((1, 1, H), dtype = torch.float, device = self.device)
+                sh_exp_t = torch.empty((1, MAX_BSZN, H), dtype = torch.float, device = self.device)
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate_bc = self.shared_gate.inner.bc
@@ -686,7 +814,7 @@ class BlockSparseMLP(Module):
             down_bias_ptrs = _bias_ptrs(self.downs)
             y_pad = None
             if Hi != H:
-                y_pad = g_tensor_cache.get(device, (1, Hi), torch.half, "moe1_y_pad")
+                y_pad = g_tensor_cache.get(device, (MAX_BSZN, Hi), torch.half, "moe1_y_pad")
                 y_pad.zero_()
 
             # Bound class for graph, dq and fused-bsz1 paths (gateless: the up module stands in
@@ -738,6 +866,7 @@ class BlockSparseMLP(Module):
                 gu_trellis_ptr,
                 gu_suh_ptr,
                 gu_svh_ptr,
+                a_gather,
                 gate_bias_ptrs,
                 up_bias_ptrs,
                 down_bias_ptrs,
@@ -783,6 +912,20 @@ class BlockSparseMLP(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
+        ip = self.config.infer_params
+        comp = getattr(ip, "moe_cpu_component", "text")
+        budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
+            else getattr(ip, "draft_moe_cpu_offload", 0)
+        if (
+            budget > 0 and
+            ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
+            device is not None and torch.device(device).type == "cuda" and
+            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
+        ):
+            if self.load_cpu_offload(device, **kwargs):
+                ip.moe_cpu_offload_assigned[comp] = ip.moe_cpu_offload_assigned.get(comp, 0) + 1
+                return
         super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
@@ -809,6 +952,17 @@ class BlockSparseMLP(Module):
 
     @override
     def unload(self):
+        if self.cpu_offload:
+            host = getattr(self, "cpu_host", None)
+            if host is not None:
+                host.unregister()
+            # Release this layer's slot in the component's offload budget so a reload of the
+            # same config can claim it again
+            asn = self.config.infer_params.moe_cpu_offload_assigned
+            comp = getattr(self, "cpu_component", "text")
+            if isinstance(asn, dict) and asn.get(comp, 0) > 0:
+                asn[comp] -= 1
+        self.cpu_offload = False
         self.bc = None
         self.fused_mode_buffers = None
         if self.multi_gate is not None:
@@ -844,6 +998,18 @@ class BlockSparseMLP(Module):
         bsz = y.shape[0]
         bc_sh_exp = False
 
+        # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
+        # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
+        # always fall through to the exl3_moe/dense path first, capping this tier's reach at
+        # f_threshold-1 instead of MAX_BSZN). bsz==1 is unrestricted (original bsz-1 path); bsz>1
+        # additionally requires no TP expert-range sharding (the kernel's compaction path doesn't
+        # preserve fixed per-token slot groups) -- shared experts are supported at any bsz via
+        # BC_GatedMLP's own multi-row graph (see mlp.py)
+        bszn_eligible = (
+            self.bc is not None and bsz <= MAX_BSZN and
+            (bsz == 1 or self.experts_cfg.min_expert == -1)
+        )
+
         # Routing
         if self.router_pre_norm:
             z = self.router_pre_norm.forward(y, params, out_dtype = torch.half)
@@ -874,10 +1040,10 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
         # Runtime-LoRA guards: every fused expert path (exl3_moe, mgemm loops, the BC
-        # single-expert kernels and the bsz-1 graph) reads the expert trellis weights
+        # single-expert kernels and the bszN graph) reads the expert trellis weights
         # directly and never sees a runtime LoRA. When one is loaded on any routed
         # expert projection, force the branch below that can take the per-expert torch
-        # path. The bsz-1 graph may also embed the shared experts (bc_sh_exp) and the
+        # path. The bszN graph may also embed the shared experts (bc_sh_exp) and the
         # shared gate, so it is additionally skipped when those carry a LoRA -- the
         # unfused fallback runs them through their own (guarded) forwards instead.
         # NOTE: routing reads routing_gate.inner.weight directly on all paths; a LoRA
@@ -889,15 +1055,34 @@ class BlockSparseMLP(Module):
             has_runtime_lora(self.shared_gate)
         )
 
+        # Experimental CPU expert offload via the persistent worker. The autosplit measuring
+        # forward only observes VRAM allocation, which the CPU compute cannot affect, so it
+        # skips the (slow, full-chunk) host pass and just allocates the output.
+        # The worker computes from its own CPU copy of the base expert weights (the GPU
+        # expert modules are never loaded), so a runtime LoRA on routed experts cannot be
+        # applied and has no fallback here -- reject loudly rather than silently bypass.
+        if self.cpu_offload:
+            if experts_lora:
+                raise RuntimeError(
+                    f"{self.key}: runtime LoRA on routed expert projections is not supported "
+                    f"with CPU expert offload (expert weights are not resident on GPU)"
+                )
+            if params.get("autosplit_measure"):
+                final_hidden_states = torch.zeros_like(y, dtype = torch.float).reshape(x.shape)
+            else:
+                final_hidden_states = self.cpu_host.submit_prefill(
+                    self.cpu_layer_idx, y, selected_experts, routing_weights
+                ).reshape(x.shape)
+
         # Empty slice
-        if self.intermediate_size == 0 or self.num_local_experts == 0:
+        elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
         # Torch/C++/fused path
         elif (
-            bsz >= self.f_threshold or not self.is_quantized or
+            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or experts_lora or
-            not (self.support_quant_paths or (bsz == 1 and self.bc is not None))
+            not (self.support_quant_paths or bszn_eligible)
         ):
             final_hidden_states = torch.zeros_like(y, dtype = torch.float)
 
@@ -1051,7 +1236,25 @@ class BlockSparseMLP(Module):
 
             final_hidden_states = final_hidden_states.reshape(x.shape)
 
-        # Fused path, few tokens
+        # Multi-row CUDA-graph path (bsz 1..MAX_BSZN): a single cooperative mgemm call per
+        # projection across all bsz*top_k assignment slots (no sort/dedup -- overlap between
+        # tokens this small is rare and not worth the argsort/bincount host-sync cost that the
+        # fused/exl3_moe path pays), captured as one CUDA graph per bsz and replayed with only a
+        # few tensor pointers patched. Shared experts (if present) run through their own
+        # multi-row BC_GatedMLP graph, fused into the same capture. bsz > 1 additionally requires
+        # no TP expert-range sharding (the kernel's compaction path doesn't preserve fixed
+        # per-token slot groups); bsz == 1 is unrestricted
+        # (sh_fused_lora: the graph may embed the shared experts/gate, which never see a
+        # runtime LoRA -- skip to the mgemm/single paths below and run them unfused instead)
+        elif bszn_eligible and not sh_fused_lora:
+            self.bc.run_bszN(y, selected_experts, routing_weights)
+            if self.experts_cfg.out_trim is not None:
+                final_hidden_states = self.experts_cfg.out_trim[:bsz].view(x.shape)
+            else:
+                final_hidden_states = self.experts_cfg.out_d[:bsz, ...].view(x.shape)
+            bc_sh_exp = self.bc_sh_exp
+
+        # Per-token mgemm loop: fallback for TP-sharded / shared-experts models at bsz 2..f_threshold-1
         elif bsz > 1:
 
             final_hidden_states = torch.empty_like(y, dtype = torch.float)
@@ -1085,7 +1288,8 @@ class BlockSparseMLP(Module):
                         self.multi_gate.mul1,
                         mine,
                         maxe,
-                        0
+                        0,
+                        1
                     )
 
                 # Up
@@ -1104,7 +1308,8 @@ class BlockSparseMLP(Module):
                     self.multi_up.mul1,
                     mine,
                     maxe,
-                    0
+                    0,
+                    1
                 )
 
                 # Activation (gateless: relu_mul(u, u, a) = relu2(u))
@@ -1129,22 +1334,14 @@ class BlockSparseMLP(Module):
                     self.multi_down.mul1,
                     mine,
                     maxe,
-                    0
+                    0,
+                    1
                 )
 
                 t = cfg.out_d[0]
                 final_hidden_states[i:i+1] = t
 
             final_hidden_states = final_hidden_states.view(x.shape)
-
-        # Bsz 1
-        elif self.bc is not None and not sh_fused_lora:
-            self.bc.run_bsz1(y, selected_experts, routing_weights)
-            if self.experts_cfg.out_trim is not None:
-                final_hidden_states = self.experts_cfg.out_trim.view(x.shape)
-            else:
-                final_hidden_states = self.experts_cfg.out_d[:1, ...].view(x.shape)
-            bc_sh_exp = self.bc_sh_exp
 
         else:
             y = y.unsqueeze(0)
@@ -1167,7 +1364,8 @@ class BlockSparseMLP(Module):
                     self.multi_gate.mul1,
                     cfg.min_expert,
                     cfg.max_expert,
-                    0
+                    0,
+                    1
                 )
 
             # Up
@@ -1186,7 +1384,8 @@ class BlockSparseMLP(Module):
                 self.multi_up.mul1,
                 cfg.min_expert,
                 cfg.max_expert,
-                0
+                0,
+                1
             )
 
             # Activation (gateless: relu_mul(u, u, a) = relu2(u))
@@ -1210,7 +1409,8 @@ class BlockSparseMLP(Module):
                 self.multi_down.mul1,
                 cfg.min_expert,
                 cfg.max_expert,
-                0
+                0,
+                1
             )
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)

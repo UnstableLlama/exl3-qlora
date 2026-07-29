@@ -77,13 +77,14 @@ def test_gated_mlp_fused_branches_guarded():
         "GatedMLP: multi_gu branch lost its gate LoRA delta"
     assert "self.ups[s].apply_lora(xf" in gu_block, \
         "GatedMLP: multi_gu branch lost its up LoRA delta"
-    # the BC bsz-1 graph fuses the whole MLP (gate/up/act/down) and cannot
-    # take a post-hoc delta, so it must yield to an unfused branch when ANY
-    # of the three carries a LoRA
+    # the BC bszN graph (v1.2.0: generalized from bsz-1 to bsz*q_len <=
+    # MAX_BSZN) fuses the whole MLP (gate/up/act/down) and cannot take a
+    # post-hoc delta, so it must yield to an unfused branch when ANY of the
+    # three carries a LoRA
     assert re.search(
-        r"self\.bc is not None and bsz == 1 and q_len == 1[^:]*?"
+        r"self\.bc is not None and bsz \* q_len <= MAX_BSZN[^:]*?"
         r"not \(gu_lora or down_lora\)",
-        src, re.S), "GatedMLP: BC bsz-1 branch lost its runtime-LoRA guard"
+        src, re.S), "GatedMLP: BC bszN branch lost its runtime-LoRA guard"
 
 
 @pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
@@ -110,23 +111,25 @@ def test_plain_mlp_bsz1_graph_guarded():
 
 
 def test_mamba2_bsz1_graph_guarded():
-    # BC_Mamba2 (v1.0.0) runs the whole layer (in_proj through o_proj) in one
+    # BC_Mamba2 runs the whole layer (in_proj through o_proj) in one
     # graph-captured call, reading both projection trellises directly
+    # (v1.2.0: generalized from bsz-1 to bsz/seqlen up to the BC limits)
     src = _src("exllamav3", "modules", "mamba2.py")
     assert re.search(
-        r"self\.bc is not None and bsz == 1 and seqlen == 1[^:]*?"
+        r"self\.bc is not None and save_state and[^:]*?"
         r"not has_runtime_lora\(self\.in_proj, self\.o_proj\)",
-        src, re.S), "Mamba2: BC bsz-1 fused decode lost its runtime-LoRA guard"
+        src, re.S), "Mamba2: BC fused decode lost its runtime-LoRA guard"
 
 
 def test_gdn_split_bsz1_graph_guarded():
     # BC_GatedDeltaNetSplit runs the whole layer in one call, reading qkv/z/o
     # trellis and the merged (base-weights-only) ba_weight_t buffer directly
+    # (v1.2.0: generalized from bsz-1 to bsz/seqlen up to the BC limits)
     src = _src("exllamav3", "modules", "gated_delta_net.py")
     assert re.search(
-        r"self\.bc_split and bsz == 1 and seqlen == 1[^:]*?"
+        r"self\.bc_split and save_state and[^:]*?"
         r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj,",
-        src, re.S), "GatedDeltaNet: split bsz-1 fused decode lost its runtime-LoRA guard"
+        src, re.S), "GatedDeltaNet: split fused decode lost its runtime-LoRA guard"
 
 
 def test_moe_expert_dispatch_guarded():
@@ -147,15 +150,21 @@ def test_moe_expert_dispatch_guarded():
     assert re.search(
         r"self\.bc is not None and self\.support_quant_paths and not experts_lora",
         src), "BlockSparseMLP: BC single-expert path lost its runtime-LoRA guard"
-    # bsz-1 graph (which may embed shared experts + shared gate) skipped when
-    # the fused shared-expert linears carry a LoRA
+    # bszN graph (v1.2.0: replaces the bsz-1 graph; may embed shared experts
+    # + shared gate) skipped when the fused shared-expert linears carry a LoRA
     assert "sh_fused_lora" in src and re.search(
-        r"elif self\.bc is not None and not sh_fused_lora",
-        src), "BlockSparseMLP: bsz-1 graph lost its shared-experts LoRA guard"
+        r"elif bszn_eligible and not sh_fused_lora",
+        src), "BlockSparseMLP: bszN graph lost its shared-experts LoRA guard"
     # raw-weight shared gate projection falls back to Linear.forward
     assert re.search(
         r"bsz > 32 or has_runtime_lora\(self\.shared_gate\)",
         src), "BlockSparseMLP: add_sigmoid_gate_proj lost its shared-gate LoRA guard"
+    # CPU expert offload (v1.2.0) computes from a CPU copy of the base expert
+    # weights with no GPU fallback available; must reject a routed-expert LoRA
+    # loudly instead of silently bypassing it
+    assert re.search(
+        r"if self\.cpu_offload:\s*\n\s*if experts_lora:\s*\n\s*raise RuntimeError",
+        src), "BlockSparseMLP: CPU expert offload lost its runtime-LoRA rejection"
 
 
 def test_moe_expert_lora_slow_path_notice_present():
