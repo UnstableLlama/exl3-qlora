@@ -21,7 +21,11 @@ conversation through the chat template and then string-searching for
 ``instruction_part``/``response_part`` markers: segment rendering needs no
 knowledge of what a Jinja template inserts, can't mis-match markers that
 appear inside message contents, and rejects roles it can't render (``tool``)
-instead of silently mislabeling them.
+instead of silently mislabeling them. (``--prompt-format jinja`` --
+training/chat_jinja.py -- renders through the model's own Jinja template
+instead, emitting this same segment contract via incremental prefix
+rendering; it handles tool roles / tool_calls / reasoning_content that these
+hardcoded formats reject.)
 
 ``--prompt-format auto`` (model.default_chat_prompt) has no multi-turn
 renderer -- the per-arch default prompts are single-turn by construction --
@@ -38,8 +42,9 @@ SEGMENT_FORMATS = ("mistral", "metharme", "gemma4-nothink", "llama3",
 AUTO_SINGLE_TURN_HINT = (
     "--prompt-format auto renders single-turn prompts only "
     "(model.default_chat_prompt); this dataset has multi-turn conversations. "
-    "Pass an explicit --prompt-format (" + " / ".join(SEGMENT_FORMATS) + ") "
-    "so each turn can be rendered and loss-masked individually.")
+    "Pass an explicit --prompt-format (" + " / ".join(SEGMENT_FORMATS) + ", "
+    "or jinja to use the model directory's own chat template) so each turn "
+    "can be rendered and loss-masked individually.")
 
 
 def extract_turns(messages):
@@ -55,6 +60,21 @@ def extract_turns(messages):
         if content:
             turns.append({"role": role, "content": content})
     return turns
+
+
+def turn_text(turn):
+    """Plain-text view of a (possibly rich) turn's content: the string
+    itself, or the concatenated text parts of a multimodal content-parts
+    list ([{"type": "text", "text": ...}, {"type": "image", ...}, ...]).
+    Used for word counts / cleaning on rows the jinja path renders."""
+    c = turn.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, (list, tuple)):
+        return " ".join(
+            (p.get("text") or "") for p in c
+            if isinstance(p, dict) and (p.get("type") or "text") == "text")
+    return ""
 
 
 def single_turn_shape(turns, need_assistant=True):

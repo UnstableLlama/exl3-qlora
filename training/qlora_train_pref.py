@@ -80,7 +80,7 @@ from qlora_train_native import (  # noqa: E402
     ThroughputMeter, StepTimer, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
-    format_prompt_and_eot,
+    format_prompt_and_eot, turn_end_token,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
     load_dataset_split,
     _FAIL_CTX, _log_failure,
@@ -107,43 +107,56 @@ def _load_rows(dataset_name, split, config_name=None):
     return load_dataset_split(dataset_name, split, config_name)
 
 
-def _prompt_turns(value):
+def _prompt_turns(value, rich=False):
     """Prompt column -> normalized turns list. A plain string is a bare user
     turn; a TRL-conversational list keeps its FULL history -- the whole
     conversation becomes masked context, so the completion is scored against
     the turn it actually answers. (The old extract_single_turn collapse broke
     at the first assistant turn, silently pairing completions with a user turn
-    from the middle of the history.)"""
+    from the middle of the history.) ``rich=True`` (the jinja path) keeps
+    reasoning_content / tool_calls / tool roles / content-parts lists that
+    the hardcoded formats can't render (chat_jinja.extract_rich_turns)."""
     if isinstance(value, str):
         v = value.strip()
         return [{"role": "user", "content": v}] if v else []
     if isinstance(value, list):
+        if rich:
+            from chat_jinja import extract_rich_turns
+            return extract_rich_turns(value)
         return extract_turns(value)
     return []
 
 
-def _encode_prompt_ids(tokenizer, turns, build_prompt, seg_builder):
+def _encode_prompt_ids(tokenizer, turns, build_prompt, seg_builder,
+                       extras=None):
     """Render + tokenize a prompt/history as fully-masked context ending with
     the assistant turn opener. Single-turn shapes ([system?] user) keep the
     original single-string path, bit-for-bit; multi-turn histories render
     turn-by-turn (prior assistant turns stay masked -- only the separately
     encoded completion is ever scored, the TRL semantic). Returns None for a
-    history the format can't render (caller skips and counts the row)."""
-    single = single_turn_shape(turns, need_assistant=False)
-    if single is not None:
-        sys_text, user, _ = single
-        prompt_text = build_prompt(user, system=sys_text or None)
-        ids = tokenizer.encode(
-            prompt_text, add_bos=False, encode_special_tokens=True)[0].tolist()
-        bos = tokenizer.bos_token_id
-        if bos is not None:
-            while len(ids) >= 2 and ids[0] == bos and ids[1] == bos:
-                ids = ids[1:]
-        return ids
-    if seg_builder is None:
-        raise SystemExit(AUTO_SINGLE_TURN_HINT)
+    history the format can't render (caller skips and counts the row).
+
+    ``extras`` is not None on the jinja path: EVERY history (single-turn
+    included) segment-renders through the model's chat template with the
+    row's tools/template_vars in context -- the template is the single
+    source of truth, there is no single-turn shortcut."""
+    if extras is None:
+        single = single_turn_shape(turns, need_assistant=False)
+        if single is not None:
+            sys_text, user, _ = single
+            prompt_text = build_prompt(user, system=sys_text or None)
+            ids = tokenizer.encode(
+                prompt_text, add_bos=False, encode_special_tokens=True)[0].tolist()
+            bos = tokenizer.bos_token_id
+            if bos is not None:
+                while len(ids) >= 2 and ids[0] == bos and ids[1] == bos:
+                    ids = ids[1:]
+            return ids
+        if seg_builder is None:
+            raise SystemExit(AUTO_SINGLE_TURN_HINT)
     try:
-        segments = seg_builder(turns, add_generation_prompt=True)
+        segments = seg_builder(turns, add_generation_prompt=True,
+                               **(extras or {}))
     except ValueError:
         return None
     ids, _ = encode_segments(tokenizer, [(t, False) for t, _ in segments])
@@ -173,36 +186,59 @@ def _fit(prompt_ids, comp_ids, seq_len):
     return out if out else None
 
 
+def _prompt_renderers(model, tokenizer, prompt_format,
+                      chat_template_file=None, template_vars=None):
+    """(seg_builder, build_prompt, eot, row_extras_fn) for a prompt format.
+    ``row_extras_fn(row)`` is None outside the jinja path; under jinja it
+    pulls the row's tools + template_vars/chat_template_kwargs columns for
+    the render context (chat_jinja.row_template_extras)."""
+    if prompt_format == "jinja":
+        from chat_jinja import (jinja_renderers, tokenizer_special_tokens,
+                                row_template_extras)
+        seg_builder, build_prompt, eot = jinja_renderers(
+            tokenizer.config.directory,
+            special_tokens=tokenizer_special_tokens(tokenizer),
+            template_file=chat_template_file, default_vars=template_vars)
+        return (seg_builder, build_prompt, eot or turn_end_token(tokenizer),
+                row_template_extras)
+    build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
+    seg_builder = make_segment_builder(prompt_format,
+                                       bos_token=tokenizer.bos_token,
+                                       eos_token=tokenizer.eos_token)
+    return seg_builder, build_prompt, eot, None
+
+
 def build_dpo_examples(model, tokenizer, dataset_name, split, seq_len,
                        prompt_key="prompt", chosen_key="chosen",
                        rejected_key="rejected", max_samples=0,
                        shuffle=False, shuffle_seed=0, prompt_format="auto",
-                       config_name=None):
+                       config_name=None, chat_template_file=None,
+                       template_vars=None):
     """Tokenize a paired preference dataset (TRL explicit-prompt format) with
     the model's chat template. Each example keeps the prompt and the two
     completions separate so collation can mask the prompt exactly:
     ``{prompt_ids, chosen_ids, rejected_ids}`` (completions end with the
-    architecture-correct turn-end token)."""
+    architecture-correct turn-end token -- under --prompt-format jinja, the
+    close the model's own chat template appends)."""
     ds = _load_rows(dataset_name, split, config_name)
     if shuffle or (max_samples and max_samples < len(ds)):
         ds = ds.shuffle(seed=shuffle_seed)
     if max_samples and max_samples < len(ds):
         ds = ds.select(range(max_samples))
 
-    build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
-    seg_builder = make_segment_builder(prompt_format,
-                                       bos_token=tokenizer.bos_token,
-                                       eos_token=tokenizer.eos_token)
+    seg_builder, build_prompt, eot, row_extras = _prompt_renderers(
+        model, tokenizer, prompt_format, chat_template_file, template_vars)
     examples, skipped = [], 0
     for row in ds:
-        turns = _prompt_turns(row.get(prompt_key))
+        turns = _prompt_turns(row.get(prompt_key), rich=row_extras is not None)
         chosen = _completion_text(row.get(chosen_key))
         rejected = _completion_text(row.get(rejected_key))
         if not turns or not chosen or not rejected:
             skipped += 1
             continue
-        prompt_ids = _encode_prompt_ids(tokenizer, turns, build_prompt,
-                                        seg_builder)
+        prompt_ids = _encode_prompt_ids(
+            tokenizer, turns, build_prompt, seg_builder,
+            extras=row_extras(row) if row_extras else None)
         if prompt_ids is None:
             skipped += 1
             continue
@@ -224,7 +260,8 @@ def build_kto_examples(model, tokenizer, dataset_name, split, seq_len,
                        prompt_key="prompt", completion_key="completion",
                        label_key="label", max_samples=0,
                        shuffle=False, shuffle_seed=0, prompt_format="auto",
-                       config_name=None):
+                       config_name=None, chat_template_file=None,
+                       template_vars=None):
     """Tokenize an unpaired KTO dataset (TRL format: prompt / completion /
     bool label). Returns ``{prompt_ids, completion_ids, label}`` dicts."""
     ds = _load_rows(dataset_name, split, config_name)
@@ -233,20 +270,19 @@ def build_kto_examples(model, tokenizer, dataset_name, split, seq_len,
     if max_samples and max_samples < len(ds):
         ds = ds.select(range(max_samples))
 
-    build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
-    seg_builder = make_segment_builder(prompt_format,
-                                       bos_token=tokenizer.bos_token,
-                                       eos_token=tokenizer.eos_token)
+    seg_builder, build_prompt, eot, row_extras = _prompt_renderers(
+        model, tokenizer, prompt_format, chat_template_file, template_vars)
     examples, skipped = [], 0
     for row in ds:
-        turns = _prompt_turns(row.get(prompt_key))
+        turns = _prompt_turns(row.get(prompt_key), rich=row_extras is not None)
         completion = _completion_text(row.get(completion_key))
         label = row.get(label_key)
         if not turns or not completion or label is None:
             skipped += 1
             continue
-        prompt_ids = _encode_prompt_ids(tokenizer, turns, build_prompt,
-                                        seg_builder)
+        prompt_ids = _encode_prompt_ids(
+            tokenizer, turns, build_prompt, seg_builder,
+            extras=row_extras(row) if row_extras else None)
         if prompt_ids is None:
             skipped += 1
             continue
@@ -538,8 +574,23 @@ def _run_main():
                     help="(kto) bool/int column; truthy = desirable")
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
-                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml"],
-                    default="auto")
+                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml",
+                             "jinja"],
+                    default="auto",
+                    help="Chat format for the prompt/history (see the SFT "
+                         "trainer's help). jinja: the model directory's own "
+                         "Jinja chat template -- multi-turn histories with "
+                         "tool roles / tool_calls / reasoning_content render "
+                         "through it, and rows may carry tools + template_vars/"
+                         "chat_template_kwargs columns (chat_jinja.py).")
+    ap.add_argument("--chat-template-file", default=None,
+                    help="(jinja) Path to a Jinja template file to use instead "
+                         "of the one in the model directory.")
+    ap.add_argument("--template-vars", default=None,
+                    help="(jinja) JSON object of extra template variables in "
+                         "every render, e.g. '{\"enable_thinking\": false}'. "
+                         "Per-row template_vars/chat_template_kwargs columns "
+                         "override these per key.")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = all rows")
     ap.add_argument("--shuffle", action="store_true")
     ap.add_argument("--shuffle-seed", type=int, default=0)
@@ -690,11 +741,15 @@ def _run_main():
                  rejected_key=args.rejected_key) if paired else
             dict(prompt_key=args.prompt_key, completion_key=args.completion_key,
                  label_key=args.label_key))
+    from chat_jinja import parse_template_vars
+    template_vars = parse_template_vars(args.template_vars)
     examples = build_examples(
         model, tokenizer, args.dataset, args.dataset_split, args.seq_len,
         max_samples=args.max_samples, shuffle=args.shuffle,
         shuffle_seed=args.shuffle_seed, prompt_format=args.prompt_format,
-        config_name=args.dataset_config, **keys)
+        config_name=args.dataset_config,
+        chat_template_file=args.chat_template_file,
+        template_vars=template_vars, **keys)
     print(f" -- {len(examples)} {method.upper()} examples"
           f"{' (shuffled)' if args.shuffle else ''}")
     assert examples, "no usable training examples"
@@ -721,7 +776,8 @@ def _run_main():
             model, tokenizer, args.eval_dataset or args.dataset,
             args.eval_split, args.seq_len, max_samples=args.eval_max_samples,
             prompt_format=args.prompt_format, config_name=args.dataset_config,
-            **keys)
+            chat_template_file=args.chat_template_file,
+            template_vars=template_vars, **keys)
         print(f" -- held-out eval: {len(val_examples)} examples from split "
               f"'{args.eval_split}'")
     elif args.val_frac > 0:

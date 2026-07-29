@@ -595,8 +595,17 @@ def _run_main():
     ap.add_argument("--text-key", default="text", help="(pretrain mode)")
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
-                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml"],
-                    default="auto")
+                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml",
+                             "jinja"],
+                    default="auto",
+                    help="Chat format (see the SFT trainer's help; jinja = the "
+                         "model directory's own Jinja chat template).")
+    ap.add_argument("--chat-template-file", default=None,
+                    help="(jinja) Jinja template file overriding the model "
+                         "directory's template.")
+    ap.add_argument("--template-vars", default=None,
+                    help="(jinja) JSON object of extra template variables, "
+                         "e.g. '{\"enable_thinking\": false}'.")
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--shuffle", action="store_true")
     ap.add_argument("--shuffle-seed", type=int, default=0)
@@ -808,8 +817,13 @@ def _run_main():
     # present, else builds one over the small cache allocated before load().
     sample_gen = None
     build_prompt = None
+    from chat_jinja import parse_template_vars
+    template_vars = parse_template_vars(args.template_vars)
     if args.sample_every:
-        build_prompt, _ = format_prompt_and_eot(model, tokenizer, args.prompt_format)
+        build_prompt, _ = format_prompt_and_eot(
+            model, tokenizer, args.prompt_format,
+            chat_template_file=args.chat_template_file,
+            template_vars=template_vars)
         sample_gen = gen or Generator(model=model, cache=sampler_cache,
                                       tokenizer=tokenizer)
         if is_moe_lora:
@@ -844,7 +858,9 @@ def _run_main():
             min_response_words=args.min_response_words,
             messages_key=args.messages_key, prompt_format=args.prompt_format,
             shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
-            config_name=args.dataset_config)
+            config_name=args.dataset_config,
+            chat_template_file=args.chat_template_file,
+            template_vars=template_vars)
     else:
         examples = build_lm_examples(
             tokenizer, args.dataset, args.dataset_split, args.seq_len,
@@ -873,7 +889,9 @@ def _run_main():
                 min_response_words=args.min_response_words,
                 messages_key=args.messages_key,
                 prompt_format=args.prompt_format,
-                config_name=args.dataset_config)
+                config_name=args.dataset_config,
+                chat_template_file=args.chat_template_file,
+                template_vars=template_vars)
         else:
             val_examples = build_lm_examples(
                 tokenizer, args.eval_dataset or args.dataset, args.eval_split,
