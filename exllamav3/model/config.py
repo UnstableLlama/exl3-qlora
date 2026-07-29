@@ -30,15 +30,38 @@ class InferParams:
         if int(os.environ.get("EXL3_INT8_GEMV", 2)) > 0:
             self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
             self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
+        self.mgemm_K_env = "EXL3_MGEMM_K_THRESHOLD" in os.environ
+        # Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU
+        # (weights in system RAM). Layer-split mode only. Budgets and counters are per component
+        # ("text" for the main model; other components, e.g. an MTP head sharing this config, use
+        # the draft budget), and each component gets its own worker process so late-loading
+        # components never race an already-started worker
+        self.moe_cpu_offload = 0
+        self.draft_moe_cpu_offload = 0
+        self.moe_cpu_offload_assigned = {}
+        self.moe_cpu_component = "text"
+        # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then cpu_count/2
+        # (see moe_cpu_host.MoeCpuTuning)
+        self.moe_cpu_threads = None
+        self.draft_moe_cpu_threads = None
 
-    def use_mgemm(self, K: int, out_features: int, mul1: bool = False) -> bool:
+    def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:
             return True
         # Fuse when K is at/above the bitrate threshold (int8 GEMV can't take those anyway) or the
-        # matrices are too narrow for separate GEMV calls to fill the GPU
-        return K >= self.mgemm_K_threshold or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
+        # matrices are too narrow for separate GEMV calls to fill the GPU. The default threshold
+        # follows the int8 kernel's per-arch K cap (Hopper takes K = 6 as well, issue #242), unless
+        # EXL3_MGEMM_K_THRESHOLD pins it explicitly
+        K_thr = self.mgemm_K_threshold
+        if K_thr and not self.mgemm_K_env and device is not None:
+            import torch
+            device = torch.device(device)
+            if device.type == "cuda" and device.index is not None:
+                from ..ext import exllamav3_ext as ext
+                K_thr = ext.exl3_gemv_int8_max_k(device.index) + 1
+        return K >= K_thr or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
 
 
 class NullConfig:
