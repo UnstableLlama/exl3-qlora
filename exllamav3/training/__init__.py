@@ -40,6 +40,11 @@ from .preference import (
     kto_loss,
     mismatched_kl_shift,
 )
+# realtime builds on native_llama the same lazy way; safe to import here.
+from .realtime import (
+    RealtimeQLoRA,
+    RealtimeConfig,
+)
 
 __all__ = [
     "EXL3LoRAFunction",
@@ -55,4 +60,6 @@ __all__ = [
     "dpo_loss",
     "kto_loss",
     "mismatched_kl_shift",
+    "RealtimeQLoRA",
+    "RealtimeConfig",
 ]
