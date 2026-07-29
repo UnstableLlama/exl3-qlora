@@ -45,6 +45,30 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   such rows fail fast instead of being silently truncated, which is what the
   old `extract_single_turn` path did). CPU-tested in
   `tests/test_chat_turns.py`.
+- `chat_jinja.py` — `--prompt-format jinja`: the same segment contract, but
+  rendered through the model directory's own Jinja chat template
+  (`chat_template.jinja` / `chat_template.json` / `tokenizer_config.json`;
+  `--chat-template-file` overrides). Segments come from incremental prefix
+  rendering (`messages[:i]` diffs, always `add_generation_prompt=False` for
+  the conversation itself), with the assistant header/prefill split off via
+  the template's own `add_generation_prompt=True` rendering — so everything
+  the model would generate (reasoning span, content, tool-call block, turn
+  close) is supervised and everything it would be prompted with is masked.
+  This unlocks what the hardcoded formats reject: `tool` roles,
+  `tool_calls` + `reasoning_content` message keys, a per-row `tools` column,
+  and template variables — `--template-vars '{"enable_thinking": false}'`
+  globally, plus per-row `template_vars` / `chat_template_kwargs` columns
+  (synonyms; the tabby and llama-server names for the same bag). So a
+  dataset row can be `{messages, tools, template_vars}`. An assistant turn
+  with `tool_calls` is supervised through its turn-close token, which is
+  exactly what triggers the tool-call finish reason at inference — the
+  template takes care of it. Caveats: the template must be prefix-monotonic
+  (templates that strip `reasoning_content` from history render fine as long
+  as reasoning appears only on the final assistant turn — the shape
+  OAI-style APIs return; rows that violate this are skipped and counted).
+  Multimodal content-parts lists pass through the template (placeholders and
+  all) but training is text-only — no pixel features are attached; such rows
+  are counted and reported. CPU-tested in `tests/test_chat_jinja.py`.
 - `qlora_train_native_ddp.py` — the multi-GPU DDP variant (run under
   `torchrun`).
 - `qlora_train_pref.py` — DPO / KTO / SimPO preference training on the native

@@ -169,7 +169,8 @@ def _run_main():
                          "response; the flat instruction/response keys are ignored.")
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
-                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml"],
+                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml",
+                             "jinja"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
@@ -181,7 +182,15 @@ def _run_main():
                          "reasoning trained). llama3: explicit Llama-3 headers "
                          "(= auto for the llama arch). qwen3.5: plain ChatML "
                          "(= auto for qwen3/3.5). qwen3.5-nothink: ChatML with an "
-                         "empty <think> block pre-closed in the masked prompt.")
+                         "empty <think> block pre-closed in the masked prompt. "
+                         "jinja: the model directory's own Jinja chat template "
+                         "(see training/chat_jinja.py).")
+    ap.add_argument("--chat-template-file", default=None,
+                    help="(jinja) Jinja template file overriding the model "
+                         "directory's template.")
+    ap.add_argument("--template-vars", default=None,
+                    help="(jinja) JSON object of extra template variables, "
+                         "e.g. '{\"enable_thinking\": false}'.")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* + normalize whitespace "
                          "(OFF by default; leave off for reasoning/code/markdown).")
@@ -498,6 +507,8 @@ def _run_main():
     # 4. Data. Build the full set identically on every rank (same seed/order), then
     #    take a disjoint stride-shard so each GPU trains on different examples.
     _FAIL_CTX["phase"] = "build_dataset"
+    from chat_jinja import parse_template_vars
+    template_vars = parse_template_vars(args.template_vars)
     examples = build_sft_examples(
         model, tokenizer, args.dataset, args.max_samples, args.seq_len,
         instruction_key=args.instruction_key, context_key=args.context_key,
@@ -508,6 +519,8 @@ def _run_main():
         messages_key=args.messages_key,
         prompt_format=args.prompt_format,
         shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
+        chat_template_file=args.chat_template_file,
+        template_vars=template_vars,
     )
     # Held-out eval set, built identically on every rank. Prefer the dataset's own
     # eval split (real held-out data); otherwise carve the first val_frac off
@@ -535,6 +548,8 @@ def _run_main():
                 messages_key=args.messages_key,
                 prompt_format=args.prompt_format,
                 config_name=args.eval_config,
+                chat_template_file=args.chat_template_file,
+                template_vars=template_vars,
             )
     elif args.val_frac > 0:
         n_val = max(1, int(len(examples) * args.val_frac))
@@ -561,7 +576,9 @@ def _run_main():
                 min_response_words=args.min_response_words,
                 uppercase_response=args.uppercase_response,
                 messages_key=args.messages_key, prompt_format=args.prompt_format,
-                config_name=args.eval2_config)
+                config_name=args.eval2_config,
+                chat_template_file=args.chat_template_file,
+                template_vars=template_vars)
     # Sample packing (training set only). Pack the FULL set identically on every
     # rank BEFORE sharding, so all ranks see the same block count (lockstep step
     # math) and the stride-shard stays balanced. The val carve above already
@@ -641,7 +658,10 @@ def _run_main():
     if args.sample_every:
         if is_main(rank):
             from exllamav3 import Generator
-            build_prompt, _ = format_prompt_and_eot(model, tokenizer, args.prompt_format)
+            build_prompt, _ = format_prompt_and_eot(
+                model, tokenizer, args.prompt_format,
+                chat_template_file=args.chat_template_file,
+                template_vars=template_vars)
             generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
             net.eval()
             with torch.inference_mode():

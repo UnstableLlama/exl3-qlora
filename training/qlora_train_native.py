@@ -62,7 +62,7 @@ from run_report import (RunLogger, decode_example_docs,  # noqa: E402
 from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
                         trim_trailing_context, make_segment_builder,
                         encode_segments, encode_completion,
-                        AUTO_SINGLE_TURN_HINT)
+                        turn_text, AUTO_SINGLE_TURN_HINT)
 
 
 class ThroughputMeter:
@@ -391,11 +391,20 @@ def turn_end_token(tokenizer):
     return ""
 
 
-def format_prompt_and_eot(model, tokenizer, prompt_format):
+def format_prompt_and_eot(model, tokenizer, prompt_format,
+                          chat_template_file=None, template_vars=None):
     """Return ``(build_prompt(user, system=None) -> str, eot_str)`` for the
     chosen chat format. ``system`` is optional and folded into the template's
     system turn when given (falsy/None omits it entirely -- identical output
     to before system support existed).
+
+    - ``jinja``: the model directory's own Jinja chat template
+      (chat_template.jinja / chat_template.json / tokenizer_config.json's
+      chat_template key; ``chat_template_file`` overrides), rendered with
+      ``add_generation_prompt=True`` and ``template_vars`` in the context --
+      see training/chat_jinja.py. The eot is derived from the template itself
+      (the text it appends after assistant content), falling back to
+      :func:`turn_end_token` for templates the probe can't render.
 
     - ``auto`` (default): the model's own template (``default_chat_prompt`` --
       Llama-3, Mistral ``[INST]``, mistral3 ``[SYSTEM_PROMPT]``/``[INST]``, etc.)
@@ -492,12 +501,19 @@ def format_prompt_and_eot(model, tokenizer, prompt_format):
             return (f"{sys_part}<|im_start|>user\n{user}<|im_end|>\n"
                     f"<|im_start|>assistant\n{nothink}")
         return build, "<|im_end|>"
+    if prompt_format == "jinja":
+        from chat_jinja import jinja_renderers, tokenizer_special_tokens
+        _, build, eot = jinja_renderers(
+            tokenizer.config.directory,
+            special_tokens=tokenizer_special_tokens(tokenizer),
+            template_file=chat_template_file, default_vars=template_vars)
+        return build, (eot or turn_end_token(tokenizer))
     if prompt_format == "auto":
         return ((lambda user, system=None: model.default_chat_prompt(user, system_prompt=system)),
                 turn_end_token(tokenizer))
     raise ValueError(f"unknown prompt-format '{prompt_format}' "
                       f"(expected auto/mistral/metharme/gemma4-nothink/llama3/"
-                      f"qwen3.5/qwen3.5-nothink/chatml)")
+                      f"qwen3.5/qwen3.5-nothink/chatml/jinja)")
 
 
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
@@ -744,23 +760,34 @@ def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
     example with only the assistant turns supervised. Returns
     ``(example, None)`` or ``(None, reason)`` where reason is a short skip
     label for the caller's counter (``malformed`` / ``short`` /
-    ``unrenderable`` / ``truncated``)."""
+    ``unrenderable`` / ``truncated``).
+
+    Rich turns (the jinja path: content-parts lists, tool_calls,
+    reasoning_content) are handled conservatively: cleaning/uppercasing
+    touch STRING contents only, word counts use the text view
+    (chat_turns.turn_text), and a turn with tool_calls/reasoning survives an
+    empty content."""
+    def keep(t):
+        return (turn_text(t).strip() or t.get("tool_calls")
+                or t.get("reasoning_content"))
     if clean_text:
-        turns = [dict(t, content=(t["content"] if t["role"] == "system"
-                                  else clean_style_text(t["content"])))
-                 for t in turns]
-        turns = [t for t in turns if t["content"]]
+        turns = [dict(t, content=clean_style_text(t["content"]))
+                 if t["role"] != "system" and isinstance(t.get("content"), str)
+                 else t for t in turns]
+        turns = [t for t in turns if keep(t)]
     turns = trim_trailing_context(turns)
     roles = [t["role"] for t in turns]
     if "user" not in roles or "assistant" not in roles:
         return None, "malformed"
-    asst_words = sum(len(t["content"].split()) for t in turns
-                     if t["role"] == "assistant")
-    if asst_words < min_response_words:
+    asst = [t for t in turns if t["role"] == "assistant"]
+    asst_words = sum(len(turn_text(t).split()) for t in asst)
+    if asst_words < min_response_words and not any(
+            t.get("tool_calls") or t.get("reasoning_content") for t in asst):
         return None, "short"
     if uppercase_response:
         turns = [dict(t, content=t["content"].upper())
-                 if t["role"] == "assistant" else t for t in turns]
+                 if t["role"] == "assistant" and isinstance(t.get("content"), str)
+                 else t for t in turns]
     try:
         segments = seg_builder(turns)
     except ValueError:
@@ -778,7 +805,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        clean_text=True, min_response_words=3,
                        uppercase_response=False, messages_key=None,
                        prompt_format="auto", shuffle=False, shuffle_seed=0,
-                       config_name=None):
+                       config_name=None, chat_template_file=None,
+                       template_vars=None):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -803,6 +831,18 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         with a pointer instead of being silently truncated). Rows with roles
         the format can't render (e.g. ``tool``) or with no user turn are
         skipped and counted.
+
+    ``--prompt-format jinja`` renders EVERY messages row (single- and
+    multi-turn) through the model's own Jinja chat template via the segment
+    path (training/chat_jinja.py) -- there is no single-turn shortcut, the
+    template is the single source of truth. Rich message keys
+    (reasoning_content / tool_calls / tool roles / content-parts lists) are
+    preserved and rendered; per-row ``tools`` and ``template_vars`` /
+    ``chat_template_kwargs`` columns join the render context on top of the
+    CLI-level ``template_vars``. Rows the template can't segment-render
+    (non-prefix-monotonic history, see chat_jinja) are skipped and counted.
+    Rows with non-text content parts (images etc.) train on the rendered
+    text only -- placeholder tokens, no pixel features -- and are counted.
 
     clean_text strips stage directions / inline actions and normalizes
     whitespace (helps play-script style sets like the Shakespeare default, whose
@@ -829,14 +869,47 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     if max_samples and max_samples < len(ds):
         ds = ds.select(range(max_samples))
 
-    build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
-    seg_builder = make_segment_builder(prompt_format,
-                                       bos_token=tokenizer.bos_token,
-                                       eos_token=tokenizer.eos_token)
+    jinja = prompt_format == "jinja"
+    if jinja:
+        from chat_jinja import (jinja_renderers, tokenizer_special_tokens,
+                                extract_rich_turns, row_template_extras,
+                                has_nontext_parts)
+        seg_builder, build_prompt, eot = jinja_renderers(
+            tokenizer.config.directory,
+            special_tokens=tokenizer_special_tokens(tokenizer),
+            template_file=chat_template_file, default_vars=template_vars)
+        eot = eot or turn_end_token(tokenizer)
+    else:
+        build_prompt, eot = format_prompt_and_eot(model, tokenizer, prompt_format)
+        seg_builder = make_segment_builder(prompt_format,
+                                           bos_token=tokenizer.bos_token,
+                                           eos_token=tokenizer.eos_token)
 
     examples = []
-    n_multi, skipped = 0, {}
+    n_multi, n_mm, skipped = 0, 0, {}
     for ex in ds:
+        if messages_key and jinja:
+            # The template is the single source of truth: every messages row
+            # (single- or multi-turn, tool calls, reasoning) takes the
+            # segment path, with the row's tools/template_vars in context.
+            turns = trim_trailing_context(
+                extract_rich_turns(ex.get(messages_key)))
+            if not any(t["role"] == "assistant" for t in turns):
+                continue  # nothing to supervise
+            if has_nontext_parts(turns):
+                n_mm += 1
+            extras = row_template_extras(ex)
+            row_builder = (lambda t, _x=extras, **kw:
+                           seg_builder(t, **kw, **_x))
+            built, reason = _build_multi_turn_example(
+                tokenizer, row_builder, turns, seq_len, clean_text,
+                min_response_words, uppercase_response)
+            if built is None:
+                skipped[reason] = skipped.get(reason, 0) + 1
+            else:
+                n_multi += 1
+                examples.append(built)
+            continue
         if messages_key:
             # Trailing non-assistant turns supervise nothing; trimming them
             # first also lets a [user, assistant, user] row keep the exact
@@ -895,9 +968,16 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
 
     if (n_multi or skipped) and int(os.environ.get("RANK", "0") or 0) == 0:
         note = ", ".join(f"{v} {k}" for k, v in sorted(skipped.items()))
-        print(f" -- messages: {n_multi} multi-turn rows rendered "
+        what = ("rows rendered via the model's Jinja chat template" if jinja
+                else "multi-turn rows rendered")
+        print(f" -- messages: {n_multi} {what} "
               f"(assistant turns supervised, user/system masked)"
               + (f"; skipped {sum(skipped.values())} ({note})" if skipped else ""))
+        if n_mm:
+            print(f" -- NOTE: {n_mm} rows carry non-text content parts "
+                  f"(image/video/audio). They render as the template's "
+                  f"placeholder tokens WITHOUT pixel features -- this trainer "
+                  f"is text-only, so only the text is trained.")
     return examples
 
 
@@ -1392,11 +1472,15 @@ def _run_main():
                          "before. Multi-turn rows: every turn is rendered and "
                          "ONLY assistant turns are supervised (user/system masked "
                          "to -100); needs an explicit --prompt-format (auto is "
-                         "single-turn only). --instruction/context/response-key "
-                         "are ignored.")
+                         "single-turn only). With --prompt-format jinja, rows "
+                         "may also carry tools and template_vars/"
+                         "chat_template_kwargs columns, and messages may carry "
+                         "reasoning_content/tool_calls. "
+                         "--instruction/context/response-key are ignored.")
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
-                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml"],
+                             "llama3", "qwen3.5", "qwen3.5-nothink", "chatml",
+                             "jinja"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
@@ -1411,9 +1495,25 @@ def _run_main():
                          "<think> spans). qwen3.5-nothink: ChatML with an empty "
                          "<think>\\n\\n</think>\\n\\n pre-closed in the masked prompt, "
                          "matching the inference-side no-think prefill. "
+                         "jinja: the model directory's own Jinja chat template "
+                         "(tokenizer_config.json / chat_template.jinja), with "
+                         "tool roles, tool_calls, reasoning_content, per-row "
+                         "tools + template_vars/chat_template_kwargs columns, "
+                         "and exact per-turn masks via incremental rendering "
+                         "(see training/chat_jinja.py; --chat-template-file / "
+                         "--template-vars below). "
                          "EOS ends the turn for mistral/metharme; <turn|> for "
                          "gemma4-nothink; <|eot_id|> for llama3; <|im_end|> for "
-                         "qwen3.5/qwen3.5-nothink.")
+                         "qwen3.5/qwen3.5-nothink; whatever the template "
+                         "appends after assistant content for jinja.")
+    ap.add_argument("--chat-template-file", default=None,
+                    help="(jinja) Path to a Jinja template file to use instead "
+                         "of the one in the model directory.")
+    ap.add_argument("--template-vars", default=None,
+                    help="(jinja) JSON object of extra template variables in "
+                         "every render, e.g. '{\"enable_thinking\": false}'. "
+                         "Per-row template_vars/chat_template_kwargs columns "
+                         "override these per key.")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* and normalize "
                          "whitespace before training (OFF by default). Helps "
@@ -1878,6 +1978,8 @@ def _run_main():
 
     # 3. Data.
     _FAIL_CTX["phase"] = "build_dataset"
+    from chat_jinja import parse_template_vars
+    template_vars = parse_template_vars(args.template_vars)
     examples = build_sft_examples(
         model, tokenizer, args.dataset, args.max_samples, args.seq_len,
         instruction_key=args.instruction_key, context_key=args.context_key,
@@ -1888,6 +1990,8 @@ def _run_main():
         messages_key=args.messages_key,
         prompt_format=args.prompt_format,
         shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
+        chat_template_file=args.chat_template_file,
+        template_vars=template_vars,
     )
     print(f" -- {len(examples)} SFT examples{' (shuffled)' if args.shuffle else ''}")
     assert examples, "no usable training examples"
@@ -1897,7 +2001,10 @@ def _run_main():
     # --seq-len truncation are visible before committing to a run. Specials are
     # shown so the chat template / <|eot_id|> stop token can be eyeballed.
     if args.inspect:
-        _, eot = format_prompt_and_eot(model, tokenizer, args.prompt_format)
+        _, eot = format_prompt_and_eot(
+            model, tokenizer, args.prompt_format,
+            chat_template_file=args.chat_template_file,
+            template_vars=template_vars)
         eot_id = tokenizer.encode(eot, add_bos=False,
                                   encode_special_tokens=True)[0].tolist() if eot else []
         # encode() auto-prepends BOS (see build_sft_examples); strip it so the
@@ -1976,6 +2083,8 @@ def _run_main():
                 messages_key=args.messages_key,
                 prompt_format=args.prompt_format,
                 config_name=args.eval_config,
+                chat_template_file=args.chat_template_file,
+                template_vars=template_vars,
             )
             kind = "SFT"
         print(f" -- held-out eval: {len(val_examples)} {kind} examples from "
@@ -2008,7 +2117,9 @@ def _run_main():
                 min_response_words=args.min_response_words,
                 uppercase_response=args.uppercase_response,
                 messages_key=args.messages_key, prompt_format=args.prompt_format,
-                config_name=args.eval2_config)
+                config_name=args.eval2_config,
+                chat_template_file=args.chat_template_file,
+                template_vars=template_vars)
             kind = "SFT"
         print(f" -- eval2 ({eval2_label}): {len(val2_examples)} {kind} examples "
               f"from split '{args.eval2_split}'")
@@ -2059,7 +2170,10 @@ def _run_main():
     # 4. Optional generator for live samples (KV-cache inference path). The cache
     #    was allocated before load() above. Use the training chat format so the
     #    preview is meaningful for a metharme-trained adapter.
-    build_prompt, _ = format_prompt_and_eot(model, tokenizer, args.prompt_format)
+    build_prompt, _ = format_prompt_and_eot(
+        model, tokenizer, args.prompt_format,
+        chat_template_file=args.chat_template_file,
+        template_vars=template_vars)
     generator = None
     if args.sample_every:
         from exllamav3 import Generator

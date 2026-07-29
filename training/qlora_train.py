@@ -61,7 +61,8 @@ COMMON_KEYS = {
     "model", "out", "r", "alpha", "expert_r", "lora_dropout", "lr", "weight_decay", "scheduler",
     "warmup_ratio", "warmup_steps", "epochs", "steps", "batch", "grad_accum",
     "dataset", "dataset_split", "instruction_key", "context_key", "response_key",
-    "messages_key", "prompt_format", "clean_text", "no_clean_text",
+    "messages_key", "prompt_format", "chat_template_file", "template_vars",
+    "clean_text", "no_clean_text",
     "min_response_words", "uppercase_response", "max_samples", "shuffle",
     "shuffle_seed", "seq_len", "pack", "pack_algo", "ga_loss",
     "profile_dequant", "dequant_mode", "dequant_cache",
@@ -111,6 +112,7 @@ EBFT_KEYS = {
     # data
     "mode", "dataset", "dataset_split", "dataset_config", "instruction_key",
     "context_key", "response_key", "messages_key", "text_key", "prompt_format",
+    "chat_template_file", "template_vars",
     "max_samples", "shuffle", "shuffle_seed", "seq_len", "clean_text",
     "min_response_words",
     # eval / saving
@@ -150,7 +152,8 @@ PREF_KEYS = {
     # data
     "dataset", "dataset_split", "dataset_config", "prompt_key",
     "chosen_key", "rejected_key", "completion_key", "label_key",
-    "prompt_format", "max_samples", "shuffle", "shuffle_seed", "seq_len",
+    "prompt_format", "chat_template_file", "template_vars",
+    "max_samples", "shuffle", "shuffle_seed", "seq_len",
     "inspect",
     # eval / saving
     "eval_split", "eval_dataset", "eval_max_samples", "val_frac", "eval_every",
