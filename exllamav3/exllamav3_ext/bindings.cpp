@@ -5,6 +5,7 @@
 #include <pybind11/stl.h>
 
 #include "stloader.h"
+#include "cuda_host.h"
 #include "hadamard.h"
 
 #include "norm.cuh"
@@ -50,6 +51,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
@@ -65,9 +67,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
     m.def("stloader_close_file", &stloader_close_file, "stloader_close_file");
     py::class_<TensorLoadJob>(m, "TensorLoadJob")
-        .def(py::init<std::vector<uintptr_t>, size_t, size_t, uintptr_t, bool, bool, bool, int>());
+        .def(py::init<std::vector<uintptr_t>, size_t, size_t, uintptr_t, size_t, bool, bool, bool, int>());
     m.def("stloader_deferred_cpu", &stloader_deferred_cpu, py::arg("jobs"));
     m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
+
+    m.def("cuda_host_register", &cuda_host_register, py::arg("ptr"), py::arg("nbytes"), py::arg("flags"));
+    m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));
+    m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
+    m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
 
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
@@ -176,6 +183,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_cache_cont", &dequant_cache_cont, "dequant_cache_cont");
     m.def("quant_cache_paged", &quant_cache_paged, "quant_cache_paged");
     m.def("dequant_cache_paged", &dequant_cache_paged, "dequant_cache_paged");
+    m.def("dequant_cache_paged_window", &dequant_cache_paged_window, "dequant_cache_paged_window");
 
     m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
     m.def("histogram", &histogram, "histogram");
@@ -191,6 +199,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"

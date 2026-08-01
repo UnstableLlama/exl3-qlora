@@ -99,6 +99,19 @@ def test_bc_attn_graph_dispatch_guarded(fname):
         src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA guard"
 
 
+def test_mla_graph_dispatch_guarded():
+    # v1.3.0: MLAttention (DeepseekV3-class) has a graph-captured decode block
+    # binding q/q_a/kv_a/o projections' base trellis (inner.bc); the dispatch
+    # must fall back to the Linear.forward-based path under a runtime LoRA.
+    # (q_a_proj here is DeepSeek's architectural low-rank factorization, not an
+    # adapter; kv_b_proj is absorbed into w_uk_flat on every path.)
+    src = _src("exllamav3", "modules", "mla_attn.py")
+    assert re.search(
+        r"params\.get\(\"causal\", True\)[^:]*?"
+        r"not has_runtime_lora\(self\.q_proj, self\.q_a_proj,",
+        src, re.S), "MLAttention: graph-captured decode lost its runtime-LoRA guard"
+
+
 def test_plain_mlp_bsz1_graph_guarded():
     # BC_MLP (v1.0.0, non-gated up/act/down for NemotronH-class models) runs
     # the whole MLP in one graph-captured C++ call, reading the up/down

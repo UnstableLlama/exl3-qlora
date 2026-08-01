@@ -1,6 +1,6 @@
 # exl3-qlora
 
-**QLoRA fine-tuning directly on EXL3-quantized models.** This repo began as a fork of [turboderp's ExLlamaV3](https://github.com/turboderp-org/exllamav3) and still contains the full inference library (synced to upstream v1.2.1 — see the [upstream README](https://github.com/turboderp-org/exllamav3#readme) for inference, conversion, and installation documentation). On top of it there is a self-contained, **transformers-free** training path: a differentiable forward built over the EXL3 trellis (validated against the native inference forward to 100% argmax agreement), a plain-PyTorch trainer, and adapters that save in standard PEFT format.
+**QLoRA fine-tuning directly on EXL3-quantized models.** This repo began as a fork of [turboderp's ExLlamaV3](https://github.com/turboderp-org/exllamav3) and still contains the full inference library (synced to upstream v1.3.0 — see the [upstream README](https://github.com/turboderp-org/exllamav3#readme) for inference, conversion, and installation documentation). On top of it there is a self-contained, **transformers-free** training path: a differentiable forward built over the EXL3 trellis (validated against the native inference forward to 100% argmax agreement), a plain-PyTorch trainer, and adapters that save in standard PEFT format.
 
 ### Why train on EXL3 instead of bitsandbytes?
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import webbrowser
 from exllamav3 import Generator, Job, model_init
+from exllamav3.constants import PAGE_SIZE
 from chat_templates import *
 from chat_util import *
 from chat_io import *
@@ -68,6 +69,15 @@ def main(args):
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     context_length = cache.max_num_tokens
 
+    # Limit max_response_tokens if cache_size is too small
+    if max_response_tokens > context_length // 2:
+        max_response_tokens = context_length // 2
+        print_error(
+            f" !! --max_response_tokens {args.max_response_tokens} leaves no room in the cache "
+            f"({context_length} tokens) for the system prompt and user messages. Reducing max response "
+            f"tokens to {max_response_tokens}."
+        )
+
     # Generator
     generator = Generator(
         model = model,
@@ -79,6 +89,8 @@ def main(args):
         ngram_match_min = args.ngram_match_min,
         dynamic_draft_tokens = args.dynamic_draft,
         dynamic_draft_skip_ema = args.draft_skip_ema,
+        cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
@@ -135,9 +147,11 @@ def main(args):
                         "/cc <n>            Copy nth-last code block to clipboard",
                         "/clear             Clear context",
                         "/e                 Edit and resume last model response",
+                        "/gm                Generator metrics",
                         "/load              Load stored session from ~/chat_py_session.json",
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
+                        "/ppt               Print page table",
                         "/probs             Set number of probs recorded (0 to disable), adds overhead",
                         "/python            Extract and run the longest code block in a bwrap sandbox",
                         "/r                 Rewind and repeat last prompt",
@@ -238,6 +252,21 @@ def main(args):
                     except KeyboardInterrupt:
                         print_info("Exiting")
                         break
+
+                # Generator metrics
+                case "/gm":
+                    m = f"Page table: {generator.pagetable.metrics}"
+                    if generator.cpu_page_cache is not None:
+                        cpc = generator.cpu_page_cache
+                        m += f"\nCPU cache: {cpc.metrics}"
+                        m += f"\nCPU cache pages: {len(cpc)} / {cpc.max_slots} ({cpc.slot_size / 1024 ** 2:.2f} MB/page)"
+                    print_info(m)
+                    continue
+
+                # Page table/cache
+                case "/ppt":
+                    print_info(generator.pagetable.dump_page_list())
+                    continue
 
                 # Edit system prompt
                 case "/sp":
@@ -417,11 +446,29 @@ def main(args):
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
             return ids_, exp_len_
 
+        def fits(_exp_len):
+            # The job occupies whole cache pages
+            return (_exp_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE <= context_length
+
         ids, exp_len = get_input_ids(prefix)
-        if exp_len > context_length:
-            while exp_len > context_length - 2 * max_response_tokens:
+        if not fits(exp_len):
+            # Drop about a third of the cache for hysteresis, then round by round in case that isn't
+            # enough for a long user prompt
+            start_len = ids.shape[-1]
+            while len(context) > 1 and start_len - ids.shape[-1] < context_length // 3:
                 context = context[1:]
                 ids, exp_len = get_input_ids(prefix)
+            while not fits(exp_len) and len(context) > 1:
+                context = context[1:]
+                ids, exp_len = get_input_ids(prefix)
+            if not fits(exp_len):
+                print_error(
+                    f" !! Prompt needs {exp_len} tokens of cache (including {max_response_tokens} "
+                    f"reserved for the response) but only {context_length} are available. Increase "
+                    f"--cache_size or reduce --max_response_tokens."
+                )
+                context = context[:-1]
+                continue
 
         last_input_ids = ids.clone()
 
