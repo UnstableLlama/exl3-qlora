@@ -63,13 +63,14 @@ void gated_rms_norm_gr
     bool gate_first = false
 );
 
-void gated_rms_norm_gr
+void rms_norm_gr
 (
-    at::Tensor x,
-    at::Tensor w,
-    at::Tensor y,
-    at::Tensor g,
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& w,
+    at::Tensor& y,
     float epsilon,
     float constant_bias,
+    float constant_scale,
+    bool span_heads,
     Graph* graph
 );

@@ -20,6 +20,10 @@ TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
+# Score activations for the nogroup routing kernels (must match routing.cu)
+ROUTING_ACT_SIGMOID = 0
+ROUTING_ACT_SQRTSP = 1
+
 @dataclass
 class RoutingCFG:
     gate_tensor: torch.Tensor
@@ -35,6 +39,7 @@ class RoutingCFG:
     topk_group: int | None
     per_expert_scale: torch.Tensor | None
     router_bias: torch.Tensor | None = None
+    tid2eid: torch.Tensor | None = None
 
 @dataclass
 class FusedBuffers:
@@ -174,6 +179,7 @@ def routing_dots(bsz, cfg, y, params):
             cfg.routing_weights_bsz1,
             cfg.routed_scaling_factor,
             cfg.gate_tensor_t,
+            ROUTING_ACT_SIGMOID,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
 
@@ -203,8 +209,87 @@ def routing_dots(bsz, cfg, y, params):
                 routing_weights,
                 cfg.routed_scaling_factor,
                 None,
+                ROUTING_ACT_SIGMOID,
             )
         return selected_experts, routing_weights
+
+
+def _sqrtsp_scores(cfg, y):
+    logits = torch.matmul(y.float(), cfg.gate_tensor.float())
+    return F.softplus(logits).sqrt()
+
+
+def routing_sqrtsp(bsz, cfg, y, params):
+    """DeepSeek-V4 router: sqrt(softplus(logits)) affinity, noaux_tc bias for selection only,
+    weights normalized over the selected set, times routed_scaling_factor. The nogroup top-k
+    kernel serves every batch size (one block per row); bsz 1 reuses the cached output
+    buffers, larger batches allocate per call. activate_all_experts (conversion) stays
+    torch-composed."""
+    if params.get("activate_all_experts"):
+        scores = _sqrtsp_scores(cfg, y)
+        routing_weights = scores / (scores.sum(dim = -1, keepdim = True) + 1e-20)
+        routing_weights = (routing_weights * cfg.routed_scaling_factor).half()
+        selected_experts = (
+            torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+            .repeat((bsz, 1))
+        )
+        return selected_experts, routing_weights
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    if bsz == 1:
+        router_logits = cfg.router_logits_bsz1
+        selected_experts = cfg.selected_experts_bsz1
+        routing_weights = cfg.routing_weights_bsz1
+    else:
+        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
+        selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
+        routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
+    ext.routing_ds3_nogroup(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        cfg.e_score_correction_bias,
+        selected_experts,
+        routing_weights,
+        cfg.routed_scaling_factor,
+        cfg.gate_tensor_t,
+        ROUTING_ACT_SQRTSP,
+    )
+    return selected_experts, routing_weights
+
+
+def routing_sqrtsp_hash(bsz, cfg, y, params):
+    """DeepSeek-V4 hash-MoE bootstrap: expert indices come from the frozen tid2eid table
+    indexed by the current tokens (params["input_ids"], flattened row-major); the learned
+    gate still weights the selected experts."""
+    if params.get("activate_all_experts"):
+        return routing_sqrtsp(bsz, cfg, y, params)
+    # One device copy of the ids per forward via the params cache, shared by every hash
+    # layer on that device; batch dims flatten row-major, matching the hidden-state rows
+    from .attn import get_for_device
+    input_ids = get_for_device(params, "input_ids", cfg.tid2eid.device).reshape(-1)
+    assert input_ids.shape[0] == bsz, \
+        f"hash routing: {bsz} hidden rows but {input_ids.shape[0]} input ids"
+    selected_experts = cfg.tid2eid[input_ids].to(y.device).long()
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    if bsz == 1:
+        routing_weights = cfg.routing_weights_bsz1
+        router_logits = cfg.router_logits_bsz1
+    else:
+        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
+        routing_weights = torch.empty(selected_experts.shape, dtype = torch.half, device = y.device)
+    ext.routing_sel_norm(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        selected_experts,
+        routing_weights,
+        cfg.routed_scaling_factor,
+        cfg.gate_tensor_t,
+        ROUTING_ACT_SQRTSP,
+    )
+    return selected_experts, routing_weights
 
 
 @dataclass
@@ -241,6 +326,7 @@ class BlockSparseMLP(Module):
         key_routing_gate: str | None = None,
         key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
+        key_tid2eid: str | None = None,
         key_per_expert_scale: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
@@ -277,10 +363,12 @@ class BlockSparseMLP(Module):
 
         self.interm_dtype = interm_dtype
         self.interm_div = interm_div
+        self.router_type = router_type
         if interm_div != 1.0:
-            assert router_type in ("dots", "ds3"), \
-                "interm_div requires a router type that folds routed_scaling_factor into the routing weights"
-            routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
+            assert router_type in ("dots", "ds3", "std"), \
+                "interm_div requires a router type that can fold the compensation into the routing weights"
+            if router_type != "std":
+                routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.intermediate_size_padded = (intermediate_size + 127) // 128 * 128
@@ -491,6 +579,8 @@ class BlockSparseMLP(Module):
 
         self.e_score_correction_bias = None
         self.e_score_correction_bias_key = key_e_score_bias
+        self.tid2eid = None
+        self.tid2eid_key = key_tid2eid
         self.per_expert_scale = None
         self.per_expert_scale_key = key_per_expert_scale
 
@@ -503,6 +593,8 @@ class BlockSparseMLP(Module):
             case "std_bias": self.routing_fn = routing_std_bias
             case "ds3": self.routing_fn = routing_ds3
             case "dots": self.routing_fn = routing_dots
+            case "sqrtsp": self.routing_fn = routing_sqrtsp
+            case "sqrtsp_hash": self.routing_fn = routing_sqrtsp_hash
             case _: raise ValueError(f"Unknown router type {router_type}")
 
         self.tp_reduce = False
@@ -585,6 +677,9 @@ class BlockSparseMLP(Module):
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}", self.device, optional = True, allow_bf16 = True)
+        if self.tid2eid_key:
+            self.tid2eid = self.config.stc.get_tensor(
+                f"{self.key}.{self.tid2eid_key}", self.device, no_defer = True)
         self.load_routing(**kwargs)
 
         from ..model.moe_cpu_host import MoeCpuHost
@@ -889,6 +984,16 @@ class BlockSparseMLP(Module):
 
     def load_routing(self, **kwargs):
 
+        if self.interm_div != 1.0 and self.router_type == "std":
+            # std routing has no scaling factor; fold the interm_div compensation into the
+            # per-expert scale, which routing_std applies after top-k normalization. Both the
+            # GPU and CPU-offload load paths come through here, and unload clears the tensor
+            if self.per_expert_scale is None:
+                self.per_expert_scale = torch.full(
+                    (self.num_experts,), self.interm_div, dtype = torch.bfloat16, device = self.device)
+            else:
+                self.per_expert_scale = (self.per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
+
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
         routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
         selected_experts_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.long, device = self.device)
@@ -903,6 +1008,7 @@ class BlockSparseMLP(Module):
             routing_weights_bsz1 = routing_weights_bsz1,
             selected_experts_bsz1 = selected_experts_bsz1,
             e_score_correction_bias = self.e_score_correction_bias,
+            tid2eid = self.tid2eid,
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
@@ -938,6 +1044,12 @@ class BlockSparseMLP(Module):
                 )
                 if self.e_score_correction_bias is not None:
                     break
+        if self.tid2eid_key:
+            self.tid2eid = self.config.stc.get_tensor(
+                f"{self.key}.{self.tid2eid_key}",
+                self.device,
+                no_defer = True,
+            )
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
@@ -977,6 +1089,7 @@ class BlockSparseMLP(Module):
         self.routing_cfg = None
         self.experts_cfg = None
         self.e_score_correction_bias = None
+        self.tid2eid = None
         self.per_expert_scale = None
         self.bcast_sel_bsz1 = None
         self.bcast_weights_bsz1 = None
@@ -1289,8 +1402,7 @@ class BlockSparseMLP(Module):
                         mine,
                         maxe,
                         0,
-                        1
-                    )
+                        1, None, None)
 
                 # Up
                 ext.exl3_mgemm(
@@ -1309,8 +1421,7 @@ class BlockSparseMLP(Module):
                     mine,
                     maxe,
                     0,
-                    1
-                )
+                    1, None, None)
 
                 # Activation (gateless: relu_mul(u, u, a) = relu2(u))
                 act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1335,8 +1446,7 @@ class BlockSparseMLP(Module):
                     mine,
                     maxe,
                     0,
-                    1
-                )
+                    1, None, None)
 
                 t = cfg.out_d[0]
                 final_hidden_states[i:i+1] = t
@@ -1365,8 +1475,7 @@ class BlockSparseMLP(Module):
                     cfg.min_expert,
                     cfg.max_expert,
                     0,
-                    1
-                )
+                    1, None, None)
 
             # Up
             ext.exl3_mgemm(
@@ -1385,8 +1494,7 @@ class BlockSparseMLP(Module):
                 cfg.min_expert,
                 cfg.max_expert,
                 0,
-                1
-            )
+                1, None, None)
 
             # Activation (gateless: relu_mul(u, u, a) = relu2(u))
             act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1410,8 +1518,7 @@ class BlockSparseMLP(Module):
                 cfg.min_expert,
                 cfg.max_expert,
                 0,
-                1
-            )
+                1, None, None)
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 
@@ -1468,6 +1575,8 @@ class BlockSparseMLP(Module):
         t = super().get_tensors()
         if self.e_score_correction_bias is not None:
             t[f"{self.key}.{self.e_score_correction_bias_key}"] = self.e_score_correction_bias.contiguous()
+        if self.tid2eid is not None:
+            t[f"{self.key}.{self.tid2eid_key}"] = self.tid2eid.contiguous()
         if self.per_expert_scale is not None:
             t[f"{self.key}.{self.per_expert_scale_key}"] = self.per_expert_scale.contiguous()
         return t
@@ -1533,7 +1642,11 @@ class BlockSparseMLP(Module):
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,
                 "alt_residual_channel": self.alt_residual_channel,
+                "key_tid2eid": self.tid2eid_key,
             },
+            # Hash-MoE bootstrap layers (DeepSeek-V4): frozen token->experts table, needed
+            # wherever routing runs (the output device, like the routing gate)
+            "tid2eid": producer.send(self.tid2eid) if self.tid2eid is not None else None,
             "routing_gate": _export(self.routing_gate),
             "shared_gate": _export(self.shared_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
@@ -1629,6 +1742,8 @@ class BlockSparseMLP(Module):
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
         module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)
+        if exported.get("tid2eid") is not None and device == output_device:
+            module.tid2eid = consumer.recv(exported["tid2eid"], cuda = True)
         if unit == "channels" or num_local_experts > 0:
             module.load_local()
         if module.routing_gate is not None:

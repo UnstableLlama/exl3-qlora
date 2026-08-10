@@ -259,6 +259,9 @@ class PromptFormat_mistral3(PromptFormat):
 
     def format(self, system_prompt, messages, think):
         context = f"[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT]"
+        context += \
+            """[MODEL_SETTINGS]{"reasoning_effort": "{high}"}[/MODEL_SETTINGS]""" if think else \
+            """[MODEL_SETTINGS]{"reasoning_effort": "{none}"}[/MODEL_SETTINGS]"""
         for (u, a) in messages:
             context += f"[INST]{u}[/INST]"
             if a is not None: context += f"{a}"
@@ -271,6 +274,9 @@ class PromptFormat_mistral3(PromptFormat):
         return [
             tokenizer.eos_token_id
         ]
+
+    def thinktag(self):
+        return "[THINK]", "[/THINK]"
 
 
 class PromptFormat_gemma(PromptFormat):
@@ -997,6 +1003,42 @@ class PromptFormat_deepseek(PromptFormat):
         ]
 
 
+class PromptFormat_ds4(PromptFormat):
+    description = "Deepseek-V4"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<｜begin▁of▁sentence｜>{system_prompt}"
+        for (u, a) in messages:
+            context += f"<｜User｜>{u}"
+            context += f"<｜Assistant｜>"
+            context += f"<think>" if think else f"</think>"
+            if a is not None:
+                context += f"{a}"
+                context += f"<｜end▁of▁sentence｜>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<｜User｜>")
+        ]
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -1023,4 +1065,5 @@ prompt_formats = {
     "laguna": PromptFormat_laguna,
     "kimi": PromptFormat_kimi,
     "deepseek": PromptFormat_deepseek,
+    "ds4": PromptFormat_ds4,
 }

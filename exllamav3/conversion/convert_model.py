@@ -8,7 +8,7 @@ from ..modules.linear import convert_exl3_group
 from ..modules.quant.exl3_lib.quantize import auto_split
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
-from ..util.memory import free_mem
+from ..util.memory import free_mem, malloc_trim
 from ..util import Timer, human_time
 from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
@@ -47,7 +47,7 @@ parser.add_argument("-d", "--devices", type = str, default = "0", help = "List o
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
-parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
+parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
 group = parser.add_mutually_exclusive_group()
@@ -183,7 +183,6 @@ def prepare(args) -> (dict, dict, bool, str):
         ("devices", True, None),
         ("device_ratios", True, None),
         ("codebook", True, "mul1"),
-        ("parallel_mode", True, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -259,13 +258,15 @@ def prepare_state(args, job_state, config, model, tokenizer):
     if idx == 0:
         print(f" -- Preparing input state")
         state = get_default_calibration(args, tokenizer)
+        original_input_ids = None
     else:
         if idx < len(model.modules):
             print(f" -- Resuming at: {model.modules[idx].key}")
         else:
             print(f" -- Resuming after: {model.modules[idx - 1].key}")
         state = load_tensor("ckpt/state.safetensors", args)
-    return state
+        original_input_ids = load_tensor("ckpt/original_input_ids.safetensors", args)
+    return state, original_input_ids
 
 
 def get_state_error(x, ref):
@@ -365,6 +366,21 @@ def group_label(group):
     return f"{prefix}* ({len(group)} tensors)"
 
 
+def _tile_split_devices(numel, devices, device_ratios):
+    """Cap the device count for tile-splitting one tensor: shredding a small tensor
+    across many GPUs leaves shards too thin for a meaningful global-scale search
+    (observed as g_sc collapsing to the search floor and proxy_err blowing up). Require
+    ~1M weights per participating device, preferring the fastest devices."""
+    max_dev = max(1, min(len(devices), numel // (1 << 20)))
+    if max_dev >= len(devices):
+        return devices, device_ratios
+    if device_ratios is not None:
+        order = sorted(range(len(devices)), key = lambda i: -device_ratios[i])[:max_dev]
+        order.sort()
+        return [devices[i] for i in order], [device_ratios[i] for i in order]
+    return devices[:max_dev], None
+
+
 def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
 
     allow_grouping = state is not None and not args["image_dump"] and not args["verbose"]
@@ -372,7 +388,13 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
 
     for group in groups:
         if len(group) > 1:
-            quant_args_list = [make_quant_args(args, idx, strategy[l.key], devices, device_ratios) for l in group]
+            quant_args_list = [
+                make_quant_args(
+                    args,
+                    idx,
+                    strategy[l.key],
+                    *_tile_split_devices(l.weights_numel(), devices, device_ratios)
+                ) for l in group]
             with Timer() as t:
                 proxy_errs = convert_exl3_group(
                     group,
@@ -396,7 +418,12 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 flush = True
             )
         else:
-            quant_args = make_quant_args(args, idx, strategy[linear.key], devices, device_ratios)
+            quant_args = make_quant_args(
+                args,
+                idx,
+                strategy[linear.key],
+                *_tile_split_devices(linear.weights_numel(), devices, device_ratios)
+            )
 
             with Timer() as t:
                 sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
@@ -445,46 +472,47 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     def work_thread(device_idx, dev_groups):
         global curr_progress
 
-        t0 = time.time()
-        work_numel = sum(l.weights_numel() for g in dev_groups for l in g)
+        with torch.inference_mode():
+            t0 = time.time()
+            work_numel = sum(l.weights_numel() for g in dev_groups for l in g)
 
-        for group in dev_groups:
-            if len(group) > 1:
-                quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
-                proxy_errs = convert_exl3_group(
-                    group,
-                    [capture_H[l.qmap] for l in group],
-                    quant_args_list,
+            for group in dev_groups:
+                if len(group) > 1:
+                    quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
+                    proxy_errs = convert_exl3_group(
+                        group,
+                        [capture_H[l.qmap] for l in group],
+                        quant_args_list,
+                    )
+                    for linear, quant_args_local, proxy_err in zip(group, quant_args_list, proxy_errs):
+                        assert isinstance(linear.inner, LinearEXL3)
+                        linear.inner.swap_cpu()
+                        print_quantized_linear(config, linear, quant_args_local, proxy_err)
+                        with progress_lock:
+                            curr_progress += 1
+                    continue
+
+                linear = group[0]
+                quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
+
+                proxy_err = linear.convert_exl3(
+                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    quant_args = quant_args_local,
+                    verbose = args["verbose"],
+                    save_reg = False,
+                    override_swap_device = device_idx
                 )
-                for linear, quant_args_local, proxy_err in zip(group, quant_args_list, proxy_errs):
-                    assert isinstance(linear.inner, LinearEXL3)
-                    linear.inner.swap_cpu()
-                    print_quantized_linear(config, linear, quant_args_local, proxy_err)
-                    with progress_lock:
-                        curr_progress += 1
-                continue
+                assert isinstance(linear.inner, LinearEXL3)
+                linear.inner.swap_cpu()
 
-            linear = group[0]
-            quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
+                print_quantized_linear(config, linear, quant_args_local, proxy_err)
+                with progress_lock:
+                    curr_progress += 1
 
-            proxy_err = linear.convert_exl3(
-                capture_H[linear.qmap] if state else linear.init_H_data(False),
-                quant_args = quant_args_local,
-                verbose = args["verbose"],
-                save_reg = False,
-                override_swap_device = device_idx
-            )
-            assert isinstance(linear.inner, LinearEXL3)
-            linear.inner.swap_cpu()
-
-            print_quantized_linear(config, linear, quant_args_local, proxy_err)
-            with progress_lock:
-                curr_progress += 1
-
-        # The device is idle from here until the slowest thread finishes; its measured speed
-        # steers the next module's split
-        torch.cuda.synchronize(torch.device(device_idx))
-        auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
+            # The device is idle from here until the slowest thread finishes; its measured speed
+            # steers the next module's split
+            torch.cuda.synchronize(torch.device(device_idx))
+            auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
 
     # Launch
     threads = []
@@ -502,7 +530,6 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 progress.update(curr_progress)
                 time.sleep(0.1)
     except KeyboardInterrupt as e:
-        # TODO: This is too hacky
         from signal import pthread_kill, SIGTSTP, SIGKILL
         for t in threads:
             pthread_kill(t.ident, SIGTSTP)
@@ -574,7 +601,8 @@ def run_row_workers(title, num_rows, workers, progress_count):
     def guard(fn):
         def inner():
             try:
-                fn()
+                with torch.inference_mode():
+                    fn()
             except Exception as e:
                 errors.append(e)
         return inner
@@ -588,7 +616,6 @@ def run_row_workers(title, num_rows, workers, progress_count):
                 time.sleep(0.05)
             progress.update(progress_count[0])
     except KeyboardInterrupt:
-        # TODO: This is too hacky (same as quantize_linears_parallel)
         from signal import pthread_kill, SIGTSTP, SIGKILL
         for t in threads:
             pthread_kill(t.ident, SIGTSTP)
@@ -785,24 +812,6 @@ def image_dump(args, linears):
             save_tensor_image(w, os.path.join(args["work_dir"], filename))
 
 
-# Per-layer host allocation churn (fp32 weight copies, H/L stashes, q_tensors, state rows)
-# leaves freed memory stranded in glibc's per-thread arenas, where RSS ratchets up over a long
-# job even though nothing is referenced. Explicitly return what can be returned after each
-# module; no-op where glibc is unavailable
-_libc = None
-def malloc_trim():
-    global _libc
-    if _libc is False:
-        return
-    try:
-        if _libc is None:
-            import ctypes
-            _libc = ctypes.CDLL("libc.so.6")
-        _libc.malloc_trim(0)
-    except Exception:
-        _libc = False
-
-
 def host_rss_str():
     """Resident set size of this process, for the per-module feedback line (empty string where
     /proc is unavailable)."""
@@ -868,7 +877,6 @@ def clear_temp_files(args):
 
 @torch.inference_mode()
 def main(args, job_state):
-    # TODO: Refactor this, split into functions
     global max_progress, curr_progress, timed_blocks
 
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
@@ -925,12 +933,13 @@ def main(args, job_state):
 
     # Get initial state or resume state
     if use_reference_state:
-        state = prepare_state(args, job_state, config, model, tokenizer)
-        original_input_ids = (
-            state.copy()
-            if job_state["next_module_idx"] == 0 else
-            [{} for _ in range(len(state))]
-        )
+        state, original_input_ids = prepare_state(args, job_state, config, model, tokenizer)
+        if original_input_ids is None:
+            original_input_ids = (
+                state.copy()
+                if job_state["next_module_idx"] == 0 else
+                [{} for _ in range(len(state))]
+            )
         quant_preserves = [{} for _ in range(len(state))]
         # Rows whose hidden state (or unquantized reference) has gone non-finite are excluded
         # from all further capture, state advancement and error measurement. Persisted through
@@ -1113,9 +1122,10 @@ def main(args, job_state):
             for linear in linears:
                 linear.inner.swap_cpu()
 
-            # Quantize
+            # Quantize: one linear per device in parallel when the layer has enough
+            # tensors to occupy every device, else tile-split each tensor across devices
+            # (single large tensors, e.g. lm_head)
             if (
-                args["parallel_mode"] and
                 len(linears) >= len(devices) and
                 all(b <= 8 for _, b in strategy.items())
             ):
@@ -1245,6 +1255,7 @@ def main(args, job_state):
             job_state["bad_rows"] = sorted(bad_rows)
             save_dict("ckpt_new/job.json", job_state, args)
             save_tensor(state, "ckpt_new/state.safetensors", args)
+            save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)
             if os.path.exists(ckpt_dir_old):
                 shutil.rmtree(ckpt_dir_old)
             os.rename(ckpt_dir, ckpt_dir_old)
@@ -1280,9 +1291,8 @@ def main(args, job_state):
             for linear in linears:
                 linear.inner.swap_cpu()
 
-            # Quantize
+            # Quantize (same dispatch as the main loop)
             if (
-                args["parallel_mode"] and
                 len(linears) >= len(devices) and
                 all(b <= 8 for _, b in strategy.items())
             ):
