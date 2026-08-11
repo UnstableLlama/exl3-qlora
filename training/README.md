@@ -157,6 +157,27 @@ significantly slower while such an adapter is loaded — for serving speed,
 deploy by merge-and-requantize. See the Session 20/21/26/28 notes in
 `doc/qlora_handoff.md`.
 
+## MuseGlimmer
+
+Built but NOT box-validated yet — run `qlora_validate_native.py` against the
+quant before spending a run on it. The text tower rides the existing feature
+path (full-width attention output gate keyed `self_attn.gate_proj` like AFMoE,
+unweighted q/k-norm with the `qk_scale_factor` folded into `sm_scale`, Gemma
+sandwich norms, per-layer RoPE theta with NoPE on the full-attention layers,
+sliding window on the rest). Two things were specific to it and are handled
+outside the block: the unweighted **norm on the token embeddings**
+(`embed_tokens.embed_norm`, applied by the native forward right after the
+embedding lookup) and the head's **logit pre-scale** (`output_multiplier`,
+folded into the head input so every head path — materialized logits, the
+trainable/LoRA head, both fused-CE heads — gets it before the softcap).
+
+Data side: use `--prompt-format jinja`. Muse is Harmony-like — a turn ends with
+`<|eot|>` (not the EOS) and an assistant turn opens with a
+`to=user<|message|>` recipient header — so the model's own chat template is the
+only renderer that gets both the header masking and the stop token right. (The
+`auto` fallback now picks `<|eot|>` too, but it is single-turn and emits no
+recipient header.) The vision tower is not built or trained; text only.
+
 ## Docs
 
 - `doc/qlora_handoff.md` — the full engineering log (per-session results,

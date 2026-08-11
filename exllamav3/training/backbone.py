@@ -25,11 +25,25 @@ import torch
 
 # --- top-level decoder layout ----------------------------------------------
 
-def split_decoder(model):
+def _decoder_layout(model):
     """
-    Return ``(embed, blocks, final_norm, lm_head)`` from a loaded exllamav3
-    ``Model``, validating the overall module layout. ``blocks`` is the list of
-    ``TransformerBlock`` modules, in order.
+    Index a loaded ``Model``'s module list and validate the overall layout,
+    returning ``(mods, first_block_idx, last_block_idx)``. The layout the native
+    forward reproduces is::
+
+        Embedding  [pre-block norm]  TransformerBlock ... TransformerBlock  RMSNorm  Linear
+
+    where the optional pre-block norm is a norm applied to the token embeddings
+    before the first block (MuseGlimmer's unweighted
+    ``embed_tokens.embed_norm``; see ``embed_norm``).
+
+    Everything else is rejected HERE rather than dropped. This selection used to
+    be by TYPE alone (``[m for m in mods if isinstance(m, TransformerBlock)]``,
+    plus positional picks for the embedding / final norm / head), so any module
+    the layout didn't anticipate -- a norm on the embeddings, a stream-expansion
+    module, a second head -- silently vanished from the training forward while
+    the inference forward still ran it: a wrong frozen base, with no error and
+    no NaN, only an adapter that doesn't reproduce at inference.
     """
     from ..modules import Embedding, TransformerBlock, RMSNorm, Linear
     mods = list(model.modules)
@@ -39,9 +53,53 @@ def split_decoder(model):
         f"expected final RMSNorm as penultimate module, got {type(mods[-2]).__name__}"
     assert isinstance(mods[-1], Linear), \
         f"expected Linear LM head as last module, got {type(mods[-1]).__name__}"
-    blocks = [m for m in mods if isinstance(m, TransformerBlock)]
-    assert blocks, "no TransformerBlock modules found; unsupported architecture"
-    return mods[0], blocks, mods[-2], mods[-1]
+    idxs = [i for i, m in enumerate(mods) if isinstance(m, TransformerBlock)]
+    assert idxs, "no TransformerBlock modules found; unsupported architecture"
+    first, last = idxs[0], idxs[-1]
+    assert idxs == list(range(first, last + 1)), \
+        "non-TransformerBlock module interleaved between the decoder blocks; " \
+        "unsupported architecture"
+    assert last == len(mods) - 3, \
+        f"unexpected module(s) between the last decoder block and the final " \
+        f"norm: {[type(m).__name__ for m in mods[last + 1:-2]]}"
+    pre = mods[1:first]
+    assert len(pre) <= 1 and all(isinstance(m, RMSNorm) for m in pre), \
+        f"unexpected module(s) between the embedding and the first decoder " \
+        f"block: {[type(m).__name__ for m in pre]} (only a single RMSNorm on " \
+        f"the embeddings is understood -- see backbone.embed_norm)"
+    return mods, first, last
+
+
+def split_decoder(model):
+    """
+    Return ``(embed, blocks, final_norm, lm_head)`` from a loaded exllamav3
+    ``Model``, validating the overall module layout. ``blocks`` is the list of
+    ``TransformerBlock`` modules, in order.
+
+    NOTE: an architecture may also carry a norm on the token embeddings, which
+    this tuple does NOT include -- get it from ``embed_norm(model)``.
+    """
+    mods, first, last = _decoder_layout(model)
+    return mods[0], mods[first:last + 1], mods[-2], mods[-1]
+
+
+def embed_norm(model):
+    """
+    The optional norm applied to the token embeddings before the first decoder
+    block, or ``None``.
+
+    MuseGlimmer normalizes its embeddings with an unweighted RMSNorm
+    (``model.language_model.embed_tokens.embed_norm``, eps = ``rms_norm_eps``),
+    a separate module sitting between the ``Embedding`` and the first block --
+    NOT the ``Embedding``'s own ``normalize`` flag (Gemma's muP-style scaling,
+    which ``embed_apply`` handles). Skipping it feeds the first block an
+    embedding of entirely the wrong magnitude, so it is read here and applied by
+    the native forward right after the embedding lookup (and after any embedding
+    adapter, mirroring the module order).
+    """
+    mods, first, _ = _decoder_layout(model)
+    pre = mods[1:first]
+    return pre[0] if pre else None
 
 
 # --- per-block structure ---------------------------------------------------
@@ -132,6 +190,11 @@ def assert_block_supported(block):
     attention, split in_proj_qkv/z/b/a projection layout) and gated softmax
     attention (interleaved output gate OR a separate full-width g_proj --
     AFMoE), NoPE layers (AFMoE full-attention layers carry no RoPE at all),
+    MuseGlimmer text towers (full-width gate + scaleless q/k-norm with the q
+    scale factor folded into sm_scale + sandwich norms + per-layer RoPE theta
+    with NoPE full-attention layers; its embedding norm and head logit
+    pre-scale are handled outside the block, see ``embed_norm`` /
+    ``head_pre_scale``),
     and BlockSparseMLP mixtures of experts with the "std" softmax or "dots"
     sigmoid top-k router incl. the optional shared expert + sigmoid shared
     gate (Qwen3-MoE, Qwen3.5-MoE), the ungated shared expert (AFMoE) and the
@@ -411,6 +474,31 @@ def attn_qkv_norms(block):
 def head_softcap(lm_head) -> float:
     """Final-logit tanh softcapping on the LM head (Gemma2; 0 = none)."""
     return float(getattr(lm_head, "softcap", 0.0) or 0.0)
+
+
+def head_pre_scale(lm_head) -> float:
+    """
+    The LM head's logit PRE-scale (MuseGlimmer's ``output_multiplier``; 1.0 =
+    none). ``Linear.forward`` applies it to the head output before the softcap
+    (``logits = cap * tanh(x * pre_scale / cap)``), after any runtime LoRA -- so
+    it scales the whole logit vector, and the native forward reproduces it by
+    scaling the head INPUT instead, which is exact for a bias-free head and
+    covers every head path (materialized logits, trainable/LoRA head, both fused
+    CE heads) in one place. Hence the no-bias assertion: the native head is a
+    plain ``hidden @ W`` and has always ignored a head bias, but with a scale
+    folded into the input an ignored bias would be wrong in a second way.
+
+    ``post_scale`` (applied AFTER the softcap, so it cannot be folded the same
+    way) is unused by every architecture here and rejected loudly.
+    """
+    scale = float(getattr(lm_head, "pre_scale", 1.0) or 1.0)
+    post = float(getattr(lm_head, "post_scale", 1.0) or 1.0)
+    assert post == 1.0, \
+        f"LM head post_scale ({post}) is not supported by the native forward"
+    if scale != 1.0:
+        assert frozen_bias(lm_head, torch.float32) is None, \
+            "LM head with both a bias and a pre_scale is not supported"
+    return scale
 
 
 def block_device(block):
