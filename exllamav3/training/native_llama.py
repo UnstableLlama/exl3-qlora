@@ -36,7 +36,11 @@ fp32 reference elsewhere) and gated full-attention layers (interleaved output
 gate), AFMoE / Trinity blocks (a separate full-width attention output gate
 keyed ``self_attn.gate_proj``, NoPE full-attention layers -- RoPE only on
 the sliding layers -- muP embedding multiplier, four-norm sandwich blocks,
-dense-first-N-layers), and BlockSparseMLP mixtures of experts with the std
+dense-first-N-layers), MuseGlimmer text towers (the same full-width attention
+gate, scaleless q/k-norm with a q scale factor folded into sm_scale, sandwich
+norms, per-layer RoPE theta with NoPE full-attention layers, an unweighted
+norm on the token embeddings, and a logit pre-scale on the softcapped head),
+and BlockSparseMLP mixtures of experts with the std
 softmax top-k
 router (Qwen3-MoE, Qwen3.5-MoE incl. the shared expert + sigmoid shared
 gate, and the Gemma4 MoE layout: routing + routed experts fed from the raw
@@ -592,6 +596,10 @@ class NativeLlamaQLoRA(nn.Module):
         # All reach into exllamav3's internal module layout goes through backbone:
         # embedding first, final RMSNorm + LM head last, transformer blocks between.
         self.embed, blocks, self.final_norm, self.lm_head = backbone.split_decoder(model)
+        # Optional norm on the token embeddings, between the Embedding and the
+        # first block (MuseGlimmer's unweighted embed_norm). None on every arch
+        # that doesn't have one -> no-op.
+        self.embed_norm_spec = backbone.norm_spec(backbone.embed_norm(model))
 
         self.blocks = nn.ModuleList()
         self._block_meta = []
@@ -763,6 +771,10 @@ class NativeLlamaQLoRA(nn.Module):
         # by the materialized supervised-position loss, and by both fused-CE
         # heads (softcap arg -- the cap is elementwise, so it chunks cleanly).
         self.final_softcap = backbone.head_softcap(self.lm_head)
+        # Logit pre-scale (MuseGlimmer's output_multiplier; 1.0 on every other
+        # arch). Applied by folding it into the head INPUT at the end of
+        # forward() -- see the note there.
+        self.head_pre_scale = backbone.head_pre_scale(self.lm_head)
         # Output device = where the final norm + LM head live. Under a single
         # load this is the one decoder device; under layer-autosplit it is the
         # last device in the split (modules[-1].device). The embedding is loaded
@@ -902,8 +914,13 @@ class NativeLlamaQLoRA(nn.Module):
         # allowed (the gemma-mode upcasts are no-ops there): pointless for VRAM but
         # required by the parity gate's fp32 math tier, which separates wrong-math
         # from half-precision reassociation noise.
+        # An UNWEIGHTED norm (weight None -- MuseGlimmer's embed_norm and qk_norm)
+        # has no weight tensor for Liger's kernel to take, and its Function saves
+        # W for backward, so it can't run there: those fall through to the torch
+        # path below. (Gemma's unweighted v-norm never reached this branch either
+        # -- it's the 4D per-head case.)
         if (self.use_liger and x.is_cuda and x.dim() in (2, 3)
-                and spec["scale"] == 1.0
+                and spec["scale"] == 1.0 and spec["weight"] is not None
                 and self.compute_dtype in (torch.float16, torch.bfloat16,
                                            torch.float32)):
             ops = _liger_ops()
@@ -1564,7 +1581,11 @@ class NativeLlamaQLoRA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         seg_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return final-norm hidden states ``[b, t, d]`` in fp32.
+        """Return final-norm hidden states ``[b, t, d]`` in fp32 -- the LM head's
+        INPUT: on an arch with a head logit pre-scale (MuseGlimmer's
+        ``output_multiplier``) that scalar is already folded in, so every head
+        path can matmul this straight against the head weight. 1.0 everywhere
+        else, so this is the plain final-norm output for every other base.
 
         ``seg_ids`` ([b, t]) enables sample packing: it marks each token's
         document within its packed sequence, so attention is restricted to the
@@ -1612,6 +1633,13 @@ class NativeLlamaQLoRA(nn.Module):
             eb = self.embed_lora_b.to(self.compute_dtype)
             delta = F.embedding(input_ids.to(ea.device), ea) @ eb       # [b, t, hid]
             hidden = hidden + self._module_lora_scale * delta.to(hidden.device).to(hidden.dtype)
+
+        # Norm on the embeddings (MuseGlimmer embed_norm), when the arch has one.
+        # AFTER the embedding adapters, mirroring the module order: the adapter
+        # replaces/shifts the Embedding's output, and the norm module then runs on
+        # whatever the Embedding emitted.
+        if self.embed_norm_spec is not None:
+            hidden = self._norm(hidden, self.embed_norm_spec)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(first_device)
@@ -1742,6 +1770,15 @@ class NativeLlamaQLoRA(nn.Module):
         # single [b, t, d] tensor, so the fp32 cast here is negligible).
         hidden = backbone.to_device(hidden, self.device)
         hidden = self._norm(hidden, self.final_norm_spec).float()
+        # Head logit pre-scale (MuseGlimmer output_multiplier), folded into the
+        # head INPUT: inference computes `logits = (head(x) [+ lora]) * pre_scale`
+        # before the softcap, and the native head is a bias-free `x @ W` (+ a
+        # low-rank delta, also linear in x), so scaling x here is exactly the same
+        # logits. Done at the single point every head path reads -- materialized
+        # logits(), the trainable/LoRA head, both fused-CE heads, and the EBFT
+        # sampler all take their hidden state from this return. 1.0 -> no-op.
+        if self.head_pre_scale != 1.0:
+            hidden = hidden * self.head_pre_scale
         return hidden
 
     # --- heads -------------------------------------------------------------

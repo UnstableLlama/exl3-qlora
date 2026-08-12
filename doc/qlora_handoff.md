@@ -4647,6 +4647,102 @@ first, so the coordinator doesn't touch the layer-split/DDP paths at all
 
 ---
 
+### Session 50 — MuseGlimmer training support: audited the new arch against the native forward, found two SILENT wrong-forward holes, fixed both
+
+> 2026-08-11. Branch `claude/qlora-muse-training-v8mtr9`. Container has no
+> torch, so this is **code-audit + fix only — NOTHING is verified, not even
+> CPU-tested**. The box list at the bottom is the whole gate.
+
+**The question** (pineapple): does QLoRA training work on the new Muse model
+(`MuseGlimmerForConditionalGeneration`, merged from upstream in
+`exllamav3/architecture/muse_glimmer.py`)?
+
+**Answer: it would have run, and it would have trained against a wrong frozen
+base — silently.** Nothing in `assert_block_supported` rejects a Muse block
+(correctly: the per-block feature set is all already covered), so the trainer
+would have started, produced a plausible loss curve, and yielded an adapter
+that doesn't reproduce at inference. Two of the arch's features live OUTSIDE
+the block, where the reach-through had no eyes at all:
+
+1. **The norm on the token embeddings.** Muse's text model is
+   `Embedding → RMSNorm(embed_tokens.embed_norm, unweighted) → blocks → …`.
+   `split_decoder` picked the embedding positionally (`mods[0]`), the blocks by
+   TYPE (`isinstance(m, TransformerBlock)`), and the final norm + head
+   positionally (`mods[-2]`, `mods[-1]`) — so a module that is none of those
+   simply *vanished*. The first block would have been fed embeddings of
+   entirely the wrong magnitude. Muse is the first supported arch with one
+   (nanochat also has one; deepseek-v4's `ExpandStreams` sat in the same blind
+   spot, though that arch is rejected for its router anyway).
+2. **The head's logit pre-scale.** Muse's head is
+   `Linear(..., pre_scale=output_multiplier, softcap=final_logit_softcapping)`
+   and `Linear.forward` applies `logits *= pre_scale` BEFORE the softcap. The
+   native path read `softcap` (`head_softcap`, Gemma2) but not `pre_scale` — a
+   nobody-else-uses-it field until now, so every logit would have been off by
+   a constant factor, *inside* a tanh cap where a constant factor does not
+   cancel. qbench already replicates this on the HF side
+   (`engines.py`'s `logit_multiplier`), which is what confirmed it matters.
+
+**Fixes (all in the training path; no inference code touched):**
+- `backbone._decoder_layout` (new) validates the WHOLE module list —
+  `Embedding [, pre-block norm] TransformerBlock … RMSNorm Linear` — and
+  rejects anything else loudly instead of dropping it. This is the general
+  fix: the silent-drop failure mode is now impossible for the next arch that
+  grows a module in an unexpected slot. `split_decoder` keeps its 4-tuple
+  contract on top of it; the new `backbone.embed_norm(model)` returns the
+  optional pre-block norm.
+- `native_llama` builds `embed_norm_spec` from it and applies the norm right
+  after the embedding lookup **and after the embedding adapters**
+  (`--train-embed` / `--lora-embed`), mirroring the module order: those
+  adapters replace/shift what the `Embedding` emits, and the norm module runs
+  on that.
+- `backbone.head_pre_scale(lm_head)` reads the scale (and rejects a
+  `post_scale`, which is applied after the softcap and so can't be folded, and
+  a head that has both a bias and a scale). `native_llama.forward` folds it
+  into the returned hidden state — the head input. Exact for a bias-free head
+  (`(x·s) @ W == (x @ W)·s`, and the low-rank head delta is linear in x too),
+  and it lands in ONE place that every head path already reads: `logits()`,
+  the trainable/LoRA head branch, both fused-CE heads, and the EBFT sampler.
+  `forward`'s docstring now says so.
+- `_norm`'s liger fast path is skipped for an unweighted spec (weight `None`).
+  Muse's embed_norm is the first unweighted **3D** norm — Gemma's unweighted
+  v-norm is 4D and never reached that branch — and Liger's Function has no
+  weight to take, let alone save for backward. Would have been a `--liger`
+  crash, not a wrong number.
+- `turn_end_token` prefers a registered bare `<|eot|>` over the EOS. Muse is
+  Harmony-like: `<|eot|>` ends a turn (its `default_chat_prompt`, its chat
+  template and `PromptFormat_muse.stop_conditions` all agree) while its EOS is
+  a different token, so the EOS fallback would have trained a stop token the
+  generator doesn't stop on.
+
+**What was checked and needed nothing** (all read from the loaded modules, as
+designed): the full-width attention output gate (`self_attn.gate_proj`,
+`full_gate=True` — the AFMoE path, and `SlidingAttention` carries the same
+`full_gate`/`g_proj` attributes `Attention` does); scaleless q/k-norm sharing
+one `qk_norm` tensor (unweighted → `norm_spec` weight `None`); `qk_scale_factor`
+(folded into `sm_scale` by the arch, and the block meta reads `attn.sm_scale`);
+Gemma sandwich norms with `constant_bias=1.0` and a separate `post_norm_eps`;
+per-layer RoPE theta including NoPE full-attention layers (the AFMoE path;
+`inv_freq=None` → rotation skipped); sliding window (already `-1`-adjusted by
+the arch to the FA past-tokens-only convention, same as Gemma3); tied
+embeddings; final-logit softcap. Component selection is fine too —
+`Model.from_config(config)` defaults to `component="text"`, so the vision tower
+is never built (text-only training, as with the Qwen-VL towers).
+
+**Box list (the gate — none of this has run):**
+1. `qlora_validate_native.py` on a Muse EXL3 quant: fp32 then bf16 forward
+   parity against the inference oracle. This is the one test that proves both
+   fixes; before them it would have failed, which is the point.
+2. A 10-step SFT smoke with `--prompt-format jinja` on a small chat set:
+   check the rendered prompt echo (recipient header masked, `<|eot|>` at the
+   end of the supervised span), a falling loss, and `qlora_infer_native.py`
+   showing the adapter steer generation on the native inference path.
+3. Re-run the smoke with `--liger` (the unweighted-norm fallback) and with
+   `--pack` (sliding window + varlen).
+4. If it passes, promote the README table row from "Accepted" to "Box-proven"
+   and note the tested bpw / size.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the

@@ -381,11 +381,20 @@ def turn_end_token(tokenizer):
     what its own chat template emits). Encoded with
     ``encode_special_tokens=True`` it maps to the single special id, matching
     the generator's stop condition.
+
+    Second exception, same shape: a Harmony-style base whose EOS is NOT the
+    turn-end marker. MuseGlimmer ends every turn with ``<|eot|>`` (its
+    ``default_chat_prompt``, its chat template and the inference stop
+    conditions all agree), while its EOS is a different special token
+    entirely -- so the EOS fallback below would train a stop token the
+    generator doesn't stop on. Prefer a registered bare ``<|eot|>``.
     """
     if tokenizer.eos_token == "<|im_end|>":
         return tokenizer.eos_token
     if "<|eot_id|>" in tokenizer.extended_piece_to_id:
         return "<|eot_id|>"
+    if "<|eot|>" in tokenizer.extended_piece_to_id:
+        return "<|eot|>"
     if tokenizer.eos_token:
         return tokenizer.eos_token
     return ""
