@@ -75,6 +75,18 @@ the allocated ``Cache``; size ``seq_len`` x ``batch_size`` so both fit --
 on a 16 GB card with a small model and a modest cache, seq_len 1-2k at batch 1
 with grad accumulation is the sane starting point.
 
+Idle offload (``offload_when_idle``, default on): between ingests the model
+only SERVES, but the persistent training state -- fp32 LoRA masters, fp32 Adam
+moments, PiSSA offset copies -- would otherwise sit idle in VRAM. So after
+every ingest (and at construction) that state is moved to system memory and
+the CUDA caching allocator is flushed; the next ingest moves it back before
+training. Value-exact both ways (device moves, not casts), and generation is
+unaffected while offloaded -- inference reads the fp16 runtime LoRA slots
+pushed by ``sync_to_inference``, which stay on the GPU. The cost is one
+HtoD/DtoH round-trip of the training state per ingest, noise next to the
+training itself. Disable it (``offload_when_idle=False``) only if ingests are
+so tiny and frequent that the copies ever show up in a profile.
+
 CPU-testable: the ingest loop, lock, encoding and checkpoint policy take the
 net/tokenizer through narrow interfaces, so ``tests/test_realtime.py``
 exercises them with stubs -- no CUDA, no model.
@@ -196,6 +208,13 @@ class RealtimeConfig:
     checkpoint_dir: Optional[str] = None
     checkpoint_every: int = 0                   # optimizer steps; 0 = manual only
     keep_checkpoints: int = 0                   # prune to newest N; 0 = keep all
+
+    # -- idle VRAM --
+    offload_when_idle: bool = True              # park training state (fp32
+                                                # masters + Adam moments) in
+                                                # system RAM between ingests;
+                                                # restored before each ingest.
+                                                # Value-exact either way.
 
     # -- ingestion --
     add_bos: bool = True                        # ensure exactly one leading BOS
@@ -378,6 +397,8 @@ class RealtimeQLoRA:
         self._update_callbacks: list = []
         self._generators: list = []
         self._synced = False                # adapter pushed to inference slots yet?
+        self._idle_offloaded = False        # training state parked in sysmem?
+        self._opt_state_homes: list = []    # (state dict, key, device) to undo
 
         pad = getattr(tokenizer, "pad_token_id", None)
         if pad is None:
@@ -386,6 +407,11 @@ class RealtimeQLoRA:
 
         if adapter_dir:
             self.load(adapter_dir)
+
+        # Nothing trains until the first ingest -- park the training state now
+        # so a freshly loaded server starts at its serving footprint. (No-op if
+        # load() above already parked it.)
+        self._offload_idle()
 
     # -- learning rate (constant, externally controllable) -------------------
 
@@ -448,6 +474,43 @@ class RealtimeQLoRA:
             for fn in self._update_callbacks:
                 fn()
 
+    # -- idle offload ---------------------------------------------------------
+
+    def _offload_idle(self) -> None:
+        """Park the persistent training state in system memory while the model
+        only serves: the net's fp32 masters/PiSSA offsets (via its
+        ``offload_training_state``, if it has one -- stubs need not) plus the
+        optimizer's device state (Adam moments), then flush the CUDA caching
+        allocator so the freed VRAM is actually returned. Value-exact."""
+        if not self.config.offload_when_idle or self._idle_offloaded:
+            return
+        fn = getattr(self.net, "offload_training_state", None)
+        moved = bool(fn()) if fn is not None else False
+        homes: list = []
+        for state in self.opt.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v) and v.device.type != "cpu":
+                    homes.append((state, k, v.device))
+                    state[k] = v.to("cpu")
+        self._opt_state_homes = homes
+        self._idle_offloaded = True
+        if (moved or homes) and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _restore_idle(self) -> None:
+        """Undo :meth:`_offload_idle` before training touches the state. The
+        net restores first so optimizer state lands back beside its (now
+        on-device) parameters."""
+        if not self._idle_offloaded:
+            return
+        fn = getattr(self.net, "restore_training_state", None)
+        if fn is not None:
+            fn()
+        for state, k, dev in self._opt_state_homes:
+            state[k] = state[k].to(dev)
+        self._opt_state_homes = []
+        self._idle_offloaded = False
+
     # -- ingestion ------------------------------------------------------------
 
     def ingest(
@@ -492,6 +555,7 @@ class RealtimeQLoRA:
 
         with self._lock.write(lock_timeout):
             self._wait_generators_idle()
+            self._restore_idle()
             self.net.train()
 
             micro = [examples[i:i + cfg.batch_size]
@@ -534,6 +598,7 @@ class RealtimeQLoRA:
 
             self.opt.zero_grad(set_to_none=True)
             self.sync_to_inference()
+            self._offload_idle()
 
         return {
             "steps": stats_steps,
@@ -609,6 +674,10 @@ class RealtimeQLoRA:
         counter) from a checkpoint written by :meth:`checkpoint` -- or any
         PEFT adapter dir saved by the offline trainers (weights only). The
         resumed adapter is pushed to inference immediately."""
+        # Un-park first: load_adapter writes into the masters at their home
+        # devices, and load_state_dict maps optimizer state to the params'
+        # CURRENT devices -- both want the training state on-device.
+        self._restore_idle()
         self.net.load_adapter(directory)
         state_path = os.path.join(directory, "realtime_trainer_state.pt")
         if os.path.exists(state_path):
@@ -621,3 +690,4 @@ class RealtimeQLoRA:
             # externally set constant lr wins.
             self.lr = self.config.lr
         self.sync_to_inference()
+        self._offload_idle()

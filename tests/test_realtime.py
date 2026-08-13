@@ -426,6 +426,83 @@ def test_manual_checkpoint_requires_dir():
     print("manual checkpoint guard: OK")
 
 
+class OffloadStubNet(StubNet):
+    """StubNet that also implements the idle-offload surface, recording the
+    interleaving so tests can assert restore-before-train / offload-after-sync
+    ordering, and that training never runs while offloaded."""
+
+    def __init__(self, losses=None):
+        super().__init__(losses)
+        self.offloaded = False
+        self.events = []
+
+    def offload_training_state(self):
+        assert not self.offloaded
+        self.offloaded = True
+        self.events.append("offload")
+        return True
+
+    def restore_training_state(self):
+        self.offloaded = False
+        self.events.append("restore")
+
+    def compute_loss(self, *args, **kwargs):
+        assert not self.offloaded, "trained while training state was offloaded"
+        self.events.append("loss")
+        return super().compute_loss(*args, **kwargs)
+
+    def apply_to_native(self, scaling=1.0):
+        self.events.append("apply")
+        super().apply_to_native(scaling)
+
+    def load_adapter(self, directory):
+        assert not self.offloaded, "load_adapter while training state offloaded"
+        self.events.append("load")
+        return super().load_adapter(directory)
+
+
+def test_idle_offload_lifecycle():
+    net = OffloadStubNet()
+    rt = make_rt(net=net)                   # offload_when_idle defaults on
+    # Parked immediately at construction (serving footprint from the start).
+    assert net.events == ["offload"] and rt._idle_offloaded
+
+    rt.ingest([{"text": "ab"}])
+    # Restored before training, trained, pushed to inference, re-parked.
+    assert net.events == ["offload", "restore", "loss", "apply", "offload"]
+    assert net.offloaded and rt._idle_offloaded
+
+    # load() un-parks around the state surgery and re-parks after the sync.
+    with tempfile.TemporaryDirectory() as d:
+        cfg_dir = os.path.join(d, "ck")
+        net.save_adapter(cfg_dir)
+        net.events.clear()
+        rt.load(cfg_dir)
+        assert net.events == ["restore", "load", "apply", "offload"]
+    print("idle offload lifecycle: OK")
+
+
+def test_idle_offload_disabled():
+    net = OffloadStubNet()
+    rt = make_rt(RealtimeConfig(offload_when_idle=False), net=net)
+    rt.ingest([{"text": "ab"}])
+    assert not rt._idle_offloaded
+    assert "offload" not in net.events and "restore" not in net.events
+    print("idle offload disabled: OK")
+
+
+def test_idle_offload_plain_stub():
+    # A net without the offload surface (the DI contract) must still work:
+    # the coordinator only moves optimizer state, which is a CPU no-op here.
+    net = StubNet()
+    rt = make_rt(net=net)
+    assert rt._idle_offloaded
+    stats = rt.ingest([{"text": "ab"}])
+    assert stats["steps"] == 1 and rt._idle_offloaded
+    assert rt._opt_state_homes == []        # nothing was on an accelerator
+    print("idle offload without net surface: OK")
+
+
 def test_unload_reload():
     net = StubNet()
     rt = make_rt(net=net)
@@ -455,5 +532,8 @@ if __name__ == "__main__":
     test_checkpoint_naming_and_listing()
     test_checkpoint_cadence_prune_resume()
     test_manual_checkpoint_requires_dir()
+    test_idle_offload_lifecycle()
+    test_idle_offload_disabled()
+    test_idle_offload_plain_stub()
     test_unload_reload()
     print("\nALL OK")

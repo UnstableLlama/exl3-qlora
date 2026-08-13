@@ -2152,6 +2152,71 @@ class NativeLlamaQLoRA(nn.Module):
                 continue
             backbone.clear_runtime_lora(w.linear, self)
 
+    # --- idle offload (serve-only VRAM squeeze) -----------------------------
+
+    # Class default (same pattern as the other non-parameter flags): a net that
+    # never offloads -- including headless test instances built via __new__ --
+    # is simply "not offloaded".
+    _training_state_homes = None
+
+    @torch.no_grad()
+    def offload_training_state(self) -> bool:
+        """
+        Move every tensor that exists only for TRAINING -- the fp32 LoRA /
+        embed / head masters (plus their gradients, if any are live) and the
+        compute-dtype PiSSA offset copies -- to system memory, remembering each
+        tensor's home device so :meth:`restore_training_state` can undo it
+        exactly. Value-exact: these are device moves, not casts.
+
+        The inference side is untouched: generation reads the frozen base
+        weights and the fp16 runtime LoRA slots installed by
+        :meth:`apply_to_native`, which are separate tensors (and
+        ``apply_to_native`` / ``save_adapter`` still work while offloaded --
+        both normalize devices themselves). The training forward is what
+        becomes unavailable until restore.
+
+        Parameter *identity* is preserved (only ``.data`` moves), so optimizer
+        ``param_groups`` built from these params stay valid; the caller owns
+        moving any optimizer state (see ``RealtimeQLoRA``).
+
+        Returns True if anything actually moved. Idempotent: a second call
+        while offloaded is a no-op returning False.
+        """
+        if self._training_state_homes is not None:
+            return False
+        homes: list = []
+        for p in self.trainable_parameters():
+            if p.device.type == "cpu":
+                continue
+            homes.append(("param", p, p.device))
+            p.data = p.data.to("cpu")
+            if p.grad is not None:
+                p.grad = p.grad.to("cpu")
+        for w in self._wrappers:
+            for name in ("init_a0", "init_b0"):
+                t = getattr(w, name, None)
+                if t is not None and t.device.type != "cpu":
+                    homes.append(("buffer", (w, name), t.device))
+                    setattr(w, name, t.to("cpu"))
+        self._training_state_homes = homes
+        return bool(homes)
+
+    @torch.no_grad()
+    def restore_training_state(self) -> None:
+        """Undo :meth:`offload_training_state`: move everything back to its
+        recorded home device. No-op if not currently offloaded."""
+        homes, self._training_state_homes = self._training_state_homes, None
+        if not homes:
+            return
+        for kind, ref, dev in homes:
+            if kind == "param":
+                ref.data = ref.data.to(dev)
+                if ref.grad is not None:
+                    ref.grad = ref.grad.to(dev)
+            else:
+                w, name = ref
+                setattr(w, name, getattr(w, name).to(dev))
+
     def save_adapter(self, directory: str,
                      base_model_name_or_path: Optional[str] = None) -> None:
         """
