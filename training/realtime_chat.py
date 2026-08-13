@@ -81,6 +81,10 @@ def parse_args():
                    help="checkpoint every N optimizer steps (0 = manual only)")
     p.add_argument("--keep-checkpoints", type=int, default=0,
                    help="prune to newest N checkpoints (0 = keep all)")
+    p.add_argument("--no-idle-offload", action="store_true",
+                   help="keep the training state (fp32 masters + Adam moments) "
+                        "in VRAM between ingests instead of parking it in "
+                        "system RAM while only serving")
     return p.parse_args()
 
 
@@ -113,7 +117,8 @@ def main():
             lr=args.lr, batch_size=args.batch, grad_accum=args.grad_accum,
             seq_len=args.seq_len, checkpoint_dir=args.checkpoint_dir,
             checkpoint_every=args.checkpoint_every,
-            keep_checkpoints=args.keep_checkpoints),
+            keep_checkpoints=args.keep_checkpoints,
+            offload_when_idle=not args.no_idle_offload),
         adapter_dir=args.adapter,
         render_segments=render_segments,
         base_model_name_or_path=args.model)

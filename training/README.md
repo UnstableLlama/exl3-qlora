@@ -115,7 +115,12 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   stale after a weight change; target only `q/o/gate/up/down_proj` for an
   adapter-free KV cache instead), and writes timestamped rollback
   checkpoints (ordinary PEFT dirs — they load everywhere the offline
-  trainers' adapters do). The script doubles as the reference wiring for
+  trainers' adapters do). Between ingests the persistent training state
+  (fp32 LoRA masters, Adam moments, PiSSA offsets) is parked in system RAM
+  and the CUDA cache flushed, so an idle-but-trainable server holds only its
+  serving footprint in VRAM; the next ingest moves it back, value-exact both
+  ways (`offload_when_idle`, on by default; `--no-idle-offload` to keep it
+  resident). The script doubles as the reference wiring for
   server backends (e.g. tabbyAPI's `backends/exllamav3/model.py`); the
   `[integration]`-marked lines are the complete glue. CPU-tested in
   `tests/test_realtime.py`.
