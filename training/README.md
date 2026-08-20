@@ -120,8 +120,18 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   and the CUDA cache flushed, so an idle-but-trainable server holds only its
   serving footprint in VRAM; the next ingest moves it back, value-exact both
   ways (`offload_when_idle`, on by default; `--no-idle-offload` to keep it
-  resident). The script doubles as the reference wiring for
-  server backends (e.g. tabbyAPI's `backends/exllamav3/model.py`); the
+  resident). The mirror image covers serving-only component models: a vision
+  tower or MTP/draft head loaded next to the text trunk is never trained (the
+  LoRA targets live in the trunk), so `rt.attach_aux_models(vision_model,
+  draft_model)` parks them OUT of VRAM for the duration of every ingest and
+  restores them — same devices, value-exact, guaranteed even if the ingest
+  fails — before serving resumes (`offload_aux_when_training`, on by default;
+  `exllamav3.training.ModelParker` is the reusable mechanism). The demo's
+  `--mtp` flag loads the model's MTP head for speculative decoding and wires
+  exactly this. Note the offline trainers never load vision/MTP components at
+  all — only `Model.from_config(config)`'s text trunk — so this applies to
+  the serve-and-train path only. The script doubles as the reference wiring
+  for server backends (e.g. tabbyAPI's `backends/exllamav3/model.py`); the
   `[integration]`-marked lines are the complete glue. CPU-tested in
   `tests/test_realtime.py`.
 - `qlora_validate_native.py` — the correctness gates: compares the

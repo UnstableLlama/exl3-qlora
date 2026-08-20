@@ -14,7 +14,13 @@ CPU tests for exllamav3/training/realtime.py -- the real-time
     callbacks (cache invalidation) firing once per ingest, generator drain;
   * checkpoint policy: timestamped names, cadence, pruning to
     keep_checkpoints, optimizer-state save/resume via load();
-  * the externally settable constant lr.
+  * the externally settable constant lr;
+  * aux component parking (aux_offload.ModelParker + attach_aux_models):
+    device-resident modules unloaded for the ingest and reloaded to their
+    recorded devices afterwards (deferred-load bracketing, stc handle close),
+    CPU/unloaded modules left alone, restore guaranteed on ingest failure,
+    the offload_aux_when_training switch, and ordering against the idle
+    offload (park before restore, unpark after re-park).
 
 The net/tokenizer are stubs implementing only the narrow surface the
 coordinator uses. No GPU / compiled extension / real model needed. Run:
@@ -53,11 +59,13 @@ def _load(name: str):
 
 
 _load("fused_ce")
+aux_mod = _load("aux_offload")
 rt_mod = _load("realtime")
 
 RealtimeQLoRA = rt_mod.RealtimeQLoRA
 RealtimeConfig = rt_mod.RealtimeConfig
 RWLock = rt_mod.RWLock
+ModelParker = aux_mod.ModelParker
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +511,168 @@ def test_idle_offload_plain_stub():
     print("idle offload without net surface: OK")
 
 
+class StubAuxModule:
+    """One top-level module of a stub component model: the narrow surface
+    ModelParker drives (device attribute, unload/load, can_defer_load)."""
+
+    def __init__(self, device, log, name, defer=False):
+        self.device = device
+        self._log = log
+        self._name = name
+        self._defer = defer
+
+    def can_defer_load(self):
+        return self._defer
+
+    def unload(self):
+        self._log.append(f"unload:{self._name}")
+        self.device = None
+
+    def load(self, device):
+        self._log.append(f"load:{self._name}:{device}")
+        self.device = device
+
+
+class StubSTC:
+    def __init__(self, log):
+        self._log = log
+        self.deferred = 0
+
+    def begin_deferred_load(self):
+        self.deferred += 1
+        self._log.append("defer+")
+
+    def end_deferred_load(self):
+        assert self.deferred > 0
+        self.deferred -= 1
+        self._log.append("defer-")
+
+    def abort_deferred_load(self):
+        assert self.deferred > 0
+        self.deferred -= 1
+        self._log.append("defer!")
+
+    def close(self):
+        self._log.append("stc_close")
+
+
+class StubAuxModel:
+    """Narrow loaded-component-Model surface: .modules, .config.stc,
+    loaded_tp. devices[i] is module i's device (None = never loaded)."""
+
+    def __init__(self, devices, log=None, defer_idx=()):
+        self.log = log if log is not None else []
+        self.loaded_tp = False
+        self.config = types.SimpleNamespace(stc=StubSTC(self.log))
+        self.modules = [
+            StubAuxModule(d, self.log, str(i), defer=(i in defer_idx))
+            for i, d in enumerate(devices)
+        ]
+
+
+def test_model_parker():
+    m = StubAuxModel(["cuda:0", "cpu", None, "cuda:1"], defer_idx={0})
+    p = ModelParker(m)
+    assert not p.parked
+
+    p.park()
+    assert p.parked
+    # Only device-resident modules are unloaded; cpu/never-loaded stay put.
+    assert m.log == ["unload:0", "unload:3"]
+    assert m.modules[1].device == "cpu" and m.modules[2].device is None
+    p.park()                                  # idempotent
+    assert m.log == ["unload:0", "unload:3"]
+
+    m.log.clear()
+    p.unpark()
+    assert not p.parked
+    # Reloaded to the recorded devices in module order; deferred-load
+    # bracketing only where the module supports it; handles closed after.
+    assert m.log == ["defer+", "load:0:cuda:0", "defer-",
+                     "load:3:cuda:1", "stc_close"]
+    assert m.config.stc.deferred == 0
+    p.unpark()                                # idempotent
+    assert m.log[-1] == "stc_close" and len(m.log) == 5
+
+    # Tensor-parallel models are refused.
+    tp = StubAuxModel(["cuda:0"])
+    tp.loaded_tp = True
+    try:
+        ModelParker(tp).park()
+        assert False, "expected AssertionError"
+    except AssertionError:
+        pass
+    print("ModelParker park/unpark: OK")
+
+
+def test_aux_offload_in_ingest():
+    events = []
+    aux = StubAuxModel(["cuda:0"], log=events)
+
+    class Net(OffloadStubNet):
+        def restore_training_state(self):
+            # Aux models leave VRAM BEFORE the training state comes back.
+            assert aux.modules[0].device is None, \
+                "training state restored before aux model was parked"
+            super().restore_training_state()
+
+        def compute_loss(self, *args, **kwargs):
+            assert aux.modules[0].device is None, \
+                "aux model resident in VRAM during training"
+            return super().compute_loss(*args, **kwargs)
+
+        def offload_training_state(self):
+            # On the way out of an ingest the training state re-parks BEFORE
+            # the aux models return. (The construction-time park runs outside
+            # any ingest, before aux models are even attached -- skip it.)
+            r = super().offload_training_state()
+            if "restore" in self.events:
+                assert aux.modules[0].device is None, \
+                    "aux model returned before training state was re-parked"
+            return r
+
+    net = Net()
+    rt = make_rt(net=net)
+    rt.attach_aux_models(aux, None)           # None entries are ignored
+    assert len(rt._aux_parkers) == 1
+
+    rt.ingest([{"text": "ab"}])
+    assert aux.modules[0].device == "cuda:0"  # restored for serving
+    assert net.events == ["offload", "restore", "loss", "apply", "offload"]
+    assert events == ["unload:0", "load:0:cuda:0", "stc_close"]
+    print("aux offload in ingest: OK")
+
+
+def test_aux_offload_restored_on_error():
+    aux = StubAuxModel(["cuda:0"])
+
+    class BoomNet(StubNet):
+        def compute_loss(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    rt = make_rt(net=BoomNet())
+    rt.attach_aux_models(aux)
+    try:
+        rt.ingest([{"text": "ab"}])
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    # Restored despite the failure, and the write lock was released.
+    assert aux.modules[0].device == "cuda:0"
+    with rt._lock.read(timeout=1.0):
+        pass
+    print("aux offload restored on ingest failure: OK")
+
+
+def test_aux_offload_disabled():
+    aux = StubAuxModel(["cuda:0"])
+    rt = make_rt(RealtimeConfig(offload_aux_when_training=False))
+    rt.attach_aux_models(aux)
+    rt.ingest([{"text": "ab"}])
+    assert aux.log == [] and aux.modules[0].device == "cuda:0"
+    print("aux offload disabled: OK")
+
+
 def test_unload_reload():
     net = StubNet()
     rt = make_rt(net=net)
@@ -535,5 +705,9 @@ if __name__ == "__main__":
     test_idle_offload_lifecycle()
     test_idle_offload_disabled()
     test_idle_offload_plain_stub()
+    test_model_parker()
+    test_aux_offload_in_ingest()
+    test_aux_offload_restored_on_error()
+    test_aux_offload_disabled()
     test_unload_reload()
     print("\nALL OK")
