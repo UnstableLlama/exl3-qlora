@@ -45,6 +45,9 @@ from .realtime import (
     RealtimeQLoRA,
     RealtimeConfig,
 )
+from .aux_offload import (
+    ModelParker,
+)
 
 __all__ = [
     "EXL3LoRAFunction",
@@ -62,4 +65,5 @@ __all__ = [
     "mismatched_kl_shift",
     "RealtimeQLoRA",
     "RealtimeConfig",
+    "ModelParker",
 ]

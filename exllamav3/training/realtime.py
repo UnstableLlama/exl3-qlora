@@ -87,6 +87,19 @@ HtoD/DtoH round-trip of the training state per ingest, noise next to the
 training itself. Disable it (``offload_when_idle=False``) only if ingests are
 so tiny and frequent that the copies ever show up in a profile.
 
+Aux component parking (``offload_aux_when_training``, default on): a serving
+stack for a multimodal / MTP-capable checkpoint typically loads extra
+component models next to the text trunk -- a vision tower for image input,
+an MTP head as speculative-decoding draft model. Training never touches them
+(the LoRA targets live in the text trunk), so while an ingest runs they are
+dead weight in VRAM. Register them with ``attach_aux_models(vision_model,
+draft_model)`` and every ingest parks them out of VRAM for its duration --
+unloaded going in (KV cache layers of a draft model included), reloaded
+value-exact to the same devices on the way out (through the safetensors
+collection; the OS page cache makes the reload a system-RAM read in
+practice). Restoration is guaranteed even when the ingest itself fails. See
+``aux_offload.py`` for the mechanism and its limits (no TP-loaded models).
+
 CPU-testable: the ingest loop, lock, encoding and checkpoint policy take the
 net/tokenizer through narrow interfaces, so ``tests/test_realtime.py``
 exercises them with stubs -- no CUDA, no model.
@@ -105,6 +118,7 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
+from .aux_offload import ModelParker
 from .fused_ce import DEFAULT_CHUNK
 
 IGNORE_INDEX = -100
@@ -215,6 +229,13 @@ class RealtimeConfig:
                                                 # system RAM between ingests;
                                                 # restored before each ingest.
                                                 # Value-exact either way.
+    offload_aux_when_training: bool = True      # park attached aux component
+                                                # models (vision tower, MTP/
+                                                # draft head -- see
+                                                # attach_aux_models) out of
+                                                # VRAM for the duration of
+                                                # each ingest; restored
+                                                # value-exact afterwards.
 
     # -- ingestion --
     add_bos: bool = True                        # ensure exactly one leading BOS
@@ -399,6 +420,8 @@ class RealtimeQLoRA:
         self._synced = False                # adapter pushed to inference slots yet?
         self._idle_offloaded = False        # training state parked in sysmem?
         self._opt_state_homes: list = []    # (state dict, key, device) to undo
+        self._aux_parkers: list = []        # ModelParkers for aux component
+                                            # models parked during ingests
 
         pad = getattr(tokenizer, "pad_token_id", None)
         if pad is None:
@@ -443,6 +466,29 @@ class RealtimeQLoRA:
         write lock)."""
         self._generators.append(generator)
         self.add_update_callback(generator.pagetable.reset_page_table)
+
+    def attach_aux_models(self, *models) -> None:
+        """Register serving-only component models -- a vision tower, an MTP/
+        draft head -- to be parked out of VRAM for the duration of every
+        ingest (``offload_aux_when_training``). Training never touches these
+        (the adapter targets live in the text trunk), so during a training
+        burst their VRAM is better spent on activations and optimizer state.
+        ``None`` entries are ignored, so optional models can be passed
+        unconditionally::
+
+            rt.attach_aux_models(vision_model, draft_model)
+
+        Only register models the adapter does not touch, and never the
+        trained model itself. Parked models are restored value-exact (same
+        devices, same weights) before ``ingest`` returns, including when the
+        ingest fails. A draft model's KV cache is freed and reallocated
+        empty across the cycle -- benign, since draft tokens are always
+        verified by the main model and the default flow resets the page
+        table after every ingest anyway."""
+        for model in models:
+            if model is None:
+                continue
+            self._aux_parkers.append(ModelParker(model))
 
     def _wait_generators_idle(self, timeout: float = 60.0) -> None:
         deadline = time.monotonic() + timeout
@@ -511,6 +557,20 @@ class RealtimeQLoRA:
         self._opt_state_homes = []
         self._idle_offloaded = False
 
+    def _park_aux(self) -> None:
+        """Park attached aux component models (vision/MTP) out of VRAM for
+        the duration of an ingest. No-op when disabled or nothing attached."""
+        if not self.config.offload_aux_when_training:
+            return
+        for parker in self._aux_parkers:
+            parker.park()
+
+    def _unpark_aux(self) -> None:
+        """Restore any parked aux component models. Idempotent; called on
+        both the success and failure paths out of an ingest."""
+        for parker in self._aux_parkers:
+            parker.unpark()
+
     # -- ingestion ------------------------------------------------------------
 
     def ingest(
@@ -555,50 +615,59 @@ class RealtimeQLoRA:
 
         with self._lock.write(lock_timeout):
             self._wait_generators_idle()
-            self._restore_idle()
-            self.net.train()
+            # Aux component models (vision tower, MTP/draft head) leave VRAM
+            # first, so the training state and activations land in the space
+            # they vacate; they come back last, into the space the re-parked
+            # training state frees -- and they come back even when the ingest
+            # fails, so serving resumes whole.
+            self._park_aux()
+            try:
+                self._restore_idle()
+                self.net.train()
 
-            micro = [examples[i:i + cfg.batch_size]
-                     for i in range(0, len(examples), cfg.batch_size)]
-            windows = [micro[i:i + cfg.grad_accum]
-                       for i in range(0, len(micro), cfg.grad_accum)]
+                micro = [examples[i:i + cfg.batch_size]
+                         for i in range(0, len(examples), cfg.batch_size)]
+                windows = [micro[i:i + cfg.grad_accum]
+                           for i in range(0, len(micro), cfg.grad_accum)]
 
-            for window in windows:
+                for window in windows:
+                    self.opt.zero_grad(set_to_none=True)
+                    batches = [collate(mb, self.pad_id) for mb in window]
+                    # Token-weighted accumulation (the offline trainer's
+                    # --ga-loss token): weight each micro-batch's mean loss by
+                    # its share of the window's supervised tokens, counted on
+                    # the SHIFTED labels to match the CE denominator.
+                    n_sups = [int((lb[:, 1:] != IGNORE_INDEX).sum())
+                              for _, lb, _ in batches]
+                    total_sup = max(sum(n_sups), 1)
+                    window_loss = 0.0
+                    for (input_ids, labels, attn), n_sup in zip(batches, n_sups):
+                        loss = self.net.compute_loss(
+                            input_ids, labels, attention_mask=attn,
+                            chunk=DEFAULT_CHUNK)
+                        w_i = n_sup / total_sup
+                        (loss * w_i).backward()
+                        window_loss += loss.item() * w_i
+                        tok_total += int(attn.sum())
+                    torch.nn.utils.clip_grad_norm_(
+                        self.net.trainable_parameters(),
+                        cfg.max_grad_norm or float("inf"))
+                    self.opt.step()
+                    self.step += 1
+                    stats_steps += 1
+                    sup_total += total_sup
+                    loss_weighted += window_loss * total_sup
+                    self.samples_seen += sum(len(mb) for mb in window)
+
+                    if (cfg.checkpoint_every and cfg.checkpoint_dir
+                            and self.step % cfg.checkpoint_every == 0):
+                        ckpts.append(self.checkpoint())
+
                 self.opt.zero_grad(set_to_none=True)
-                batches = [collate(mb, self.pad_id) for mb in window]
-                # Token-weighted accumulation (the offline trainer's --ga-loss
-                # token): weight each micro-batch's mean loss by its share of
-                # the window's supervised tokens, counted on the SHIFTED labels
-                # to match the CE denominator.
-                n_sups = [int((lb[:, 1:] != IGNORE_INDEX).sum())
-                          for _, lb, _ in batches]
-                total_sup = max(sum(n_sups), 1)
-                window_loss = 0.0
-                for (input_ids, labels, attn), n_sup in zip(batches, n_sups):
-                    loss = self.net.compute_loss(
-                        input_ids, labels, attention_mask=attn,
-                        chunk=DEFAULT_CHUNK)
-                    w_i = n_sup / total_sup
-                    (loss * w_i).backward()
-                    window_loss += loss.item() * w_i
-                    tok_total += int(attn.sum())
-                torch.nn.utils.clip_grad_norm_(
-                    self.net.trainable_parameters(),
-                    cfg.max_grad_norm or float("inf"))
-                self.opt.step()
-                self.step += 1
-                stats_steps += 1
-                sup_total += total_sup
-                loss_weighted += window_loss * total_sup
-                self.samples_seen += sum(len(mb) for mb in window)
-
-                if (cfg.checkpoint_every and cfg.checkpoint_dir
-                        and self.step % cfg.checkpoint_every == 0):
-                    ckpts.append(self.checkpoint())
-
-            self.opt.zero_grad(set_to_none=True)
-            self.sync_to_inference()
-            self._offload_idle()
+                self.sync_to_inference()
+                self._offload_idle()
+            finally:
+                self._unpark_aux()
 
         return {
             "steps": stats_steps,

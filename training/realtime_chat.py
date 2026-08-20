@@ -85,6 +85,15 @@ def parse_args():
                    help="keep the training state (fp32 masters + Adam moments) "
                         "in VRAM between ingests instead of parking it in "
                         "system RAM while only serving")
+    p.add_argument("--mtp", action="store_true",
+                   help="load the model's MTP head (architectures that have "
+                        "one) as a draft model for speculative decoding; it "
+                        "is parked out of VRAM during every ingest and "
+                        "restored for serving (--no-aux-offload to keep it "
+                        "resident)")
+    p.add_argument("--no-aux-offload", action="store_true",
+                   help="keep aux component models (the --mtp head) in VRAM "
+                        "during ingests instead of parking them")
     return p.parse_args()
 
 
@@ -97,7 +106,16 @@ def main():
     cache = Cache(model, max_num_tokens=args.cache_size)
     model.load(progressbar=True)
     tokenizer = Tokenizer.from_config(config)
-    generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
+    draft_model, draft_cache = None, None
+    if args.mtp:
+        if "mtp" not in config.model_classes:
+            raise SystemExit(f" !! --mtp: {config.architecture} does not "
+                             f"define an MTP head")
+        draft_model = Model.from_config(config, component="mtp")
+        draft_cache = Cache(draft_model, max_num_tokens=args.cache_size)
+        draft_model.load(progressbar=True)
+    generator = Generator(model=model, cache=cache, tokenizer=tokenizer,
+                          draft_model=draft_model, draft_cache=draft_cache)
 
     # The model's own chat template drives BOTH prompt rendering for
     # generation and segment masking for training -- one source of truth.
@@ -118,11 +136,15 @@ def main():
             seq_len=args.seq_len, checkpoint_dir=args.checkpoint_dir,
             checkpoint_every=args.checkpoint_every,
             keep_checkpoints=args.keep_checkpoints,
-            offload_when_idle=not args.no_idle_offload),
+            offload_when_idle=not args.no_idle_offload,
+            offload_aux_when_training=not args.no_aux_offload),
         adapter_dir=args.adapter,
         render_segments=render_segments,
         base_model_name_or_path=args.model)
     rt.attach_generator(generator)   # page table reset on every adapter update
+    # [integration] serving-only components (a vision tower would go here too)
+    # are parked out of VRAM while each ingest trains, restored after.
+    rt.attach_aux_models(draft_model)
     print(f" -- realtime adapter: {rt.net.num_trainable():,} trainable params, "
           f"lr {rt.lr:g}, targets {' '.join(rt.net.target_modules)}")
 
