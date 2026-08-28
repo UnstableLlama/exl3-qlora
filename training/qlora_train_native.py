@@ -293,6 +293,16 @@ def checkpoint_dir(out, step):
     return os.path.join(out, f"checkpoint-{step:08d}")
 
 
+def final_dir(out):
+    """Where the last-step (or interrupted) adapter goes when --save-best owns
+    ``out`` itself. Separate path so the final weights are always preserved
+    without clobbering the best-val adapter -- before this existed, --save-best
+    silently discarded both the final step and everything after the last
+    --checkpoint-every boundary on Ctrl-C. Not a ``checkpoint-<step>`` dir, so
+    prune_checkpoints never touches it."""
+    return os.path.join(out, "final")
+
+
 def list_checkpoints(out):
     """Existing ``checkpoint-<step>`` dirs under ``out``, oldest-step first."""
     if not os.path.isdir(out):
@@ -2275,13 +2285,17 @@ def _run_main():
                     tot += (w.lora_b.detach().float().cpu() - b0).pow(2).sum().item()
             return tot ** 0.5
 
-    def save(tag):
+    def save(tag, directory=None):
         # Always leave net in train mode after; saving touches the adapter only.
-        net.save_adapter(args.out, base_model_name_or_path=args.model)
-        save_trainer_state(args.out, step=step, opt=opt, sched=sched,
+        # ``directory`` defaults to --out (the best-val / --save-every target);
+        # the final and interrupted saves pass final_dir() so they never clobber
+        # a kept best-val adapter.
+        directory = directory or args.out
+        net.save_adapter(directory, base_model_name_or_path=args.model)
+        save_trainer_state(directory, step=step, opt=opt, sched=sched,
                            best_val=best_val, best_val_step=best_val_step, ema=ema,
                            offload_opt=offload_opt)
-        print(f"{tag} Adapter written to {args.out}")
+        print(f"{tag} Adapter written to {directory}")
 
     def eval_loss(exs):
         # Mean per-example loss over an eval set, one example at a time (no
@@ -2717,12 +2731,15 @@ def _run_main():
         if prof is not None:   # window incomplete: no artifacts, just release
             prof.stop()
             prof = None
-        # Stopping early at the loss plateau is a normal workflow; don't discard
-        # the adapter trained so far -- unless --save-best already kept the
-        # best-val checkpoint, in which case saving now would clobber it with
-        # later (likely overfit) weights.
+        # Stopping early at the loss plateau is a normal workflow; never discard
+        # the adapter trained so far. Under --save-best, --out belongs to the
+        # best-val adapter, so the interrupted weights go to final_dir() instead
+        # of clobbering it with later (likely overfit) weights.
         if args.save_best and val_examples:
-            print(f"\nInterrupted at step {step}; keeping best-val adapter.")
+            print(f"\nInterrupted at step {step}; best-val adapter kept in "
+                  f"{args.out}.")
+            if step > 0:
+                save("[interrupted, final weights]", directory=final_dir(args.out))
         else:
             print(f"\nInterrupted at step {step}; saving adapter before exit.")
             if step > 0:
@@ -2737,8 +2754,9 @@ def _run_main():
         prof = None
 
     # 6. Save adapter (PEFT format; loadable by exllamav3.model.lora.LoRA).
-    #    With --save-best we already kept the best-val checkpoint; don't clobber
-    #    it with the (likely overfit) final-step weights.
+    #    With --save-best the best-val checkpoint already owns --out, so the
+    #    (likely overfit) final-step weights go to final_dir() alongside it
+    #    rather than being dropped.
     dt = time.time() - t0
     _FAIL_CTX["phase"] = "final_eval"
     # Final held-out numbers. Reuse the last in-loop eval when it already ran on
@@ -2752,7 +2770,12 @@ def _run_main():
         final_eval2 = eval_loss(val2_examples) if val2_examples else None
     else:
         val_loss, final_eval2 = None, None
-    if not (args.save_best and val_examples):
+    if args.save_best and val_examples:
+        # --out holds the best-val adapter; keep the final-step weights too, in
+        # final_dir(), so a run whose last step misses a --checkpoint-every
+        # boundary doesn't lose them.
+        save("Done. [final weights]", directory=final_dir(args.out))
+    else:
         save("Done.")
     if val_loss is not None:
         tag = f" (best kept: {best_val:.4f})" if args.save_best else ""

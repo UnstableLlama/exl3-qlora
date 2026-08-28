@@ -81,6 +81,7 @@ COMMON_KEYS = {
     "init_eva_tokens",
     "sample_every", "sample_prompt",
     "no_report", "run_name",
+    "live_report", "live_report_port",
 }
 SINGLE_ONLY_KEYS = {
     "device", "parallel", "reserve_per_device", "use_per_device", "split_even", "optim",
@@ -126,7 +127,7 @@ EBFT_KEYS = {
     # live sample generations (shared with the SFT trainer)
     "sample_every", "sample_prompt",
     # local run report
-    "no_report", "run_name",
+    "no_report", "run_name", "live_report", "live_report_port",
 }
 
 # Keys forwarded to the preference backend (qlora_train_pref.py) when method is
