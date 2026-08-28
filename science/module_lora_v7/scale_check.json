@@ -1,0 +1,37 @@
+[
+  {
+    "arm": "base, no adapter",
+    "loss": 2.532822939094955,
+    "trainer_ref": 2.523
+  },
+  {
+    "arm": "v7 ckpt-160  module_scale=1.0 (BUG)",
+    "loss": 1.8527948956845888,
+    "trainer_ref": null
+  },
+  {
+    "arm": "v7 ckpt-160  module_scale=5.657 (FIX)",
+    "loss": 1.8519214518313774,
+    "trainer_ref": 1.8098
+  },
+  {
+    "arm": "v7 ckpt-160  per-linear only",
+    "loss": 1.8530341239105335,
+    "trainer_ref": null
+  },
+  {
+    "arm": "v7 ckpt-200  module_scale=5.657",
+    "loss": 1.8907535911421511,
+    "trainer_ref": 1.8517
+  },
+  {
+    "arm": "v6 final (step 160)",
+    "loss": 1.865996280846775,
+    "trainer_ref": 1.8285
+  },
+  {
+    "arm": "v6 best  (step 123)",
+    "loss": 1.8655445034603662,
+    "trainer_ref": 1.8268
+  }
+]

@@ -1,0 +1,55 @@
+[
+  {
+    "arm": "per-linear only (floor)",
+    "modules": [],
+    "mult": null,
+    "loss": 1.8529940609979745,
+    "vs_floor": 0.0
+  },
+  {
+    "arm": "head only   x1",
+    "modules": [
+      "lm_head"
+    ],
+    "mult": 1.0,
+    "loss": 1.8519548439123992,
+    "vs_floor": -0.0010392170855753058
+  },
+  {
+    "arm": "head only   x8",
+    "modules": [
+      "lm_head"
+    ],
+    "mult": 8.0,
+    "loss": 1.8495777868186734,
+    "vs_floor": -0.0034162741793011264
+  },
+  {
+    "arm": "embed only  x1",
+    "modules": [
+      "embed_tokens"
+    ],
+    "mult": 1.0,
+    "loss": 1.8529754970739376,
+    "vs_floor": -1.8563924036874013e-05
+  },
+  {
+    "arm": "embed only  x8",
+    "modules": [
+      "embed_tokens"
+    ],
+    "mult": 8.0,
+    "loss": 1.8528231725344027,
+    "vs_floor": -0.00017088846357182774
+  },
+  {
+    "arm": "both        x8  (harness check)",
+    "modules": [
+      "lm_head",
+      "embed_tokens"
+    ],
+    "mult": 8.0,
+    "loss": 1.849344963470009,
+    "vs_floor": -0.0036490975279654947
+  }
+]
