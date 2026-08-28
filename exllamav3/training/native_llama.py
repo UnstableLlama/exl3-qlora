@@ -1862,8 +1862,16 @@ class NativeLlamaQLoRA(nn.Module):
             logits = hs @ w
             if self.lora_head:
                 # Low-rank head shift: logits += scale * (hs @ A) @ B.
-                logits = logits + self._module_lora_scale * (
-                    (hs @ self.head_lora_a) @ self.head_lora_b)
+                # a/b are fp32 masters (like every other LoRA here) but hs was cast
+                # to w.dtype above, so they must be cast to match or the matmul
+                # raises. Cast to hs.dtype, NOT compute_dtype (the lora_embed path's
+                # convention): the delta is added to `logits`, which is w.dtype --
+                # an exl3 head reconstructs fp16 even in a bf16 run, and a bf16 delta
+                # would type-promote that add to fp32, i.e. a [supervised_tok, vocab]
+                # fp32 buffer (~2 GB at 202k vocab) on the head device.
+                ha = self.head_lora_a.to(hs.dtype)
+                hb = self.head_lora_b.to(hs.dtype)
+                logits = logits + self._module_lora_scale * ((hs @ ha) @ hb)
             if self.final_softcap:
                 # In place: the out-of-place chain (`cap * tanh(logits / cap)`)
                 # holds three [supervised, vocab] buffers at its peak; div_/tanh_
