@@ -48,6 +48,7 @@ class LoRA:
             model: Model,
             directory: str,
             lora_scaling: float = 1.0,
+            module_lora_scale: float | None = None,
     ) -> LoRA:
         """
         Load LoRA adapter from a PEFT directory.
@@ -61,6 +62,10 @@ class LoRA:
 
         :param lora_scaling:
             Additional scaling factor applied on top of alpha/r.
+
+        :param module_lora_scale:
+            Base scale for the embed/head LoRAs in lora_modules.safetensors,
+            overriding the adapter config. See :meth:`_load_module_adapters`.
         """
         config_path = os.path.join(directory, "adapter_config.json")
         weights_st = os.path.join(directory, "adapter_model.safetensors")
@@ -69,13 +74,13 @@ class LoRA:
         lora_modules = os.path.join(directory, "lora_modules.safetensors")
 
         if os.path.exists(weights_st):
-            return LoRA(model, config_path, weights_st, lora_scaling)
+            return LoRA(model, config_path, weights_st, lora_scaling, module_lora_scale)
         if os.path.exists(weights_bin):
-            return LoRA(model, config_path, weights_bin, lora_scaling)
+            return LoRA(model, config_path, weights_bin, lora_scaling, module_lora_scale)
         if os.path.exists(config_path) and (
             os.path.exists(modules_to_save) or os.path.exists(lora_modules)
         ):
-            return LoRA(model, config_path, None, lora_scaling)
+            return LoRA(model, config_path, None, lora_scaling, module_lora_scale)
         raise FileNotFoundError(f"No LoRA adapter found in {directory}")
 
     @torch.inference_mode()
@@ -85,6 +90,7 @@ class LoRA:
             config_path: str,
             weights_path: str | None,
             lora_scaling: float = 1.0,
+            module_lora_scale: float | None = None,
     ):
         self.target_modules = {}
         # modules_to_save / embed-LoRA targets we mutate in place, tracked so unload()
@@ -116,6 +122,25 @@ class LoRA:
         # correct for uniform-rank adapters; mixed-rank/alpha modules get their
         # own value from _module_scaling.
         self.lora_scaling = lora_scaling * effective_alpha / self.lora_r
+
+        # Scale for the embed/head LoRAs (lora_modules.safetensors), which are
+        # saved RAW -- no scale folded in -- and so must NOT reuse lora_scaling.
+        # The trainer applies alpha/denom (denom = sqrt(r) under rslora, else r)
+        # with the ORIGINAL r/alpha; a pissa export rewrites the config triple to
+        # the converted 2r/2r/rslora=False so the per-linear path resolves to 1.0.
+        # Reusing that here silently under-applies the module deltas (a pissa
+        # r32/alpha32/rslora run wants 5.657, not 1.0). Priority: explicit
+        # argument > config key written by save_adapter > legacy alpha/r fallback
+        # (which reproduces the pre-fix behavior for adapters saved without it).
+        ms = module_lora_scale
+        if ms is None:
+            ms = config.get("module_lora_scale")
+        if ms is None:
+            ms = effective_alpha / self.lora_r
+            self.module_scale_is_guess = True
+        else:
+            self.module_scale_is_guess = False
+        self.module_lora_scale = lora_scaling * float(ms)
 
         if config.get("fan_in_fan_out", False):
             raise ValueError("fan_in_fan_out mode is not supported")
@@ -304,9 +329,10 @@ class LoRA:
             if "lm_head.lora_a" in ml and head is not None and not head.is_sliced:
                 a = ml["lm_head.lora_a"].to(torch.float16).to(head.device)   # [in, r]
                 b = ml["lm_head.lora_b"].to(torch.float16).to(head.device)   # [r, out]
-                # apply_lora computes x @ a @ b with no scaling, so bake alpha/r (and the
-                # user's --lora-scaling) into b, matching the per-linear path.
-                b = b * self.lora_scaling
+                # apply_lora computes x @ a @ b with no scaling, so bake the module
+                # scale (and the user's --lora-scaling) into b. NOT lora_scaling:
+                # see the module_lora_scale note in __init__.
+                b = b * self.module_lora_scale
                 head.lora_a_tensors[self] = a
                 head.lora_b_tensors[self] = b
                 self.target_modules.setdefault("lm_head", head)
@@ -320,14 +346,20 @@ class LoRA:
                 factor = float(getattr(embed, "multiplier", 1.0) or 1.0)
                 if getattr(embed, "normalize", False):
                     factor *= float(embed.hidden_size) ** 0.5
-                delta = (self.lora_scaling / factor) * (a @ b)              # [V, d]
+                delta = (self.module_lora_scale / factor) * (a @ b)          # [V, d]
                 w = embed.embedding.weight
                 self._embed_restore.append((embed, w.data))
                 w.data = (w.data + delta.to(w.dtype).to(w.device)).contiguous()
                 applied.append("embed_tokens")
             if applied:
                 print(f" -- LoRA '{self.name}': applied module LoRA {applied} "
-                      f"(scaling={self.lora_scaling:.4f})")
+                      f"(scaling={self.module_lora_scale:.4f})")
+                if self.module_scale_is_guess:
+                    print(f" -- LoRA '{self.name}': WARNING -- no 'module_lora_scale' "
+                          f"in adapter_config.json; guessed {self.module_lora_scale:.4f} "
+                          f"from alpha/r. If this adapter was trained with rslora "
+                          f"and/or exported through pissa, that guess is WRONG "
+                          f"(pass module_lora_scale=alpha/sqrt(r) explicitly).")
 
     def _module_scaling(self, full_path: str, module_r: int) -> float:
         """

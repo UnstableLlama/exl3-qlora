@@ -2374,6 +2374,13 @@ class NativeLlamaQLoRA(nn.Module):
             "modules_to_save": modules_to_save,
             "lora_embed": self.lora_embed,
             "lora_head": self.lora_head,
+            # The embed/head LoRAs in lora_modules.safetensors are saved RAW (no
+            # scale folded in) and need alpha/denom applied at load time. That
+            # value is NOT recoverable from r/lora_alpha above: a pissa export
+            # rewrites those to the converted 2r/2r/rslora=False triple so the
+            # per-linear loader computes 1.0, which is wrong for these. Record
+            # the module scale explicitly so a loader never has to guess.
+            **({"module_lora_scale": self._module_lora_scale} if module_lora else {}),
             "tie_word_embeddings": self.tie_word_embeddings,
             "base_model_name_or_path": base_model_name_or_path,
             # Provenance: how the adapter was initialized. For pissa the
