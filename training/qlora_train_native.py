@@ -176,7 +176,9 @@ RUN_LOG_FIELDS = [
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
     "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
-    "max_samples", "train_embeddings", "train_head", "prompt_format",
+    "max_samples", "train_embeddings", "train_head",
+    "lora_embed", "lora_head", "module_lora_lr_mul",
+    "prompt_format",
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
     "start_val", "start_eval2", "final_val", "final_eval2",
@@ -1612,6 +1614,13 @@ def _run_main():
                          "delta to the head logits at the supervised positions; "
                          "memory scales with supervised tokens, params are tiny. "
                          "Saved to lora_modules.safetensors (merge-path).")
+    ap.add_argument("--module-lora-lr-mul", type=float, default=1.0,
+                    help="LR multiplier for the embed/head LoRA adapters "
+                         "(--lora-embed/--lora-head): their own optimizer param "
+                         "group at lr * this, following the same schedule. S64 "
+                         "found the head LoRA ~8x undertrained at the shared LR "
+                         "(gain monotone to x8, worse at x16). No effect on the "
+                         "per-linear adapters or fully-trained modules_to_save.")
     ap.add_argument("--offload-embed-head-optim", action="store_true",
                     help="Put the fully-trained embedding/LM-head optimizer on CPU "
                          "(torchao CPUOffloadOptimizer) with bf16 stochastic-rounding "
@@ -1882,6 +1891,9 @@ def _run_main():
         "ga_loss": args.ga_loss, "max_samples": args.max_samples,
         "train_embeddings": int(bool(args.train_embeddings)),
         "train_head": int(bool(args.train_head)),
+        "lora_embed": int(bool(args.lora_embed)),
+        "lora_head": int(bool(args.lora_head)),
+        "module_lora_lr_mul": args.module_lora_lr_mul,
         "prompt_format": args.prompt_format,
     }
 
@@ -2209,14 +2221,23 @@ def _run_main():
     #    separate CPU-offload optimizer (offload_opt) and the main optimizer/scheduler
     #    drives only the LoRA group; offload_opt mirrors the schedule's LR per step.
     offload_opt = None
+    if args.module_lora_lr_mul != 1.0 and not (args.lora_embed or args.lora_head):
+        raise SystemExit("--module-lora-lr-mul has nothing to scale without "
+                         "--lora-embed and/or --lora-head.")
     if args.offload_embed_head_optim:
-        lora_groups = [{"params": net.lora_parameters(), "weight_decay": args.weight_decay}]
+        lora_groups = net.lora_param_groups(args.weight_decay, args.lr,
+                                            args.module_lora_lr_mul)
         opt = build_optimizer(lora_groups, args.lr, args.optim)
         offload_opt = build_cpu_offload_optimizer(net.modules_to_save_parameters(), args.lr)
         print(f" -- embed/head optimizer offloaded to CPU (torchao, bf16 stochastic "
               f"rounding); excluded from grad clip, follows the LoRA LR schedule")
     else:
-        opt = build_optimizer(net.param_groups(args.weight_decay), args.lr, args.optim)
+        opt = build_optimizer(net.param_groups(args.weight_decay, args.lr,
+                                               args.module_lora_lr_mul),
+                              args.lr, args.optim)
+    if args.module_lora_lr_mul != 1.0:
+        print(f" -- embed/head LoRA adapters in their own param group at "
+              f"lr x {args.module_lora_lr_mul:g} = {args.lr * args.module_lora_lr_mul:.2e}")
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     # 5a. Optionally restore optimizer/schedule/step from the resumed checkpoint so
@@ -2480,6 +2501,9 @@ def _run_main():
             "max_samples": args.max_samples,
             "train_embeddings": int(bool(args.train_embeddings)),
             "train_head": int(bool(args.train_head)), "prompt_format": args.prompt_format,
+            "lora_embed": int(bool(args.lora_embed)),
+            "lora_head": int(bool(args.lora_head)),
+            "module_lora_lr_mul": args.module_lora_lr_mul,
             "trainable_params": net.num_trainable(), "n_train": len(examples),
             "n_val": len(val_examples), "n_eval2": len(val2_examples),
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),

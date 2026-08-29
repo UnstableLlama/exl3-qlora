@@ -85,7 +85,8 @@ COMMON_KEYS = {
 }
 SINGLE_ONLY_KEYS = {
     "device", "parallel", "reserve_per_device", "use_per_device", "split_even", "optim",
-    "inspect", "lora_embed", "lora_head", "offload_embed_head_optim",
+    "inspect", "lora_embed", "lora_head", "module_lora_lr_mul",
+    "offload_embed_head_optim",
     "offload_activations", "offload_mode", "vram_spillover", "use_liger",
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
     "torch_profile",   # torch.profiler window; DDP backend has no such flag
@@ -212,6 +213,7 @@ SINGLE_ONLY_DEFAULTS = {
     "inspect": 0,
     "lora_embed": False,
     "lora_head": False,
+    "module_lora_lr_mul": 1.0,
     "offload_embed_head_optim": False,
     "offload_activations": False,
     "offload_mode": "async",

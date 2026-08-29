@@ -2095,10 +2095,30 @@ class NativeLlamaQLoRA(nn.Module):
         """All trainable params: LoRA adapters + any full-trained embed/head."""
         return self.lora_parameters() + self.modules_to_save_parameters()
 
-    def param_groups(self, weight_decay: float) -> list[dict]:
+    def lora_param_groups(self, weight_decay: float, base_lr: float | None = None,
+                          module_lora_lr_mul: float = 1.0) -> list[dict]:
+        """LoRA-only param groups. With ``module_lora_lr_mul != 1`` the embed/head
+        LoRA adapters get their OWN group at ``base_lr * module_lora_lr_mul``
+        (S64: at the shared LR the head LoRA lands ~8x short of its optimum on
+        its own descent direction). The per-linear group stays group 0, whose LR
+        the log line and the offload-optimizer mirror read."""
+        per_linear: list[nn.Parameter] = []
+        for w in self._wrappers:
+            if w.r > 0:
+                per_linear += [w.lora_a, w.lora_b]
+        mod = self.module_lora_parameters()
+        if not mod or module_lora_lr_mul == 1.0:
+            return [{"params": per_linear + mod, "weight_decay": weight_decay}]
+        assert base_lr is not None, "module_lora_lr_mul != 1 needs base_lr"
+        return [{"params": per_linear, "weight_decay": weight_decay},
+                {"params": mod, "weight_decay": weight_decay,
+                 "lr": base_lr * module_lora_lr_mul}]
+
+    def param_groups(self, weight_decay: float, base_lr: float | None = None,
+                     module_lora_lr_mul: float = 1.0) -> list[dict]:
         """Optimizer param groups: weight decay on the LoRA params, but NONE on
         the full embed/head (weight-decaying a whole embedding table is harmful)."""
-        groups = [{"params": self.lora_parameters(), "weight_decay": weight_decay}]
+        groups = self.lora_param_groups(weight_decay, base_lr, module_lora_lr_mul)
         ms = self.modules_to_save_parameters()
         if ms:
             groups.append({"params": ms, "weight_decay": 0.0})
