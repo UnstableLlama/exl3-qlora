@@ -49,6 +49,7 @@ from qlora_train_native import (  # noqa: E402
     resolve_steps_and_warmup, ThroughputMeter, StepTimer, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
+    snapshot_datasets, resolve_resumed_datasets,
     format_prompt_and_eot, sample,
     _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
@@ -378,6 +379,24 @@ def _run_main():
     rank, local_rank, world_size = ddp_setup()
     device = f"cuda:{local_rank}"
 
+    # Dataset-mix continuity (see the single-GPU arm). Every rank resolves the
+    # same paths deterministically; interactive=False because a per-rank prompt
+    # under torchrun would desync the ranks -- a hash mismatch aborts with
+    # instructions instead. Only rank 0 writes the fresh-run snapshot.
+    if args.out:
+        data_roles = {"dataset": args.dataset,
+                      "eval_dataset": args.eval_dataset,
+                      "eval2_dataset": args.eval2_dataset}
+        if args.resume:
+            resolved = resolve_resumed_datasets(
+                args.out, args.resume, data_roles,
+                interactive=False, verbose=is_main(rank))
+            args.dataset = resolved["dataset"]
+            args.eval_dataset = resolved["eval_dataset"]
+            args.eval2_dataset = resolved["eval2_dataset"]
+        elif is_main(rank):
+            snapshot_datasets(args.out, data_roles)
+
     # Failure logger: rank 0 only (other ranks keep run_log=None -> no-op), so a
     # crash anywhere after this point still leaves one run-log row + traceback.
     if is_main(rank):
@@ -678,12 +697,28 @@ def _run_main():
     # the same trainer_state.pt; ranks hold identical synced state after each
     # all-reduce, so this keeps them in lockstep). --reset-optimizer skips it.
     resume_step, resume_state = 0, None
+    yaml_base_lrs = list(sched.base_lrs)  # per-group base LRs from the CONFIG
     if args.resume and not args.reset_optimizer:
         resume_state = load_trainer_state(args.resume)
         if resume_state is not None:
             restore_optimizer_state(opt, resume_state["optimizer"])
             if resume_state.get("scheduler") is not None:
                 sched.load_state_dict(resume_state["scheduler"])
+            # Config lr wins on resume (see the single-GPU arm): re-base the
+            # restored schedule at the config value; moments/position kept.
+            # Deterministic, so every rank applies the identical override.
+            if list(sched.base_lrs) != yaml_base_lrs:
+                old_lr = sched.base_lrs[0]
+                sched.base_lrs = list(yaml_base_lrs)
+                for g, base, fn in zip(opt.param_groups, sched.base_lrs,
+                                       sched.lr_lambdas):
+                    g["initial_lr"] = base
+                    g["lr"] = base * fn(sched.last_epoch)
+                sched._last_lr = [g["lr"] for g in opt.param_groups]
+                if is_main(rank):
+                    print(f" -- resume LR override: base lr {old_lr:.2e} "
+                          f"(checkpoint) -> {yaml_base_lrs[0]:.2e} (config); "
+                          f"optimizer moments and schedule position kept")
             resume_step = int(resume_state["step"])
             if is_main(rank):
                 print(f" -- resumed trainer state from {args.resume}: continuing at "
@@ -697,10 +732,11 @@ def _run_main():
     # shard r = examples[r::world_size] shuffled by a STATEFUL per-rank rng
     # (Random(1234+r), cumulative shuffles across epochs), so rank 0 simulates
     # each rank's rng stream, extending the per-epoch permutations lazily as
-    # future steps are browsed. The k-th step of THIS process (a resume
-    # restarts bgen) consumes micro-batches k*ga .. k*ga+ga-1 of every rank's
-    # own stream; shard sizes (and so micro-batches per pass) can differ by
-    # rank, which is why the epoch index is computed per rank.
+    # future steps are browsed. Optimizer step s consumes micro-batches
+    # (s-1)*ga .. (s-1)*ga+ga-1 of every rank's own stream -- an ABSOLUTE
+    # mapping, valid on resume too now that each rank fast-forwards its bgen
+    # to the resume step; shard sizes (and so micro-batches per pass) can
+    # differ by rank, which is why the epoch index is computed per rank.
     if args.live_report and is_main(rank):
         if report is None:
             print(" -- --live-report needs the local report; ignoring "
@@ -719,14 +755,13 @@ def _run_main():
                 return st["perms"][e]
 
             def live_batch_fn(s):
-                if not (resume_step < s <= args.steps):
-                    raise ValueError(
-                        f"step must be in [{resume_step + 1}, {args.steps}]")
+                if not (0 < s <= args.steps):
+                    raise ValueError(f"step must be in [1, {args.steps}]")
                 mbs = []
                 for r in range(world_size):
                     mpe = max(1, len(live_shards[r]) // args.batch)
                     for g in range(args.grad_accum):
-                        m = (s - resume_step - 1) * args.grad_accum + g
+                        m = (s - 1) * args.grad_accum + g
                         e, w = divmod(m, mpe)
                         seqs = [{"index": r + j * world_size,  # pre-shard index
                                  "docs": decode_example_docs(
@@ -828,6 +863,17 @@ def _run_main():
         return eval_loss(val_examples)
 
     bgen = batches()
+    if resume_step:
+        # Fast-forward each rank's stream to where the original process
+        # stopped (see the single-GPU arm; doc/bug_resume_data_order.md).
+        # Every rank skips the same count on its OWN shard/rng, so the
+        # resumed order is exactly what an uninterrupted run would have used.
+        for _ in range(resume_step * args.grad_accum):
+            next(bgen)
+        if is_main(rank):
+            print(f" -- data stream fast-forwarded "
+                  f"{resume_step * args.grad_accum} micro-batches/rank to "
+                  f"continue the run's batch order at step {resume_step + 1}")
     opt.zero_grad(set_to_none=True)
     # Seed from the resumed state so best-tracking / EMA continue (None under
     # --reset-optimizer or a weights-only dir).
@@ -937,6 +983,10 @@ def _run_main():
         if is_main(rank):
             print(f" -- profiling dequant (trellis reconstruction) for the first "
                   f"{args.profile_dequant} steps; adds sync overhead while active")
+    # Last COMPLETED optimizer step (see qlora_train_native.py): `step` holds the
+    # in-flight iteration mid-loop, and saving that on Ctrl-C desyncs the step
+    # counter from the scheduler, skipping an iteration's batches on resume.
+    done_step = resume_step
     try:
         for step in range(resume_step + 1, args.steps + 1):
             _FAIL_CTX["phase"] = f"train step {step}"
@@ -1106,8 +1156,15 @@ def _run_main():
                     print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
                     prune_checkpoints(args.out, args.keep_checkpoints)
                 dist.barrier()
+
+            # Reached only if the whole iteration ran: this step is now durable.
+            done_step = step
     except KeyboardInterrupt:
         status = "interrupted"
+        # Roll back to the last completed step so the saved counter, the
+        # scheduler and the data stream agree. Every rank breaks out of the same
+        # iteration, so this stays consistent across ranks.
+        step = done_step
         # Don't clobber the best-val checkpoint with the current (later, likely
         # worse) weights when --save-best is on; it's already saved.
         if args.save_best and val_examples:

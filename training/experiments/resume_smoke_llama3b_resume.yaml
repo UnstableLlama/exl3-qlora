@@ -1,0 +1,74 @@
+# Llama-3.2-3B @ 4bpw -- GPU smoke test for the S65 --resume continuity work.
+# NOT a real experiment: 16 rows, 8 steps, tiny rank. The only thing being
+# measured is that resume restores data order / LR / dataset identity on real
+# hardware, which the S65 offline suite could not prove.
+#
+#   python training/qlora_train.py --config training/experiments/resume_smoke_llama3b.yaml
+#
+# Design notes:
+#   - 16 rows, batch 1, grad_accum 2, pack off -> exactly 8 optimizer steps/epoch,
+#     so every step boundary is hand-checkable.
+#   - checkpoint_every 2 + keep_checkpoints 0 (keep ALL) so checkpoint-00000004
+#     survives to be resumed from repeatedly.
+#   - init_lora default: the trainer has no --seed, so pissa's randomized SVD
+#     would make the init unreproducible. Irrelevant here (we resume from a
+#     checkpoint, not from a re-init) but keeps the run cheap and boring.
+#   - dataset lives in the session scratchpad ON PURPOSE: the mismatch-branch
+#     test has to edit it, and the real semancer set must not be touched.
+
+model: /mnt/two/weights/meta-llama-Llama-3.2-3B-Instruct/4
+out: out/resume_smoke
+resume: out/resume_smoke/checkpoint-00000004
+
+method: sft
+parallel: single
+device: cuda:0
+
+# LoRA -- small and cheap; rank == alpha as always.
+r: 16
+alpha: 16
+use_rslora: true
+init_lora: default
+
+# Optimization. Cosine + warmup so the LR is visibly step-dependent -- a resume
+# that silently restarted the schedule would show up immediately in the lr column.
+lr: 0.00001
+scheduler: cosine
+warmup_ratio: 0.1
+weight_decay: 0.0
+epochs: 1
+batch: 1
+grad_accum: 2
+optim: adamw
+max_grad_norm: 1.0
+
+# Data -- 16-row scratchpad slice of semancy v5.
+dataset: /tmp/claude-1000/-home-unstable-exl3-private-exl3-qlora/770eccf1-74c8-45a7-9d86-eaa18d04f5cc/scratchpad/smoke_train.jsonl
+dataset_split: train       # local jsonl loads as split "train"
+messages_key: messages
+shuffle: true
+seq_len: 1024
+pack: false
+
+prompt_format: llama3      # semancy rows are multi-turn; 'auto' is single-turn only
+
+targets:
+  - down_proj
+  - gate_proj
+  - up_proj
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+compute_dtype: bfloat16
+attn_impl: flash
+sample_every: 0
+
+# Eval every 2 steps so the resumed half produces directly comparable numbers.
+eval_dataset: /tmp/claude-1000/-home-unstable-exl3-private-exl3-qlora/770eccf1-74c8-45a7-9d86-eaa18d04f5cc/scratchpad/smoke_eval.jsonl
+eval_split: train          # local jsonl quirk (S45)
+eval_every: 2
+save_best: false
+checkpoint_every: 2
+keep_checkpoints: 0        # keep every checkpoint dir

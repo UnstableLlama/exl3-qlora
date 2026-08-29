@@ -73,6 +73,7 @@ from qlora_train_native import (  # noqa: E402
     ThroughputMeter, StepTimer, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
+    snapshot_datasets, resolve_resumed_datasets,
     build_sft_examples, build_lm_examples,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
     compute_even_split_budgets,
@@ -693,6 +694,20 @@ def _run_main():
 
     reward_self_test()
 
+    # Dataset-mix continuity (see the SFT trainer): fresh runs snapshot their
+    # data files into <out>/dataset/; resumes verify against that record and
+    # may substitute the snapshot. Before the failure-log record below so the
+    # RESOLVED paths get logged.
+    if args.out:
+        data_roles = {"dataset": args.dataset,
+                      "eval_dataset": args.eval_dataset}
+        if args.resume:
+            resolved = resolve_resumed_datasets(args.out, args.resume, data_roles)
+            args.dataset = resolved["dataset"]
+            args.eval_dataset = resolved["eval_dataset"]
+        else:
+            snapshot_datasets(args.out, data_roles)
+
     _FAIL_CTX["run_log"] = args.run_log
     _FAIL_CTX["phase"] = "startup"
     _FAIL_CTX["record"] = {
@@ -945,12 +960,26 @@ def _run_main():
         g["betas"] = betas
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
     resume_step, resume_state = 0, None
+    yaml_base_lrs = list(sched.base_lrs)  # per-group base LRs from the CONFIG
     if args.resume and not args.reset_optimizer:
         resume_state = load_trainer_state(args.resume)
         if resume_state is not None:
             restore_optimizer_state(opt, resume_state["optimizer"])
             if resume_state.get("scheduler") is not None:
                 sched.load_state_dict(resume_state["scheduler"])
+            # Config lr wins on resume (see the SFT trainer): re-base the
+            # restored schedule at the config value; moments/position kept.
+            if list(sched.base_lrs) != yaml_base_lrs:
+                old_lr = sched.base_lrs[0]
+                sched.base_lrs = list(yaml_base_lrs)
+                for g, base, fn in zip(opt.param_groups, sched.base_lrs,
+                                       sched.lr_lambdas):
+                    g["initial_lr"] = base
+                    g["lr"] = base * fn(sched.last_epoch)
+                sched._last_lr = [g["lr"] for g in opt.param_groups]
+                print(f" -- resume LR override: base lr {old_lr:.2e} "
+                      f"(checkpoint) -> {yaml_base_lrs[0]:.2e} (config); "
+                      f"optimizer moments and schedule position kept")
             resume_step = int(resume_state["step"])
             print(f" -- resumed trainer state: continuing at step "
                   f"{resume_step + 1}/{args.steps}")
@@ -1068,6 +1097,16 @@ def _run_main():
         return " | ".join(parts)
 
     bgen = batches()
+    if resume_step:
+        # Fast-forward the data stream to where the original process stopped
+        # (see the SFT trainer; doc/bug_resume_data_order.md). Deterministic
+        # from Random(shuffle_seed), so this reproduces the exact order an
+        # uninterrupted run would have used.
+        for _ in range(resume_step * args.grad_accum):
+            next(bgen)
+        print(f" -- data stream fast-forwarded {resume_step * args.grad_accum} "
+              f"micro-batches to continue the run's batch order at step "
+              f"{resume_step + 1}")
     opt.zero_grad(set_to_none=True)
     ema = resume_state["ema"] if resume_state else None
     step = resume_step
@@ -1097,9 +1136,10 @@ def _run_main():
             config=run_config)
         _REPORT["rep"] = report
 
-    # Live monitor (--live-report). Mirrors batches()/the loop: the k-th step
-    # of THIS process (k = step - resume_step - 1; a resume restarts bgen)
-    # consumes micro-batches k*ga .. k*ga+ga-1. batches() reseeds
+    # Live monitor (--live-report). Mirrors batches()/the loop: optimizer step
+    # s consumes micro-batches (s-1)*ga .. (s-1)*ga+ga-1 -- an ABSOLUTE
+    # mapping, valid on resume too now that bgen is fast-forwarded to the
+    # resume step. batches() reseeds
     # Random(shuffle_seed) every pass but shuffles the SAME list in place, so
     # epoch e's permutation is that seeded shuffle applied e+1 times
     # cumulatively -- replayed lazily as steps are browsed. Rollout anchors are
@@ -1118,11 +1158,11 @@ def _run_main():
             return live_orders["perms"][e]
 
         def live_batch_fn(s):
-            if not (resume_step < s <= args.steps):
-                raise ValueError(f"step must be in [{resume_step + 1}, {args.steps}]")
+            if not (0 < s <= args.steps):
+                raise ValueError(f"step must be in [1, {args.steps}]")
             mbs = []
             for g in range(args.grad_accum):
-                m = (s - resume_step - 1) * args.grad_accum + g
+                m = (s - 1) * args.grad_accum + g
                 e, w = divmod(m, live_mpe)
                 seqs = [{"index": j,
                          "docs": decode_example_docs(tokenizer, examples[j])}
@@ -1199,6 +1239,10 @@ def _run_main():
 
     timer = StepTimer(devices=active_devices if torch.cuda.is_available() else None)
 
+    # Last COMPLETED optimizer step (see qlora_train_native.py): `step` holds the
+    # in-flight iteration mid-loop, and saving that on Ctrl-C desyncs the step
+    # counter from the scheduler, skipping an iteration's batches on resume.
+    done_step = resume_step
     try:
         for step in range(resume_step + 1, args.steps + 1):
             _FAIL_CTX["phase"] = f"train step {step}"
@@ -1313,7 +1357,13 @@ def _run_main():
                                    ema=ema)
                 print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
                 prune_checkpoints(args.out, args.keep_checkpoints)
+
+            # Reached only if the whole iteration ran: this step is now durable.
+            done_step = step
     except KeyboardInterrupt:
+        # Roll back to the last completed step so the saved counter, the
+        # scheduler and the data stream all agree.
+        step = done_step
         if args.save_best and val_examples:
             print(f"\nInterrupted at step {step}; keeping best-val adapter.")
         else:

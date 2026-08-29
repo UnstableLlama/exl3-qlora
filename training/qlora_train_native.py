@@ -40,6 +40,8 @@ The adapter is saved in PEFT format, loadable by exllamav3.model.lora.LoRA
 import argparse
 import csv
 import datetime
+import hashlib
+import json
 import math
 import os
 import random
@@ -772,6 +774,144 @@ def load_dataset_split(dataset_name, split, config_name=None):
     if config_name:
         return load_dataset(dataset_name, config_name, split=split)
     return load_dataset(dataset_name, split=split)
+
+
+DATASET_SNAPSHOT_DIR = "dataset"
+DATASET_SNAPSHOT_META = "meta.json"
+
+
+def _dataset_is_local_file(name):
+    """True when a --dataset-style argument points at a local data file (as
+    opposed to a HF Hub id), mirroring load_dataset_split's resolution."""
+    path = os.path.expanduser(name)
+    return (os.path.splitext(path)[1].lower() in _LOCAL_DATA_BUILDERS
+            and os.path.isfile(path))
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def snapshot_datasets(out_dir, roles):
+    """Preserve the run's data mix inside the run dir: copy each local dataset
+    file into <out>/dataset/ and record original path + sha256 in meta.json,
+    so a later --resume can verify -- and if the source was edited or
+    regenerated since, reload -- the EXACT data this run started on.
+
+    ``roles`` maps a role name ("dataset", "eval_dataset", ...) to the
+    --dataset-style argument; falsy entries are skipped. HF Hub ids get a
+    metadata row only (no copy -- content pinning for Hub sets would need a
+    revision hash, and every run here trains on local jsonl anyway). Called on
+    fresh runs only; an existing snapshot is overwritten, since a non-resume
+    launch into the same --out IS a new run. Resumes go through
+    resolve_resumed_datasets() instead and never rewrite the record.
+    """
+    snap_dir = os.path.join(out_dir, DATASET_SNAPSHOT_DIR)
+    os.makedirs(snap_dir, exist_ok=True)
+    meta = {"created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "roles": {}}
+    for role, name in roles.items():
+        if not name:
+            continue
+        if _dataset_is_local_file(name):
+            src = os.path.expanduser(name)
+            copy_name = role + os.path.splitext(src)[1].lower()
+            shutil.copy2(src, os.path.join(snap_dir, copy_name))
+            meta["roles"][role] = {
+                "original": os.path.abspath(src), "copy": copy_name,
+                "sha256": _sha256_file(src), "bytes": os.path.getsize(src)}
+        else:
+            meta["roles"][role] = {"original": name, "copy": None,
+                                   "sha256": None}
+    with open(os.path.join(snap_dir, DATASET_SNAPSHOT_META), "w") as f:
+        json.dump(meta, f, indent=2)
+    copied = [r for r, m in meta["roles"].items() if m["copy"]]
+    if copied:
+        print(f" -- dataset mix snapshotted to {snap_dir}/ "
+              f"({', '.join(copied)})")
+
+
+def _find_dataset_snapshot(out_dir, resume_dir):
+    """Locate the snapshot for a resumed run. --resume usually points INSIDE
+    the run root (a checkpoint-NNNNNNNN dir) or AT it, and --out is normally
+    that same root -- check all three spots and take the first hit."""
+    resume_dir = os.path.normpath(resume_dir)
+    for root in (resume_dir, os.path.dirname(resume_dir), out_dir):
+        snap_dir = os.path.join(root, DATASET_SNAPSHOT_DIR)
+        if os.path.exists(os.path.join(snap_dir, DATASET_SNAPSHOT_META)):
+            return snap_dir
+    return None
+
+
+def resolve_resumed_datasets(out_dir, resume_dir, roles, interactive=True,
+                             verbose=True):
+    """--resume counterpart of snapshot_datasets: verify each role's file
+    against the sha256 recorded at run start and return ``{role: path}`` with
+    any substitutions applied.
+
+    On a hash mismatch (the source file was edited/regenerated since the run
+    started) the choice matters too much to guess: prompt for snapshot /
+    current / abort. Continuing on the snapshot preserves exact data
+    continuity (including the fast-forwarded batch order); continuing on the
+    current file makes this a different mix from the step counter's point of
+    view. Non-interactive callers (DDP ranks -- a prompt would desync them --
+    or no tty) abort instead. A missing current file falls back to the
+    snapshot automatically; a run predating snapshots proceeds unverified
+    with a warning.
+    """
+    resolved = dict(roles)
+    snap_dir = _find_dataset_snapshot(out_dir, resume_dir)
+    if snap_dir is None:
+        if verbose:
+            print(" -- no dataset snapshot found (run predates snapshots); "
+                  "resuming on the config's dataset paths UNVERIFIED")
+        return resolved
+    with open(os.path.join(snap_dir, DATASET_SNAPSHOT_META)) as f:
+        meta = json.load(f)
+    for role, name in roles.items():
+        if not name:
+            continue
+        rec = meta["roles"].get(role)
+        if rec is None or rec["copy"] is None:
+            continue  # hub id, or a role this run didn't record
+        snap_path = os.path.join(snap_dir, rec["copy"])
+        cur = os.path.expanduser(name)
+        if not os.path.isfile(cur):
+            resolved[role] = snap_path
+            if verbose:
+                print(f" -- dataset '{role}': {name} no longer exists; using "
+                      f"the run's snapshot {snap_path}")
+            continue
+        if _sha256_file(cur) == rec["sha256"]:
+            if verbose:
+                print(f" -- dataset '{role}' verified against the run "
+                      f"snapshot (sha256 match)")
+            continue
+        if verbose:
+            print(f"\n !! dataset '{role}' has CHANGED since this run started:")
+            print(f"      current:  {cur}")
+            print(f"      snapshot: {snap_path}  (the data the run began on)")
+        if not (interactive and sys.stdin.isatty()):
+            raise SystemExit(
+                f"dataset '{role}' changed since run start; re-run pointing "
+                f"--{role.replace('_', '-')} at the snapshot or the intended "
+                f"file explicitly (interactive prompt unavailable here)")
+        while True:
+            ans = input("    continue on [s]napshot (exact continuation), "
+                        "[c]urrent file (new mix mid-run), or [a]bort? "
+                        ).strip().lower()
+            if ans in ("s", "snapshot"):
+                resolved[role] = snap_path
+                break
+            if ans in ("c", "current"):
+                break
+            if ans in ("a", "abort", "q", "quit"):
+                raise SystemExit("aborted: dataset changed since run start")
+    return resolved
 
 
 def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
@@ -1863,6 +2003,24 @@ def _run_main():
     from exllamav3.training import backbone as _backbone_cfg
     _backbone_cfg.set_dequant_mode(args.dequant_mode)
 
+    # Dataset-mix continuity: a fresh run snapshots its data files into
+    # <out>/dataset/ (copy + sha256); a resume verifies the config's paths
+    # against that record and may substitute the snapshot, so the mix a run
+    # trained on stays knowable and reloadable even after the source jsonl is
+    # edited or regenerated. Done before the failure-log record below so the
+    # RESOLVED paths are what gets logged.
+    if args.out:
+        data_roles = {"dataset": args.dataset,
+                      "eval_dataset": args.eval_dataset,
+                      "eval2_dataset": args.eval2_dataset}
+        if args.resume:
+            resolved = resolve_resumed_datasets(args.out, args.resume, data_roles)
+            args.dataset = resolved["dataset"]
+            args.eval_dataset = resolved["eval_dataset"]
+            args.eval2_dataset = resolved["eval2_dataset"]
+        else:
+            snapshot_datasets(args.out, data_roles)
+
     # Seed the failure logger with everything knowable before work starts, so a
     # crash at ANY later point (bad dataset name, OOM, unsupported arch guard)
     # still produces a run-log row identifying the attempt. Progress fields
@@ -2244,6 +2402,7 @@ def _run_main():
     #     the run continues instead of cold-restarting warmup/cosine. resume_state
     #     seeds best_val/ema below; resume_step shifts the loop's start.
     resume_step, resume_state = 0, None
+    yaml_base_lrs = list(sched.base_lrs)  # per-group base LRs from the CONFIG
     if args.resume and not args.reset_optimizer:
         resume_state = load_trainer_state(args.resume)
         if resume_state is not None:
@@ -2255,6 +2414,23 @@ def _run_main():
                 offload_opt.load_state_dict(resume_state["offload_optimizer"])
             if resume_state.get("scheduler") is not None:
                 sched.load_state_dict(resume_state["scheduler"])
+            # The config is the source of truth for the base LR on resume: the
+            # restored optimizer/scheduler state carries the ORIGINAL run's lr
+            # in param_groups/base_lrs, which used to silently override an
+            # edited lr:. Re-base the schedule at the config value -- moments,
+            # step counter and schedule position all kept. A byte-identical
+            # config leaves everything exactly as restored.
+            if list(sched.base_lrs) != yaml_base_lrs:
+                old_lr = sched.base_lrs[0]
+                sched.base_lrs = list(yaml_base_lrs)
+                for g, base, fn in zip(opt.param_groups, sched.base_lrs,
+                                       sched.lr_lambdas):
+                    g["initial_lr"] = base
+                    g["lr"] = base * fn(sched.last_epoch)
+                sched._last_lr = [g["lr"] for g in opt.param_groups]
+                print(f" -- resume LR override: base lr {old_lr:.2e} "
+                      f"(checkpoint) -> {yaml_base_lrs[0]:.2e} (config); "
+                      f"optimizer moments and schedule position kept")
             resume_step = int(resume_state["step"])
             print(f" -- resumed trainer state from {args.resume}: continuing at "
                   f"step {resume_step + 1}/{args.steps} (best_val "
@@ -2341,6 +2517,21 @@ def _run_main():
         return eval_loss(val_examples)
 
     bgen = batches()
+    if resume_step:
+        # Fast-forward the data stream to where the original process stopped:
+        # the sequence is fully deterministic from Random(0), so skipping
+        # resume_step * grad_accum micro-batches reproduces the exact order an
+        # uninterrupted run would have used. Without this a resume replayed
+        # epoch 0's permutation while the step counter and LR schedule
+        # continued (doc/bug_resume_data_order.md). Yields are index lists --
+        # no tokenization -- so this is microseconds. Only exact when the
+        # dataset matches the original run's (enforced above by
+        # resolve_resumed_datasets unless 'current' was chosen on a mismatch).
+        for _ in range(resume_step * args.grad_accum):
+            next(bgen)
+        print(f" -- data stream fast-forwarded {resume_step * args.grad_accum} "
+              f"micro-batches to continue the run's batch order at step "
+              f"{resume_step + 1}")
     opt.zero_grad(set_to_none=True)
     if offload_opt is not None:
         offload_opt.zero_grad(set_to_none=True)
@@ -2383,13 +2574,14 @@ def _run_main():
         _REPORT["rep"] = report
 
     # Live monitor (--live-report): recompute any step's batch on demand. The
-    # mapping mirrors batches()/the loop exactly: the k-th optimizer step
-    # executed IN THIS PROCESS (k = step - resume_step - 1, since a resume
-    # restarts bgen from scratch) consumes micro-batches k*ga .. k*ga+ga-1 of
-    # the stream. batches() reseeds Random(0) every pass but shuffles the SAME
-    # list in place, so epoch e's permutation is that seeded shuffle applied
-    # e+1 times cumulatively -- replayed here lazily as steps are browsed
-    # (verified against the generator in the parity test).
+    # mapping mirrors batches()/the loop exactly: optimizer step s consumes
+    # micro-batches (s-1)*ga .. (s-1)*ga+ga-1 of the stream -- an ABSOLUTE
+    # mapping, valid on resume too now that bgen is fast-forwarded to the
+    # resume step (so pre-resume steps are browsable and correct). batches()
+    # reseeds Random(0) every pass but shuffles the SAME list in place, so
+    # epoch e's permutation is that seeded shuffle applied e+1 times
+    # cumulatively -- replayed here lazily as steps are browsed (verified
+    # against the generator in the parity test).
     if args.live_report and report is None:
         print(" -- --live-report needs the local report; ignoring (--no-report set)")
     elif args.live_report:
@@ -2403,11 +2595,11 @@ def _run_main():
             return live_orders["perms"][e]
 
         def live_batch_fn(s):
-            if not (resume_step < s <= args.steps):
-                raise ValueError(f"step must be in [{resume_step + 1}, {args.steps}]")
+            if not (0 < s <= args.steps):
+                raise ValueError(f"step must be in [1, {args.steps}]")
             mbs = []
             for g in range(args.grad_accum):
-                m = (s - resume_step - 1) * args.grad_accum + g
+                m = (s - 1) * args.grad_accum + g
                 e, w = divmod(m, live_mpe)
                 seqs = [{"index": j,
                          "docs": decode_example_docs(tokenizer, examples[j])}
@@ -2578,6 +2770,12 @@ def _run_main():
     # (packed blocks under --pack), so in --steps mode the total shows the
     # equivalent epoch count the step budget works out to.
     epochs_total = args.epochs if args.epochs > 0 else args.steps / args.steps_per_epoch
+    # Last COMPLETED optimizer step, as opposed to the in-flight one `step` holds
+    # mid-iteration. Ctrl-C used to save the latter, producing a state whose
+    # step counter disagreed with the scheduler's last_epoch; the resume then
+    # trusted the counter, skipped that iteration's micro-batches and ran the
+    # rest of the LR schedule one step late. Measured on GPU in S65.
+    done_step = resume_step
     try:
         for step in range(resume_step + 1, args.steps + 1):
             _FAIL_CTX["phase"] = f"train step {step}"
@@ -2751,10 +2949,18 @@ def _run_main():
                 if (step - resume_step) >= 5 + args.torch_profile:
                     prof.stop()
                     prof = None
+
+            # Reached only if the whole iteration ran: this step is now durable.
+            done_step = step
     except KeyboardInterrupt:
         if prof is not None:   # window incomplete: no artifacts, just release
             prof.stop()
             prof = None
+        # Roll back to the last completed step so the saved counter, the
+        # scheduler and the data stream all agree; save()/log_run() below close
+        # over `step`. An interrupt inside the first iteration saves resume_step
+        # (no progress), which is correct.
+        step = done_step
         # Stopping early at the loss plateau is a normal workflow; never discard
         # the adapter trained so far. Under --save-best, --out belongs to the
         # best-val adapter, so the interrupted weights go to final_dir() instead
