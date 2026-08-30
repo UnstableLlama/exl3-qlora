@@ -1,0 +1,129 @@
+# Muse-Glimmer-30B @ 6.00bpw -- semancy v5 (798 rows), STOCK TEMPLATE, Session 68.
+#
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     python training/qlora_train.py --config training/experiments/muse_glimmer_semancy_v10.yaml
+#
+# The v9 recipe with two changes, both requested by the user:
+#   - lr     2e-5 -> 5e-6   (4x colder)
+#   - epochs 2    -> 3
+#
+# Everything else is byte-identical to v9 (r64/alpha64, rslora, pissa, no
+# embed/head adapters, seq_len 3072, bfd packing, stock jinja template).
+#
+# v9 for reference: 160 steps, start held-out 2.5227 -> best 1.8248 @ step 80
+# (end of epoch 1) -> final 1.9045. It overfit through the whole of epoch 2 at
+# 2e-5. The colder LR + third epoch is the counter-move: less step size, more
+# passes.
+#
+# 240 planned steps @ 80/epoch. eval_every 40 is still an exact HALF-epoch, so
+# evals/checkpoints land at 40/80/120/160/200/240 -- epoch ends at 80/160/240.
+#
+# CHECKPOINTS (v10 change vs v9): save_best OFF, keep_checkpoints 4 -> 6.
+# eval_every and checkpoint_every are both 40, so every eval step is ALSO a full
+# resumable checkpoint -- the best-val step is always already on disk as a
+# checkpoint dir and save_best has nothing to add. best_val / best_val_step are
+# still tracked and written to the run log with the flag off
+# (qlora_train_native.py:2906). Step 240 is the last step and a multiple of 40,
+# so the final checkpoint is written too, and with save_best off the run ROOT
+# holds the final-step adapter directly (no separate final/ subdir).
+#
+# DISK: ~5.5 GB per checkpoint dir + ~5.9 GB at the root = ~39 GB for all 6.
+# /home has 85 GB free.
+
+model: /mnt/two/weights/Muse-Glimmer-30B-exl3-6.00bpw
+out: out/muse_glimmer_semancy_v10
+
+method: sft
+parallel: split
+split_even: true
+
+# LoRA -- r64/alpha64 + rslora + pissa. Under rslora the effective scale is
+# alpha/sqrt(r) = 64/8 = 8.0.
+r: 64
+alpha: 64
+use_rslora: true
+init_lora: pissa
+init_svd_niter: 16
+
+# No embed/head adapters (S64: the whole embed+head ray is <0.004 nats and
+# lora_head costs 8.7 GB by killing the chunked-vocab fused CE).
+lora_embed: false
+lora_head: false
+train_embeddings: false
+train_head: false
+
+# Optimization -- lr 5e-6, warmup_ratio 0.05, weight_decay 0 (user).
+lr: 0.000005
+scheduler: cosine
+warmup_ratio: 0.05
+weight_decay: 0.0
+epochs: 3
+batch: 1
+grad_accum: 2              # eff batch 2 blocks (~10 documents at 98% fill)
+optim: paged_adamw8bit
+max_grad_norm: 1.0
+
+# Data -- semancy v5. Max row = 2445 tok under the v5 template, so 3072 truncates
+# NOTHING (1024, the old semancy seq_len, would have chopped 17% of rows).
+dataset: /home/unstable/datasets/semancer_expansion/train_v5.jsonl
+dataset_split: train       # local jsonl loads as split "train"
+messages_key: messages
+shuffle: true
+seq_len: 3072
+pack: true
+pack_algo: bfd             # 160 packed blocks/epoch -> 80 optimizer steps/epoch
+
+# Prompt format -- the model's shipped template with the injected-system-block
+# defaults patched (training/chat_templates/muse-glimmer-semancer.jinja).
+#
+# The stock template synthesizes a system block whenever a row has no system
+# message -- which is all 798 semancy rows -- and that block carried three things
+# nobody asked for:
+#   1. "Reasoning strength: high."  (macro default when reasoning_strength is
+#      unset). Our assistant turns are direct prose with no `to=self` reasoning
+#      block, so training on this teaches "high effort => skip reasoning". The
+#      model card lists low/medium/high/xhigh -- there is no "off" -- so the
+#      patched default is `low`.
+#   2. "Knowledge cutoff: 2026-01-04."  (emitted unconditionally)
+#   3. "Current date: <today>."  (falls through to strftime_now, so the rendered
+#      dataset changed with the calendar -- runs were not reproducible)
+#
+# 1 is not reachable via template_vars in a useful way and 2/3 are not reachable
+# at all, hence a patched copy. Everything after the system block renders
+# byte-identical to stock; overrides and the explicit-system path still work.
+# THIS DIFFERS FROM v5-v9, which all trained with high/cutoff/date baked in.
+prompt_format: jinja
+chat_template_file: training/chat_templates/muse-glimmer-semancer.jinja
+
+# Trainable modules -- 7 dense projections (vision tower untouched)
+targets:
+  - down_proj
+  - gate_proj
+  - up_proj
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# Compute / VRAM -- 202k vocab head is the pressure point, hence head_vocab_chunk.
+# v9 measured 15.79 GB peak at these settings.
+compute_dtype: bfloat16
+attn_impl: flash
+head_vocab_chunk: 16384
+ce_chunk: 1024
+offload_activations: true
+sample_every: 0
+
+# Eval / checkpoints -- 116-row held-out, identical to every prior semancy run.
+eval_dataset: mala-data/semancy_test.jsonl
+eval_split: train          # local jsonl quirk (S45)
+eval_every: 40
+save_best: false
+checkpoint_every: 40       # half-epoch: 40/80/120/160/200/240
+keep_checkpoints: 6        # all of them; nothing rotates out
+
+# Live monitor -- binds 127.0.0.1 only. Port pinned so the URL is stable. From a
+# remote box:  ssh -L 8137:127.0.0.1:8137 <thishost>
+live_report: true
+live_report_port: 8137
+run_name: muse_glimmer_semancy_v10
