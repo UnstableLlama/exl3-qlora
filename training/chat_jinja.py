@@ -52,6 +52,7 @@ module costs nothing. Unit-testable without torch / the compiled extension
 import datetime
 import json
 import os
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,59 @@ def compile_chat_template(source):
                 f"expects") from e
 
     return render
+
+
+# ---------------------------------------------------------------------------
+# Optional system-preamble scrubbing (--strip-sys-prompt-extras)
+# ---------------------------------------------------------------------------
+
+# Boilerplate that harmony-style templates (Muse-Glimmer, gpt-oss and friends)
+# synthesize into the system block when a row has no system message of its own.
+# None of it comes from the dataset, and for a persona/voice fine-tune all three
+# are actively unhelpful:
+#
+#   Reasoning strength: <level>   the macro default is the model's HIGHEST or a
+#                                 fixed level, and if the training answers carry
+#                                 no reasoning channel the run teaches "this
+#                                 effort level => emit no reasoning"
+#   Knowledge cutoff: <date>      emitted unconditionally by some templates; no
+#                                 template variable suppresses it
+#   Current date: <date>          falls through to strftime_now() when the
+#                                 caller passes no current_date, so the rendered
+#                                 corpus silently changes from day to day and
+#                                 runs stop being byte-reproducible
+#
+# Only some of these are reachable via --template-vars, and only per-call-site,
+# which is why this is a render-level scrub rather than a set of variables.
+SYS_PROMPT_EXTRA_LINE = re.compile(
+    r"(?m)^(?:Reasoning strength|Knowledge cutoff|Current date)[ \t]*:[^\n]*\n?")
+
+
+_STRIP_EXTRAS_DEFAULT = False
+
+
+def set_strip_sys_prompt_extras(on):
+    """Process-wide default for jinja_renderers(strip_extras=...). The trainers
+    call this once from their arg parsing so the flag reaches every renderer
+    without threading a parameter through build_dataset/format_prompt_and_eot
+    and their callers in four separate scripts."""
+    global _STRIP_EXTRAS_DEFAULT
+    _STRIP_EXTRAS_DEFAULT = bool(on)
+
+
+def strip_sys_prompt_extras(text):
+    """Delete template-injected reasoning-strength / knowledge-cutoff /
+    current-date lines from a rendered prompt.
+
+    Removing whole lines leaves a longer run of newlines behind where the block
+    used to be, so runs of 3+ newlines collapse back to a single blank line --
+    which restores exactly the spacing the template would have produced had the
+    lines never been emitted. That collapse is global, so a *message* whose own
+    content contains three or more consecutive newlines would be normalized too;
+    keep that in mind for corpora with ASCII art or deliberate vertical space.
+    """
+    out = SYS_PROMPT_EXTRA_LINE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", out)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +485,8 @@ def parse_template_vars(text):
 
 
 def jinja_renderers(model_dir, special_tokens=None, template_file=None,
-                    default_vars=None, template_name=None):
+                    default_vars=None, template_name=None,
+                    strip_extras=None):
     """One-stop factory for the trainers: load + compile the model's chat
     template and return ``(seg_build, build_prompt, eot)``:
 
@@ -444,9 +499,26 @@ def jinja_renderers(model_dir, special_tokens=None, template_file=None,
         template can't render the probe (use turn_end_token() then).
 
     ``special_tokens`` and ``default_vars`` (e.g. {"enable_thinking": False})
-    are in every render's context; per-row template_vars layer on top."""
+    are in every render's context; per-row template_vars layer on top.
+
+    ``strip_extras`` (--strip-sys-prompt-extras) wraps the compiled renderer in
+    strip_sys_prompt_extras(), so the scrub happens once, below every consumer:
+    seg_build, build_prompt and the derive_turn_close probe all see the same
+    text and the segment prefix-matching stays consistent with it. Defaults to
+    whatever set_strip_sys_prompt_extras() last set (off unless a trainer opts
+    in), so behaviour is unchanged for every existing caller."""
     source = load_chat_template(model_dir, template_file, name=template_name)
     render = compile_chat_template(source)
+    if strip_extras is None:
+        strip_extras = _STRIP_EXTRAS_DEFAULT
+    if strip_extras:
+        _raw_render = render
+
+        def render(messages, add_generation_prompt=False, **kwargs):
+            return strip_sys_prompt_extras(
+                _raw_render(messages,
+                            add_generation_prompt=add_generation_prompt,
+                            **kwargs))
     base = dict(special_tokens or {})
     base.update(default_vars or {})
     seg_build = make_jinja_segment_builder(render, base)

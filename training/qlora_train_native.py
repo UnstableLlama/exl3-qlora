@@ -1675,6 +1675,16 @@ def _run_main():
                          "every render, e.g. '{\"enable_thinking\": false}'. "
                          "Per-row template_vars/chat_template_kwargs columns "
                          "override these per key.")
+    ap.add_argument("--strip-sys-prompt-extras", action="store_true",
+                    help="(jinja) Delete template-injected 'Reasoning "
+                         "strength:', 'Knowledge cutoff:' and 'Current date:' "
+                         "lines from every rendered prompt (OFF by default). "
+                         "Harmony-style templates (Muse-Glimmer, gpt-oss) "
+                         "synthesize these into the system block whenever a row "
+                         "has no system message of its own; none of it is in "
+                         "your data. The date line in particular comes from "
+                         "strftime_now(), so without this flag the rendered "
+                         "corpus changes from one day to the next.")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* and normalize "
                          "whitespace before training (OFF by default). Helps "
@@ -1986,6 +1996,11 @@ def _run_main():
     ap.add_argument("--wandb-entity", default="",
                     help="wandb entity (user/team; empty = account default).")
     args = ap.parse_args()
+
+    # Set before anything can build a renderer, so every jinja_renderers() call
+    # in this process (dataset build, eval build, --sample-every prompts) agrees.
+    from chat_jinja import set_strip_sys_prompt_extras
+    set_strip_sys_prompt_extras(args.strip_sys_prompt_extras)
 
     # UVM spillover must be installed before the first CUDA tensor exists, so
     # this runs before anything touches a device (model load is the first).

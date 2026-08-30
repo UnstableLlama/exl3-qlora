@@ -73,27 +73,28 @@ seq_len: 3072
 pack: true
 pack_algo: bfd             # 160 packed blocks/epoch -> 80 optimizer steps/epoch
 
-# Prompt format -- the model's shipped template with the injected-system-block
-# defaults patched (training/chat_templates/muse-glimmer-semancer.jinja).
+# Prompt format -- the model's OWN shipped template, unmodified, plus the new
+# --strip-sys-prompt-extras scrub.
 #
 # The stock template synthesizes a system block whenever a row has no system
 # message -- which is all 798 semancy rows -- and that block carried three things
-# nobody asked for:
-#   1. "Reasoning strength: high."  (macro default when reasoning_strength is
-#      unset). Our assistant turns are direct prose with no `to=self` reasoning
-#      block, so training on this teaches "high effort => skip reasoning". The
-#      model card lists low/medium/high/xhigh -- there is no "off" -- so the
-#      patched default is `low`.
+# that are not in the dataset:
+#   1. "Reasoning strength: high."  (render_reasoning() macro default). Our
+#      assistant turns are direct prose with no `to=self` reasoning block, so
+#      training on this teaches "high effort => emit no reasoning".
 #   2. "Knowledge cutoff: 2026-01-04."  (emitted unconditionally)
 #   3. "Current date: <today>."  (falls through to strftime_now, so the rendered
-#      dataset changed with the calendar -- runs were not reproducible)
+#      corpus changed with the calendar -- runs were not byte-reproducible)
 #
-# 1 is not reachable via template_vars in a useful way and 2/3 are not reachable
-# at all, hence a patched copy. Everything after the system block renders
-# byte-identical to stock; overrides and the explicit-system path still work.
-# THIS DIFFERS FROM v5-v9, which all trained with high/cutoff/date baked in.
+# strip_sys_prompt_extras deletes all three lines outright. Verified over all
+# 798 rows: exactly 83 chars removed per row, zero changes to supervised text,
+# zero changes to segment shape.
+#
+# THIS DIFFERS FROM v5-v9, which all trained with high/cutoff/date baked in, so
+# v10's curve is NOT directly comparable to theirs.
 prompt_format: jinja
-chat_template_file: training/chat_templates/muse-glimmer-semancer.jinja
+chat_template_file: /mnt/two/weights/Muse-Glimmer-30B-exl3-6.00bpw/chat_template.jinja
+strip_sys_prompt_extras: true
 
 # Trainable modules -- 7 dense projections (vision tower untouched)
 targets:
@@ -117,9 +118,18 @@ sample_every: 0
 # Eval / checkpoints -- 116-row held-out, identical to every prior semancy run.
 eval_dataset: mala-data/semancy_test.jsonl
 eval_split: train          # local jsonl quirk (S45)
-eval_every: 40
+# Scrubbing the system extras shortens every row, so the corpus packs into
+# FEWER blocks than v9's 160 and the step count drops with it. 38 is the
+# half-epoch for ~77 steps/epoch (user's pick); confirm against the "packed
+# (bfd)" line in the log, since no integer is both a true half-epoch and a
+# divisor of the total.
+#
+# save_best is off, so save() writes the final-step adapter AND trainer_state to
+# the run ROOT (qlora_train_native.py:2485) -- the final checkpoint is always
+# kept and resumable even when the last step misses the checkpoint cadence.
+eval_every: 38
 save_best: false
-checkpoint_every: 40       # half-epoch: 40/80/120/160/200/240
+checkpoint_every: 38       # half-epoch
 keep_checkpoints: 6        # all of them; nothing rotates out
 
 # Live monitor -- binds 127.0.0.1 only. Port pinned so the URL is stable. From a

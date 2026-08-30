@@ -592,6 +592,15 @@ def _run_main():
                          "every render, e.g. '{\"enable_thinking\": false}'. "
                          "Per-row template_vars/chat_template_kwargs columns "
                          "override these per key.")
+    ap.add_argument("--strip-sys-prompt-extras", action="store_true",
+                    help="(jinja) Delete template-injected 'Reasoning "
+                         "strength:', 'Knowledge cutoff:' and 'Current "
+                         "date:' lines from every rendered prompt (OFF by "
+                         "default). Harmony-style templates synthesize "
+                         "these into the system block for rows with no "
+                         "system message; the date comes from "
+                         "strftime_now(), so without this the rendered "
+                         "corpus changes from day to day.")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = all rows")
     ap.add_argument("--shuffle", action="store_true")
     ap.add_argument("--shuffle-seed", type=int, default=0)
@@ -638,6 +647,10 @@ def _run_main():
                     help="Opt-in recompute->backward frozen-weight cache (a net "
                          "loss under the default fast path; see the SFT arm).")
     args = ap.parse_args()
+
+    # Process-wide, before any renderer is built (see chat_jinja).
+    from chat_jinja import set_strip_sys_prompt_extras
+    set_strip_sys_prompt_extras(args.strip_sys_prompt_extras)
 
     if args.beta is None:
         args.beta = 2.0 if args.method == "simpo" else 0.1

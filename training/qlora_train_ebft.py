@@ -607,6 +607,15 @@ def _run_main():
     ap.add_argument("--template-vars", default=None,
                     help="(jinja) JSON object of extra template variables, "
                          "e.g. '{\"enable_thinking\": false}'.")
+    ap.add_argument("--strip-sys-prompt-extras", action="store_true",
+                    help="(jinja) Delete template-injected 'Reasoning "
+                         "strength:', 'Knowledge cutoff:' and 'Current "
+                         "date:' lines from every rendered prompt (OFF by "
+                         "default). Harmony-style templates synthesize "
+                         "these into the system block for rows with no "
+                         "system message; the date comes from "
+                         "strftime_now(), so without this the rendered "
+                         "corpus changes from day to day.")
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--shuffle", action="store_true")
     ap.add_argument("--shuffle-seed", type=int, default=0)
@@ -679,6 +688,10 @@ def _run_main():
     ap.add_argument("--live-report-port", type=int, default=0,
                     help="Port for --live-report (default 0 = pick a free one).")
     args = ap.parse_args()
+
+    # Process-wide, before any renderer is built (see chat_jinja).
+    from chat_jinja import set_strip_sys_prompt_extras
+    set_strip_sys_prompt_extras(args.strip_sys_prompt_extras)
 
     from exllamav3.training import backbone as _backbone
     _backbone.set_dequant_mode(args.dequant_mode)

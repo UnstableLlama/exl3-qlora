@@ -192,6 +192,15 @@ def _run_main():
     ap.add_argument("--template-vars", default=None,
                     help="(jinja) JSON object of extra template variables, "
                          "e.g. '{\"enable_thinking\": false}'.")
+    ap.add_argument("--strip-sys-prompt-extras", action="store_true",
+                    help="(jinja) Delete template-injected 'Reasoning "
+                         "strength:', 'Knowledge cutoff:' and 'Current "
+                         "date:' lines from every rendered prompt (OFF by "
+                         "default). Harmony-style templates synthesize "
+                         "these into the system block for rows with no "
+                         "system message; the date comes from "
+                         "strftime_now(), so without this the rendered "
+                         "corpus changes from day to day.")
     ap.add_argument("--clean-text", action="store_true",
                     help="Strip [stage directions]/*actions* + normalize whitespace "
                          "(OFF by default; leave off for reasoning/code/markdown).")
@@ -368,6 +377,10 @@ def _run_main():
                          "dequants per step, costs VRAM; a net loss under the "
                          "default fast path -- see the single-GPU arm).")
     args = ap.parse_args()
+
+    # Process-wide, before any renderer is built (see chat_jinja).
+    from chat_jinja import set_strip_sys_prompt_extras
+    set_strip_sys_prompt_extras(args.strip_sys_prompt_extras)
 
     from exllamav3.training import backbone as _backbone_cfg
     _backbone_cfg.set_dequant_mode(args.dequant_mode)
