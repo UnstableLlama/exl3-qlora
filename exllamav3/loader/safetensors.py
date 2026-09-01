@@ -182,6 +182,83 @@ class STCMetrics:
         print(f" -- Direct: {self.direct_tensors:,} tensors")
 
 
+class DiskTensorHandle:
+    """
+    Handle to a tensor that stays on disk: full shape/dtype metadata plus the file location, with
+    on-demand row reads. Returned by SafetensorsCollection.get_tensor_handle() so modules can
+    stream rows of very large tensors (e.g. hashed n-gram embedding tables) instead of loading
+    them. Reads use pread on a shared fd and are thread-safe.
+    """
+
+    def __init__(self, key: str, filename: str, abs_offset: int, shape: list, dtype: torch.dtype):
+        assert len(shape) >= 1
+        self.key = key
+        self.filename = filename
+        self.abs_offset = abs_offset
+        self.shape = list(shape)
+        self.dtype = dtype
+        esize = torch.empty(0, dtype = dtype).element_size()
+        self.num_rows = shape[0]
+        self.row_shape = list(shape[1:])
+        self.row_bytes = math.prod(shape[1:]) * esize if len(shape) > 1 else esize
+        self.fd = None
+
+    def _ensure_open(self):
+        if self.fd is None:
+            self.fd = os.open(self.filename, os.O_RDONLY)
+        return self.fd
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def read_range(self, start: int, end: int) -> torch.Tensor:
+        """Contiguous rows [start, end) as a CPU tensor in the stored dtype."""
+        assert 0 <= start <= end <= self.num_rows
+        fd = self._ensure_open()
+        nbytes = (end - start) * self.row_bytes
+        buf = bytearray(nbytes)
+        mv = memoryview(buf)
+        pos = 0
+        base = self.abs_offset + start * self.row_bytes
+        while pos < nbytes:
+            got = os.preadv(fd, [mv[pos:]], base + pos)
+            assert got > 0, f"short read from {self.filename}"
+            pos += got
+        return torch.frombuffer(buf, dtype = self.dtype).view(end - start, *self.row_shape)
+
+    def read_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Gather of arbitrary rows, returned in the order given, as a CPU tensor in the stored
+        dtype. Adjacent sorted indices are coalesced into single reads.
+        """
+        idx = indices.reshape(-1).cpu().to(torch.int64)
+        n = idx.numel()
+        out = torch.empty((n, *self.row_shape), dtype = self.dtype)
+        if n == 0:
+            return out
+        fd = self._ensure_open()
+        order = torch.argsort(idx)
+        sidx = idx[order].tolist()
+        out_flat = out.view(n, -1)
+        rb = self.row_bytes
+        run_start = 0
+        j = 0
+        while j < n:
+            # extend run while file rows stay consecutive
+            k = j + 1
+            while k < n and sidx[k] == sidx[k - 1] + 1:
+                k += 1
+            nbytes = (k - j) * rb
+            buf = os.pread(fd, nbytes, self.abs_offset + sidx[j] * rb)
+            assert len(buf) == nbytes, f"short read from {self.filename}"
+            rows = torch.frombuffer(bytearray(buf), dtype = self.dtype).view(k - j, -1)
+            out_flat[order[j:k]] = rows
+            j = k
+        return out
+
+
 class SafetensorsCollection:
 
     def __init__(
@@ -210,6 +287,7 @@ class SafetensorsCollection:
 
         self.metrics = STCMetrics()
         self.first_open_time = None
+        self.disk_handles = []
 
         self.tensor_files = []
         self.add_tensor_files(directory)
@@ -218,14 +296,28 @@ class SafetensorsCollection:
         self.deferred_mode = False
         self.deferred_loads = []
 
+        # Load-time slab arena (per CUDA device): weight tensors loaded inside a deferred-load
+        # bracket carve out of large shared blocks instead of one allocation each. MoE models
+        # with many small per-expert tensors otherwise shatter the caching allocator (measured:
+        # 74k ~1MB + 150k tiny allocations -> 37k segments, 15.3 GB reserved-but-unallocated on
+        # a 512-expert model). The boundary block is shared across brackets, so at most one
+        # partially-external block per module stays pinned after an unload
+        self.arena = {}                    # device index -> [block (uint8), fill offset]
+        self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
+
 
     def add_tensor_files(
         self,
         directory: str,
         warn_if_override: bool = True
     ):
-        st_pattern = os.path.join(directory, "*.safetensors")
-        new_tensor_files = glob.glob(st_pattern)
+        # accepts either a directory to scan or a single .safetensors file (e.g. a quantized
+        # n-gram table added to a conversion job's collection)
+        if directory.endswith(".safetensors") and os.path.isfile(directory):
+            new_tensor_files = [directory]
+        else:
+            st_pattern = os.path.join(directory, "*.safetensors")
+            new_tensor_files = glob.glob(st_pattern)
         self.tensor_files += new_tensor_files
 
         overrides = 0
@@ -240,7 +332,7 @@ class SafetensorsCollection:
                     if key.endswith(k):
                         key = key[:-len(k)] + v
                 if key in self.tensor_file_map and warn_if_override:
-                    # print(f" !! Overriding {key} from {self.tensor_file_map[key]} with f{st_file}")
+                    print(f" !! Overriding {key} from {self.tensor_file_map[key]} with {st_file}")
                     overrides += 1
                 self.tensor_file_map[key] = st_file
         if overrides:
@@ -371,6 +463,34 @@ class SafetensorsCollection:
         }
 
 
+    def get_tensor_handle(
+        self,
+        key: str,
+        optional: bool = False,
+    ) -> DiskTensorHandle | None:
+        """
+        Return a DiskTensorHandle for streaming rows of the tensor from disk without loading it.
+        The handle stays valid until the collection is closed.
+        """
+        filename = self.tensor_file_map.get(key)
+        if filename is None:
+            if not optional:
+                raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        dtype, np_dtype, esize = convert_dtype(h["dtype"])
+        handle = DiskTensorHandle(
+            key = key,
+            filename = filename,
+            abs_offset = header["_header_offset"] + h["data_offsets"][0],
+            shape = h["shape"],
+            dtype = dtype,
+        )
+        self.disk_handles.append(handle)
+        return handle
+
+
     def get_tensors(
         self,
         prefix: str,
@@ -386,6 +506,29 @@ class SafetensorsCollection:
         result = {key: self.get_tensor(key, device, allow_bf16 = allow_bf16) for key in keys}
         return result
 
+
+    ARENA_BLOCK = 128 << 20        # slab block size
+    ARENA_MAX_TENSOR = 64 << 20    # larger tensors get their own allocation (few, no waste)
+    ARENA_ALIGN = 256
+
+    def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool):
+        """Persistent weight-tensor allocation: carve from the device's slab block while a
+        deferred-load bracket is open, falling back to a plain allocation otherwise."""
+        device = torch.device(device)
+        nbytes = math.prod(shape) * dtype.itemsize
+        if not (self.arena_enable and self.deferred_mode and device.type == "cuda"
+                and 0 < nbytes <= self.ARENA_MAX_TENSOR):
+            return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
+        blk, off = self.arena.get(device.index, (None, 0))
+        off = -(-off // self.ARENA_ALIGN) * self.ARENA_ALIGN
+        if blk is None or off + nbytes > blk.numel():
+            blk = torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device)
+            off = 0
+        self.arena[device.index] = (blk, off + nbytes)
+        t = blk[off : off + nbytes].view(dtype).view(shape)
+        if zeros:
+            t.zero_()
+        return t
 
     def get_tensor(
         self,
@@ -481,11 +624,11 @@ class SafetensorsCollection:
                         load_dtype = torch.half
                     final_shape = pad_to if pad_to is not None else load_shape_t
                     final_dtype = dtype if not (bf16_to_fp16 or fp32_to_fp16) else torch.float16
-                    if final_shape == load_shape_t:
-                        tensor = torch.empty(final_shape, dtype = final_dtype, device = device)
-                    else:
-                        tensor = torch.zeros(final_shape, dtype = final_dtype, device = device)
+                    tensor = self._arena_alloc(final_shape, final_dtype, device,
+                                               zeros = final_shape != load_shape_t)
                     if transpose or fp32_to_fp16 or final_shape != load_shape_t:
+                        # transient staging: NOT from the arena (freed after the fill; it would
+                        # pin its block as dead weight)
                         temp_tensor = torch.empty(load_shape, dtype = load_dtype, device = device)
                     else:
                         temp_tensor = None
@@ -512,7 +655,15 @@ class SafetensorsCollection:
                         except RuntimeError as e:
                             print(f" ## Error opening {filename}")
                             raise e
-                    tensor = torch.empty(shape, dtype = dtype, device = device)
+                    # Arena only when the loaded tensor IS the final tensor (a conversion or
+                    # transpose below replaces it, stranding the original in the slab)
+                    final = not (dtype == torch.bfloat16 and not allow_bf16) \
+                        and not (dtype == torch.float and float2half) \
+                        and not transpose and pad_to is None
+                    if final:
+                        tensor = self._arena_alloc(shape, dtype, device, zeros = False)
+                    else:
+                        tensor = torch.empty(shape, dtype = dtype, device = device)
                     assert tensor.is_contiguous()
                     # No sync needed here: the loader engine synchronizes the target device
                     # before writing from its own streams
@@ -571,6 +722,9 @@ class SafetensorsCollection:
             if h:
                 ext.stloader_close_file(h)
                 self.handles[filename] = None
+        for h in self.disk_handles:
+            h.close()
+        self.disk_handles = []
 
 
     @cached_property
@@ -850,6 +1004,16 @@ class VariantSafetensorsCollection(SafetensorsCollection):
     ) -> torch.Tensor | None:
         stc = self.find_stc(key)
         return stc.get_tensor(key, *args, **kwargs)
+
+
+    def get_tensor_handle(
+        self,
+        key: str,
+        *args,
+        **kwargs,
+    ) -> DiskTensorHandle | None:
+        stc = self.find_stc(key)
+        return stc.get_tensor_handle(key, *args, **kwargs)
 
 
     def close(self):

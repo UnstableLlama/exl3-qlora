@@ -201,9 +201,6 @@ class Generator:
         # CPU page cache tier
         self.cpu_page_cache = None
         if cpu_cache_size:
-            # TODO: Add TP support for CPU cache
-            assert not model.loaded_tp, \
-                "CPU page cache tier is not currently supported in tensor-parallel mode."
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
             self.cpu_page_cache.attach(self.pagetable)
@@ -399,6 +396,11 @@ class Generator:
             }
         """
 
+        assert self.cache.initialized, \
+            "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
+        assert self.draft_cache is None or self.draft_cache.initialized, \
+            "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
+
         results = []
         self.iterate_start_jobs(results)
 
@@ -449,6 +451,11 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
         self.pagetable.defrag()
+        # Dynamic expert placement: apply any pending swap sweep now, between generations —
+        # a placement change perturbs the logits slightly (same expert, different device
+        # numerics) and must never land mid-stream
+        from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
+        run_pending_swap_sweeps(self.model.config.infer_params)
         malloc_trim()
 
 

@@ -61,10 +61,28 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("xh"),
     py::arg("h32")
 )
+.def("set_indexer", &BC_MLAttention::set_indexer,
+    py::arg("mode"),
+    py::arg("wq_b"),
+    py::arg("wk_w"),
+    py::arg("k_norm_w"),
+    py::arg("k_norm_b"),
+    py::arg("weights_w"),
+    py::arg("kidx"),
+    py::arg("n_heads"),
+    py::arg("head_dim"),
+    py::arg("topk"),
+    py::arg("kpool") = 0,
+    py::arg("kpool_tail") = true,
+    py::arg("gate_w") = py::none(),
+    py::arg("kpool_ape") = py::none(),
+    py::arg("kpool_plane") = py::none()
+)
 .def("needs_configure", &BC_MLAttention::needs_configure)
 .def("configure_slot", &BC_MLAttention::configure_slot,
     py::arg("bsz"),
     py::arg("q_len"),
+    py::arg("regime"),
     py::arg("q_full"),
     py::arg("q_a"),
     py::arg("ckv_kpe"),
@@ -90,5 +108,33 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("absorb_gx"),
     py::arg("absorb_gy"),
     py::arg("unfold_gx")
+)
+.def("configure_slot_dsa", &BC_MLAttention::configure_slot_dsa,
+    py::arg("bsz"),
+    py::arg("q_len"),
+    py::arg("regime"),
+    py::arg("x_st"),
+    py::arg("kidx"),
+    py::arg("kidx_n"),
+    py::arg("qidx"),
+    py::arg("wts"),
+    py::arg("scores"),
+    py::arg("indices"),
+    py::arg("dsa_arr"),
+    py::arg("dsa_ws_ml"),
+    py::arg("dsa_ws_acc"),
+    py::arg("k_idx_norm"),
+    py::arg("k_plane_append"),
+    py::arg("k_fewq"),
+    py::arg("k_dsa_split"),
+    py::arg("k_dsa_combine"),
+    py::arg("dsa_hb"),
+    py::arg("dsa_splits"),
+    py::arg("fewq_gy"),
+    py::arg("gidx") = py::none(),
+    py::arg("pool_idx") = py::none(),
+    py::arg("k_gate_append") = nullptr,
+    py::arg("k_pool_update") = nullptr,
+    py::arg("k_pool_expand") = nullptr
 )
 .def("run", &BC_MLAttention::run);
