@@ -95,7 +95,16 @@ class ModelParker:
         homes, self._homes = self._homes, None
         if not homes:
             return
-        stc = self.model.config.stc
+        config = self.model.config
+        stc = config.stc
+        # Mirror the loader (model_ls.py): a vision tower loaded with
+        # InferParams.vision_pinned keeps its linear weights in pinned host
+        # memory (zero-copy device aliases); module.load() puts them back in
+        # VRAM, so re-pin after every restore or the tower silently regrows.
+        pin = (
+            getattr(config.infer_params, "vision_pinned", False) and
+            getattr(self.model, "component", "text") == "vision"
+        )
         for module, device in homes:
             defer = module.can_defer_load()
             if defer:
@@ -108,6 +117,8 @@ class ModelParker:
                 raise
             if defer:
                 stc.end_deferred_load()
+            if pin:
+                module.pin_linears()
         stc.close()
         # Mirror Model.load_gen(): release global shared scratch tensors that
         # module loading may have (re)created; modules keep their own refs.
