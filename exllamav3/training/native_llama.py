@@ -2139,21 +2139,20 @@ class NativeLlamaQLoRA(nn.Module):
         The native ``Linear.apply_lora`` computes ``x @ A @ B`` with no extra
         scale, so the LoRA scale is folded into B here.
 
-        MoE caveat: runtime LoRA fires only through ``Linear.forward``, and the
-        quantized ``BlockSparseMLP`` inference forward dispatches its routed
-        experts through fused kernels (bc / mgemm / exl3_moe) that bypass it --
-        so ROUTED-expert adapters will NOT be reflected in native generation
-        (live samples / qlora_infer_native). They still train correctly; deploy
-        them by merge-and-requantize (the recommended path per the handoff's
-        finding C anyway). A one-time warning is printed when that applies.
+        MoE note: routed-expert adapters DO apply in native generation (the
+        quantized ``BlockSparseMLP`` forward takes its per-expert torch path
+        while any routed projection carries a runtime LoRA, Session 26), but
+        that path skips the fused expert kernels, so MoE decode is slower
+        while they are installed. A one-time notice is printed when that
+        applies; ``remove_from_native`` restores fused speed.
         """
         if not getattr(self, "_warned_moe_apply", False) and any(
                 w.r > 0 and ".experts." in w.key for w in self._wrappers):
             self._warned_moe_apply = True
-            print(" -- warning: routed-expert LoRA adapters are installed in the "
-                  "runtime slots, but the fused MoE inference kernels bypass "
-                  "them: native generation will NOT reflect the expert "
-                  "adapters. Merge-and-requantize to deploy them.")
+            print(" -- note: routed-expert LoRA adapters are installed in the "
+                  "runtime slots; MoE layers take the unfused per-expert path "
+                  "while they are loaded (slower decode -- generation IS "
+                  "adapted). Merge-and-requantize for deployment speed.")
         for w in self._wrappers:
             if w.r <= 0:
                 continue

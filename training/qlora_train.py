@@ -166,6 +166,8 @@ PREF_KEYS = {
     "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
     "head_vocab_chunk", "offload_activations", "offload_mode", "use_liger",
     "dequant_mode", "dequant_cache",
+    # reference-logp cache (dpo/kto)
+    "ref_cache",
 }
 
 # Preference-only knobs at the backend's argparse defaults. Mirrors
@@ -189,6 +191,7 @@ PREF_DEFAULTS = {
     "rejected_key": "rejected",
     "completion_key": "completion",
     "label_key": "label",
+    "ref_cache": "auto",
 }
 
 # EBFT-only knobs at their reference-code defaults. Mirrors SINGLE_ONLY_DEFAULTS:

@@ -101,13 +101,23 @@ SimPO reference-free with length-normalised rewards and margin γ. The trainer
 adapters disabled) through the same net, and for KTO two more no-grad
 forwards for the KL rows. All correct by inspection.
 
-**One efficiency lever, not a bug:** reference logps are recomputed every
+**One efficiency lever, not a bug:** reference logps were recomputed every
 micro-batch, every epoch. They are constants of the dataset (the reference is
 the frozen base, and `pissa/eva/default` inits make reference == step-0
 policy exactly). TRL's `precompute_ref_log_probs` caches them once. For a
 multi-epoch DPO/KTO run that removes 1/3 (DPO) to 1/2 (KTO with KL rows) of
-all forward passes. One `dict[example_id] -> (logps, kl_logps)` filled on
-epoch 1. Cheap to add; noted in §5 as optional.
+all forward passes.
+
+**Done on this branch:** `exllamav3/training/ref_cache.py` caches each row's
+reference logp by content key (blake2b of prompt ids + completion ids, so
+order/shuffle/max-samples/dataset-file independent; KTO's mismatched KL rows
+cache the same way), persisted per model under
+`~/.cache/exl3_qlora/ref_logps/<fingerprint>.pt` (fingerprint: model dir
+config + shard content sample, compute dtype, resolved attention plan; a
+mismatch ignores the file). `--ref-cache auto|off|<path>` in
+`qlora_train_pref.py`, `ref_cache:` in the YAML. Only missing rows are
+forwarded, as one sub-batch. Saved at every eval/checkpoint and at exit.
+CPU tests in `tests/test_ref_cache.py`. Not yet box-run.
 
 ### 1.3 Realtime (`exllamav3/training/realtime.py`)
 
@@ -121,13 +131,12 @@ place. §4 handles both.
 
 ### 1.4 Stale bits found on the way (small, worth fixing)
 
-1. `native_llama.py:2143-2157` — `apply_to_native` still prints
+1. `native_llama.py:2143-2157` — `apply_to_native` still printed
    "routed-expert LoRA adapters ... native generation will NOT reflect the
    expert adapters". That was true in Session 24 and false since Session 26:
    `block_sparse_mlp.py:1049-1090` routes to the per-expert torch path under
-   `experts_lora`, and Session 28 box-demoed it. The warning misleads anyone
-   running live samples on a MoE. Change to the slow-path notice
-   `model/lora.py` already prints.
+   `experts_lora`, and Session 28 box-demoed it. **Fixed on this branch:**
+   now the same slow-path notice `model/lora.py` prints.
 2. `exllamav3_ext/quant/exl3_gemm.cu:179-186` says the int8 GEMV path is
    "Not graph-capturable yet"; `exl3_gemv_int8.cu:205-211,337-343` records
    graph params. Upstream comment rot, harmless, don't chase.
@@ -336,6 +345,45 @@ have a hard ceiling far below the base.
 ---
 
 ## 4. The plan
+
+### Reality check: what can be done without an NVIDIA card
+
+Nobody on the project has a GPU available at the moment, and this container
+has neither a GPU nor `nvcc`. That splits the plan into two tracks:
+
+**GPU-free track (can land now, CPU-tested):**
+- The Python side of stage 1: `Linear.lora_packed()` with the version
+  counter, multi-adapter concatenation, `MultiLinear.ptrs_lora_*` tables,
+  the in-place `set_runtime_lora` from stage 4, and the tripwire-test
+  rewrite. All of it is exercisable with the existing CPU test pattern
+  (`tests/test_lora_fused_path.py` already imports `linear.py` without the
+  extension for its semantics tests).
+- `eval/perf.py --lora` and `--lora-noop` (argument plumbing only; the
+  measurement itself needs the box).
+- A pure-torch reference of `lora_gemv` semantics (`x@A@B` accumulate with
+  the fp16 rounding point pinned) that the later GPU parity tests compare
+  against, so the kernel's contract is written down before the kernel is.
+- The C++ can be *written* against the existing patterns
+  (`exl3_gemm_gr`'s `record_param` sequence, `BC_GatedMLP`'s flavour-keyed
+  graphs are mechanical) but not compiled here. Landing uncompiled CUDA is
+  not acceptable; keep it on a branch marked "needs box build".
+- Already done this session: the reference-logp cache and the stale MoE
+  warning (§1).
+
+**Box track (needs any CUDA GPU, a 3090-class card is enough):**
+- Stage 0's measurements. Note they are not a gate for *deciding* anything:
+  Session 27 already measured the two halves and every projection in §5 is
+  derived from those numbers. Stage 0 is the regression baseline and the
+  per-model table, and it takes an hour once a card exists.
+- Compiling and validating stages 1-3, which is kernel work and cannot be
+  trusted without running it.
+
+Absent a physical card, a rented one (any provider with a single 24 GB
+Ampere or newer, by the hour) covers stage 0 and stage 1 validation in one
+sitting: the extension build is ~10 minutes, the parity and perf runs are
+minutes each on a 1B/3B. That is the cheapest way to unblock the box track;
+the GPU-free track is worth doing first regardless because it is what the
+kernel plugs into.
 
 ### Stage 0 — measurement and safety net (½ session, box)
 

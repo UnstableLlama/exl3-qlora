@@ -73,7 +73,11 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   `torchrun`).
 - `qlora_train_pref.py` — DPO / KTO / SimPO preference training on the native
   path. DPO/KTO use the adapter-disabled base as the frozen reference (no
-  second model copy); SimPO (`--method simpo`) is reference-free —
+  second model copy), and cache each row's reference log-prob by content in a
+  per-model file (`--ref-cache auto|off|<path>`, default under
+  `~/.cache/exl3_qlora/ref_logps/`; `exllamav3/training/ref_cache.py`), so
+  the reference forward runs once per row across epochs and across runs on
+  the same model; SimPO (`--method simpo`) is reference-free —
   length-normalized rewards with a target margin `--gamma`, no reference
   forward at all (roughly half the compute of a DPO step), optional
   `--sft-weight` NLL mix (CPO-SimPO).

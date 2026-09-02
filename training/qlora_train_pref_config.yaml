@@ -118,6 +118,11 @@ offload_mode: async
 use_liger: false
 dequant_mode: fast        # fast (default) | legacy
 dequant_cache: false
+ref_cache: auto           # dpo/kto reference-logp cache. The frozen base's completion logps are
+                          #   constants of (model, row), so they are computed once and reused across
+                          #   micro-batches, epochs and LATER RUNS on the same model. auto: per-model
+                          #   file under $EXL3_QLORA_CACHE_DIR or ~/.cache/exl3_qlora/ref_logps/;
+                          #   a path: that file; off: recompute every time. Ignored by simpo
 
 # ---------------------------------------------------------------------------
 # Eval / checkpoints / run log

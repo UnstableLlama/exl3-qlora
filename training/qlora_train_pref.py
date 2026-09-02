@@ -92,6 +92,9 @@ from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
 
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
+from exllamav3.training.ref_cache import (  # noqa: E402
+    RefLogpCache, model_fingerprint, fingerprint_digest, default_cache_dir,
+)
 from exllamav3.training.preference import (  # noqa: E402
     dpo_loss, kto_loss, simpo_loss, mismatched_kl_shift,
     DPO_LOSS_TYPES, KTO_LOSS_TYPES,
@@ -332,18 +335,46 @@ def rows_to_batch(rows, pad_id):
 # Batch loss (policy + frozen-base reference through ONE net)
 # ---------------------------------------------------------------------------
 
+# Reference-logp cache (exllamav3.training.ref_cache), installed by _run_main
+# for the reference-based methods when --ref-cache is not "off". None = every
+# reference logp is a fresh no-grad forward (the pre-cache behavior).
+_REF_CACHE = None
+
+
+def reference_logps(net, rows, pad_id, args, prebuilt=None, device=None):
+    """Frozen-base (adapter-disabled) completion logps for ``rows`` as a
+    ``[len(rows)]`` fp32 tensor. With the cache installed, only rows not yet
+    in it are forwarded (as one sub-batch); ``prebuilt`` is the already
+    padded ``(input_ids, labels, attn)`` of the FULL row list, reused when
+    every row is missing so the tensors aren't re-padded."""
+    def compute(sub):
+        if prebuilt is not None and len(sub) == len(rows):
+            input_ids, labels, attn = prebuilt
+        else:
+            input_ids, labels, attn = rows_to_batch(sub, pad_id)
+        with torch.no_grad(), net.adapters_disabled():
+            lp, _ = net.compute_logps(input_ids, labels, attention_mask=attn,
+                                      chunk=args.ce_chunk)
+        return lp
+
+    if _REF_CACHE is None:
+        return compute(rows)
+    return _REF_CACHE.lookup_or_compute(rows, compute, device=device)
+
+
 def dpo_batch_metrics(net, batch, pad_id, args):
     """Loss + logging metrics for one micro-batch of DPO pairs. The 2*batch
     rows (chosen block, then rejected block) share a single policy forward and
-    a single no-grad reference forward."""
+    a single no-grad reference forward (or a cache lookup, see
+    reference_logps)."""
     rows = ([(e["prompt_ids"], e["chosen_ids"]) for e in batch]
             + [(e["prompt_ids"], e["rejected_ids"]) for e in batch])
     input_ids, labels, attn = rows_to_batch(rows, pad_id)
     pol_logps, counts = net.compute_logps(input_ids, labels, attention_mask=attn,
                                           chunk=args.ce_chunk)
-    with torch.no_grad(), net.adapters_disabled():
-        ref_logps, _ = net.compute_logps(input_ids, labels, attention_mask=attn,
-                                         chunk=args.ce_chunk)
+    ref_logps = reference_logps(net, rows, pad_id, args,
+                                prebuilt=(input_ids, labels, attn),
+                                device=pol_logps.device)
     b = len(batch)
     losses, cr, rr = dpo_loss(
         pol_logps[:b], pol_logps[b:], ref_logps[:b], ref_logps[b:],
@@ -404,9 +435,9 @@ def kto_batch_metrics(net, batch, pad_id, args):
     input_ids, labels, attn = rows_to_batch(rows, pad_id)
     pol_logps, _ = net.compute_logps(input_ids, labels, attention_mask=attn,
                                      chunk=args.ce_chunk)
-    with torch.no_grad(), net.adapters_disabled():
-        ref_logps, _ = net.compute_logps(input_ids, labels, attention_mask=attn,
-                                         chunk=args.ce_chunk)
+    ref_logps = reference_logps(net, rows, pad_id, args,
+                                prebuilt=(input_ids, labels, attn),
+                                device=pol_logps.device)
 
     pol_kl = ref_kl = None
     if args.kto_loss == "kto" and len(batch) > 1:
@@ -423,10 +454,11 @@ def kto_batch_metrics(net, batch, pad_id, args):
                 pol_kl, _ = net.compute_logps(kl_ids, kl_labels,
                                               attention_mask=kl_attn,
                                               chunk=args.ce_chunk)
-                with net.adapters_disabled():
-                    ref_kl, _ = net.compute_logps(kl_ids, kl_labels,
-                                                  attention_mask=kl_attn,
-                                                  chunk=args.ce_chunk)
+            # The mismatched (prompt_i, completion_j) rows are ordinary rows
+            # to the cache: their reference logps persist like any other.
+            ref_kl = reference_logps(net, kl_rows, pad_id, args,
+                                     prebuilt=(kl_ids, kl_labels, kl_attn),
+                                     device=pol_kl.device)
 
     des = torch.tensor([e["label"] for e in batch], dtype=torch.bool,
                        device=pol_logps.device)
@@ -646,6 +678,15 @@ def _run_main():
     ap.add_argument("--dequant-cache", action="store_true",
                     help="Opt-in recompute->backward frozen-weight cache (a net "
                          "loss under the default fast path; see the SFT arm).")
+    ap.add_argument("--ref-cache", default="auto",
+                    help="Reference-logp cache for dpo/kto (the frozen base's "
+                         "completion logps are constants of the model + row, so "
+                         "they are computed once and reused across micro-batches, "
+                         "epochs AND later runs on the same model). 'auto' "
+                         "(default): a per-model file under $EXL3_QLORA_CACHE_DIR "
+                         "or ~/.cache/exl3_qlora/ref_logps/; a path: that file; "
+                         "'off': recompute every time (the pre-cache behavior). "
+                         "Ignored by simpo (reference-free).")
     args = ap.parse_args()
 
     # Process-wide, before any renderer is built (see chat_jinja).
@@ -756,6 +797,31 @@ def _run_main():
         mline = (f"gamma {args.gamma}, sft_weight {args.sft_weight}, "
                  f"label_smoothing {args.label_smoothing} (reference-free)")
     print(f" -- method: {method} | beta {args.beta} | {mline}")
+
+    # Reference-logp cache (dpo/kto only; simpo has no reference). Keyed by
+    # row content, validated by a fingerprint of everything the frozen base's
+    # logps depend on: model dir content, compute dtype, resolved attention
+    # plan. See exllamav3/training/ref_cache.py.
+    global _REF_CACHE
+    _REF_CACHE = None
+    if method != "simpo" and str(args.ref_cache).lower() != "off":
+        fp = model_fingerprint(args.model)
+        fp["compute_dtype"] = args.compute_dtype
+        fp["attn_plan"] = net.describe_attn()
+        if str(args.ref_cache).lower() == "auto":
+            cache_path = os.path.join(default_cache_dir(),
+                                      f"{fingerprint_digest(fp)[:24]}.pt")
+        else:
+            cache_path = args.ref_cache
+        _REF_CACHE = RefLogpCache(fp, cache_path)
+        if _REF_CACHE.load_note:
+            print(f" -- ref-logp cache {cache_path}: {_REF_CACHE.load_note}")
+        else:
+            print(f" -- ref-logp cache: {cache_path} "
+                  f"({_REF_CACHE.loaded_entries} entries loaded)")
+    elif method != "simpo":
+        print(" -- ref-logp cache: off (reference forward on every micro-batch)")
+
     if method == "kto" and args.kto_loss == "kto" and args.batch < 2:
         raise SystemExit("--method kto with --kto-loss kto needs --batch >= 2 "
                          "(the KL reference point is estimated from mismatched "
@@ -910,11 +976,27 @@ def _run_main():
     batch_metrics = {"dpo": dpo_batch_metrics, "kto": kto_batch_metrics,
                      "simpo": simpo_batch_metrics}[method]
 
+    def save_ref_cache(final=False):
+        """Persist new reference logps (no-op when nothing changed). Called at
+        every checkpoint/eval boundary and at exit, so an interrupted run
+        still leaves what it computed for the next one."""
+        if _REF_CACHE is None:
+            return
+        try:
+            wrote = _REF_CACHE.save()
+        except OSError as e:
+            print(f" -- ref-logp cache: could not write {_REF_CACHE.path}: {e}")
+            return
+        if final:
+            print(f" -- {_REF_CACHE.stats_line()}"
+                  f"{' (saved)' if wrote else ''}")
+
     def save(tag):
         net.save_adapter(args.out, base_model_name_or_path=args.model)
         save_trainer_state(args.out, step=step, opt=opt, sched=sched,
                            best_val=best_val, best_val_step=best_val_step, ema=ema)
         print(f"{tag} Adapter written to {args.out}")
+        save_ref_cache()
 
     def evaluate():
         """Mean preference loss (+ reward metrics) over the eval set, in
@@ -1116,6 +1198,7 @@ def _run_main():
 
             if args.eval_every and step % args.eval_every == 0 and val_examples:
                 vl, em = evaluate()
+                save_ref_cache()
                 last_eval_step, last_val = step, vl
                 if vl is not None:
                     print(f"    [eval] step {step}: {fmt_eval(vl, em)}")
@@ -1149,6 +1232,7 @@ def _run_main():
             print(f"\nInterrupted at step {step}; saving adapter before exit.")
             if step > 0:
                 save("[interrupted]")
+        save_ref_cache(final=True)
         log_run("interrupted", time.time() - t0, None)
         raise SystemExit(0)
 
@@ -1165,6 +1249,7 @@ def _run_main():
         val_loss = None
     if not (args.save_best and val_examples):
         save("Done.")
+    save_ref_cache(final=True)
     if torch.cuda.is_available():
         peak_str = " / ".join(
             f"cuda:{d} {torch.cuda.max_memory_allocated(d) / 1e9:.2f}GB"
