@@ -12,6 +12,7 @@
 #include "../add.cuh"
 #include "../activation.cuh"
 #include "../norm.cuh"
+#include "../lora.cuh"
 #include "../dsa_topk.cuh"
 
 BC_Attention::BC_Attention
@@ -352,12 +353,26 @@ void BC_Attention::run_gr
     const c10::optional<at::Tensor>& inv_freq_override,
     int regime,
     int64_t t_total,
-    Graph* graph
+    Graph* graph,
+    bool lora
 )
 {
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
     int R = bsz * q_len;
     bool use_mgemm = kv_ptrs_trellis.has_value() && (R <= 32 || !k_proj);
+
+    // Runtime-LoRA nodes (lora.cuh), one per adapted projection, placed where Linear.forward
+    // would have added the delta: on the raw projection output, before norm / RoPE / gating.
+    // run() patches their input/output pointers alongside the GEMMs' (same order as here)
+    auto lora_q = lora && q_proj && q_proj->has_lora();
+    auto lora_g = lora && g_proj && g_proj->has_lora();
+    auto lora_k = lora && k_proj && k_proj->has_lora();
+    auto lora_v = lora && v_proj && v_proj->has_lora();
+    auto lora_o = lora && o_proj && o_proj->has_lora();
+    auto lora_node = [&](const std::shared_ptr<BC_LinearEXL3>& l, const at::Tensor& in, at::Tensor out)
+    {
+        lora_gemv_gr(in, l->lora_a.value(), l->lora_b.value(), out, graph);
+    };
     TORCH_CHECK(use_mgemm || (k_proj && (v_proj || use_k_as_v)), "BC_Attention: no k/v projection path for this batch shape");
 
     at::Tensor xh_flat = xh.view({-1});
@@ -382,6 +397,7 @@ void BC_Attention::run_gr
         exl3_gemm_gr(x2, q_proj->trellis, s.qg2, q_proj->suh, xh_q, q_proj->svh, -1, q_proj->mcg, q_proj->mul1, 0, graph);
         if (q_proj->bias)
             add_gr(s.qg2, q_proj->bias.value(), s.qg2, graph);
+        if (lora_q) lora_node(q_proj, x2, s.qg2);   // on the interleaved q/g output, pre-split
         deinterleave_qg_gr(s.qg2, s.q2, s.g2, head_dim, graph);
     }
     else if (use_qg_mgemm)
@@ -390,12 +406,15 @@ void BC_Attention::run_gr
         at::Tensor xh_qg = xh_flat.narrow(0, 0, (int64_t) 2 * R * hs).view({2, R, hs});
         exl3_mgemm_gr(x3q, qg_ptrs_trellis.value(), s.qg2, qg_ptrs_suh.value(), xh_qg, qg_ptrs_svh.value(),
                       c10::nullopt, c10::nullopt, qg_K, -1, qg_mcg, qg_mul1, -1, -1, 0, graph);
+        if (lora_q) lora_node(q_proj, x2, s.qg2.select(0, 0));
+        if (lora_g) lora_node(g_proj, x2, s.qg2.select(0, 1));
     }
     else
     {
         exl3_gemm_gr(x2, q_proj->trellis, s.q2, q_proj->suh, xh_q, q_proj->svh, -1, q_proj->mcg, q_proj->mul1, 0, graph);
         if (q_proj->bias)
             add_gr(s.q2, q_proj->bias.value(), s.q2, graph);
+        if (lora_q) lora_node(q_proj, x2, s.q2);
         if (gate_mode == 1)
         {
             TORCH_CHECK(g_weight, "BC_Attention: headwise gate requires the fp16 gate weight");
@@ -415,6 +434,7 @@ void BC_Attention::run_gr
                 exl3_gemm_gr(x2, g_proj->trellis, s.g2, g_proj->suh, xh_q, g_proj->svh, -1, g_proj->mcg, g_proj->mul1, 0, graph);
                 if (g_proj->bias)
                     add_gr(s.g2, g_proj->bias.value(), s.g2, graph);
+                if (lora_g) lora_node(g_proj, x2, s.g2);
             }
         }
     }
@@ -428,6 +448,7 @@ void BC_Attention::run_gr
         exl3_gemm_gr(x2, k_proj->trellis, k2, k_proj->suh, xh_k, k_proj->svh, -1, k_proj->mcg, k_proj->mul1, 0, graph);
         if (k_proj->bias)
             add_gr(k2, k_proj->bias.value(), k2, graph);
+        if (lora_k) lora_node(k_proj, x2, k2);   // before the copy: V shares the adapted K output
         at::Tensor v2 = kv2.select(0, 1);
         if (v_norm)
         {
@@ -449,6 +470,8 @@ void BC_Attention::run_gr
         at::Tensor xh_kv = xh_flat.narrow(0, 0, (int64_t) 2 * R * hs).view({2, R, hs});
         exl3_mgemm_gr(x3, kv_ptrs_trellis.value(), kv2, kv_ptrs_suh.value(), xh_kv, kv_ptrs_svh.value(),
                       c10::nullopt, c10::nullopt, kv_K, -1, kv_mcg, kv_mul1, -1, -1, 0, graph);
+        if (lora_k) lora_node(k_proj, x2, kv2.select(0, 0));
+        if (lora_v) lora_node(v_proj, x2, kv2.select(0, 1));
     }
     else
     {
@@ -458,9 +481,11 @@ void BC_Attention::run_gr
         exl3_gemm_gr(x2, k_proj->trellis, k2, k_proj->suh, xh_k, k_proj->svh, -1, k_proj->mcg, k_proj->mul1, 0, graph);
         if (k_proj->bias)
             add_gr(k2, k_proj->bias.value(), k2, graph);
+        if (lora_k) lora_node(k_proj, x2, k2);
         exl3_gemm_gr(x2, v_proj->trellis, v2, v_proj->suh, xh_k, v_proj->svh, -1, v_proj->mcg, v_proj->mul1, 0, graph);
         if (v_proj->bias)
             add_gr(v2, v_proj->bias.value(), v2, graph);
+        if (lora_v) lora_node(v_proj, x2, v2);
     }
 
     if (v_norm && !use_k_as_v)
@@ -755,6 +780,7 @@ void BC_Attention::run_gr
     exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(c2, o_proj->bias.value(), c2, graph);
+    if (lora_o) lora_node(o_proj, s.o2, c2);
     if (hs != hidden_size)
         copy2d_gr(c2, y2, graph);
 }
@@ -784,11 +810,28 @@ void BC_Attention::run
     TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "BC_Attention: x and y must be contiguous");
     TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
 
+    // Runtime-LoRA flavour: which projections carry an adapter decides which lora nodes the
+    // slot's graph holds. A change drops the captured graph and repeats the warmup + capture
+    // sequence; a swap with the same flavour only patches the A/B/rank sites below
+    int flavour = 0;
+    if (q_proj && q_proj->has_lora()) flavour |= 1;
+    if (g_proj && g_proj->has_lora()) flavour |= 2;
+    if (k_proj && k_proj->has_lora()) flavour |= 4;
+    if (v_proj && v_proj->has_lora()) flavour |= 8;
+    if (o_proj && o_proj->has_lora()) flavour |= 16;
+    bool lora = flavour != 0;
+    if (s.graph->flavour != flavour)
+    {
+        s.graph->reset();
+        s.graph->flavour = flavour;
+        s.runs = 0;
+    }
+
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched
     if (s.runs == 0)
     {
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr, lora);
         s.runs = 1;
         return;
     }
@@ -796,7 +839,7 @@ void BC_Attention::run
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get(), lora);
         s.graph->capture_end();
         s.runs = 2;
     }
@@ -806,7 +849,19 @@ void BC_Attention::run
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
 
     std::vector<PPTR> params;
-    params.reserve(40);
+    params.reserve(64);
+
+    // lora node sites are recorded x, A, B, C, rank; only the entries given are patched (a
+    // static x or C is skipped by the site walk). Emitted in the same order run_gr placed them
+    auto lora_params = [&](const std::shared_ptr<BC_LinearEXL3>& l, void* xp, void* cp)
+    {
+        if (xp) params.emplace_back(GP_lora_x, xp);
+        params.emplace_back(GP_lora_A, (void*) l->lora_a->data_ptr());
+        params.emplace_back(GP_lora_B, (void*) l->lora_b->data_ptr());
+        if (cp) params.emplace_back(GP_lora_C, cp);
+        params.emplace_back(GP_lora_rank, (void*) (uintptr_t) (uint32_t) l->lora_rank());
+    };
+    bool lq = flavour & 1, lg = flavour & 2, lk = flavour & 4, lv = flavour & 8, lo = flavour & 16;
 
     // Padded hidden dim or fp16 gate: x feeds the staging copy at the head of the graph and the
     // projections read the (static) buffer; otherwise the projections read x directly
@@ -816,29 +871,43 @@ void BC_Attention::run
     if (staged)
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
 
-    // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
+    // Q / gate projections (an fp16 gate is a cublas node with no patchable sites). The lora
+    // nodes read the same (patched) input as their projection and write its static output
     if (use_qg_mgemm)
+    {
         params.emplace_back(GP_mgemm_A, xptr);
+        if (lq) lora_params(q_proj, xptr, nullptr);
+        if (lg) lora_params(g_proj, xptr, nullptr);
+    }
     else
     {
         params.emplace_back(GP_gemm_A, xptr);
+        if (lq) lora_params(q_proj, xptr, nullptr);
         if (gate_mode == 2 && !g_weight)
+        {
             params.emplace_back(GP_gemm_A, xptr);
+            if (lg) lora_params(g_proj, xptr, nullptr);
+        }
     }
 
     // K/V projections
     if (use_k_as_v)
     {
         params.emplace_back(GP_gemm_A, xptr);
+        if (lk) lora_params(k_proj, xptr, nullptr);
     }
     else if (use_mgemm)
     {
         params.emplace_back(GP_mgemm_A, xptr);
+        if (lk) lora_params(k_proj, xptr, nullptr);
+        if (lv) lora_params(v_proj, xptr, nullptr);
     }
     else
     {
         params.emplace_back(GP_gemm_A, xptr);
+        if (lk) lora_params(k_proj, xptr, nullptr);
         params.emplace_back(GP_gemm_A, xptr);
+        if (lv) lora_params(v_proj, xptr, nullptr);
     }
 
     // RoPE: which position source is active is a runtime branch in the kernel, so nulls are
@@ -923,6 +992,7 @@ void BC_Attention::run
         params.emplace_back(GP_add_x, yptr);
         params.emplace_back(GP_add_z, yptr);
     }
+    if (lo) lora_params(o_proj, nullptr, yptr);   // input is the static attention output
     if (padded)
         params.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
     s.graph->launch(params, stream);

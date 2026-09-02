@@ -363,10 +363,16 @@ has neither a GPU nor `nvcc`. That splits the plan into two tracks:
 - A pure-torch reference of `lora_gemv` semantics (`x@A@B` accumulate with
   the fp16 rounding point pinned) that the later GPU parity tests compare
   against, so the kernel's contract is written down before the kernel is.
-- The C++ can be *written* against the existing patterns
-  (`exl3_gemm_gr`'s `record_param` sequence, `BC_GatedMLP`'s flavour-keyed
-  graphs are mechanical) but not compiled here. Landing uncompiled CUDA is
-  not acceptable; keep it on a branch marked "needs box build".
+- **Stage 1 for the Llama path is WRITTEN on this branch, uncompiled and
+  untested** (the user has a card at home): `exllamav3_ext/lora.cu/.cuh`
+  (the cooperative `lora_gemv` kernel, `lora_gemv_gr` with `GP_lora_*`
+  sites, `ext.lora_gemv` binding), `Graph::reset()` + `Graph::flavour`,
+  `BC_LinearEXL3::set_lora/clear_lora/has_lora`, LoRA nodes and flavour
+  handling in `BC_GatedMLP` and `BC_Attention`, `Linear.sync_lora_bc` and
+  `lora_graph_ok` in Python with the `EXL3_LORA_GRAPH=0` fallback switch,
+  tripwires updated, `tests/test_lora_graph.py` (kernel unit test + end-to-
+  end parity), and the runbook `doc/lora_box_test.md`. Other graph paths
+  (SWA, BC_MLP, Mamba2, GDN, MLA, MoE) keep their guards.
 - Already done this session (all CPU-tested, `tests/test_lora_state.py`,
   `tests/test_ref_cache.py`):
   - `exllamav3/modules/lora_state.py`: `pack_lora` (one effective adapter

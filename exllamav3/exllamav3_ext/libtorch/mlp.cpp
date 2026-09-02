@@ -8,6 +8,7 @@
 #include "../quant/exl3_gemm.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
+#include "../lora.cuh"
 
 using namespace torch::indexing;
 
@@ -16,9 +17,14 @@ void BC_GatedMLP::run_bszN_gr
     const at::Tensor& x,
     at::Tensor& d,
     int num_tokens,
-    Graph* graph
+    Graph* graph,
+    bool lora
 )
 {
+    bool lora_gate = lora && gate && gate->has_lora();
+    bool lora_up   = lora && up && up->has_lora();
+    bool lora_down = lora && down->has_lora();
+    at::Tensor x2 = x.view({num_tokens, x.size(-1)});
     // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
     // would leave dim 0's stride at MAX_BSZN*width instead of num_tokens*width, corrupting the
     // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
@@ -58,6 +64,17 @@ void BC_GatedMLP::run_bszN_gr
             1   // mgemm's reduction-group param, unused here (no weights -> no reduction runs);
                 // bszm=2 is the gate/up slot pair, unrelated to num_tokens (carried via size_m)
         );
+        // Runtime LoRA on the fused slots, pre-activation (the delta Linear.forward would add)
+        if (lora_gate)
+        {
+            at::Tensor g2 = gu_n.select(0, 0);
+            lora_gemv_gr(x2, gate->lora_a.value(), gate->lora_b.value(), g2, graph);
+        }
+        if (lora_up)
+        {
+            at::Tensor u2 = gu_n.select(0, 1);
+            lora_gemv_gr(x2, up->lora_a.value(), up->lora_b.value(), u2, graph);
+        }
     }
     else
     {
@@ -70,9 +87,11 @@ void BC_GatedMLP::run_bszN_gr
         at::Tensor gate_xh = guh_n.select(0, 0);
         at::Tensor up_xh   = guh_n.select(0, 1);
         exl3_gemm_gr(x, gate->trellis, g2, gate->suh, gate_xh, gate->svh, -1, gate->mcg, gate->mul1, 0, graph);
-        exl3_gemm_gr(x, up->trellis, u2, up->suh, up_xh, up->svh, -1, up->mcg, up->mul1, 0, graph);
         if (gate->bias) add_gr(g2, gate->bias.value(), g2, graph);
+        if (lora_gate) lora_gemv_gr(x2, gate->lora_a.value(), gate->lora_b.value(), g2, graph);
+        exl3_gemm_gr(x, up->trellis, u2, up->suh, up_xh, up->svh, -1, up->mcg, up->mul1, 0, graph);
         if (up->bias) add_gr(u2, up->bias.value(), u2, graph);
+        if (lora_up) lora_gemv_gr(x2, up->lora_a.value(), up->lora_b.value(), u2, graph);
     }
 
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
@@ -88,6 +107,12 @@ void BC_GatedMLP::run_bszN_gr
     exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
     if (down->bias)
         add_gr(d, down->bias.value(), d, graph);
+    if (lora_down)
+    {
+        at::Tensor a2 = a_n.view({num_tokens, a_n.size(-1)});
+        at::Tensor d2 = d.view({num_tokens, d.size(-1)});
+        lora_gemv_gr(a2, down->lora_a.value(), down->lora_b.value(), d2, graph);
+    }
 }
 
 void BC_GatedMLP::run_bszN
@@ -105,9 +130,24 @@ void BC_GatedMLP::run_bszN
 
     Graph& g = graph_bszN[graphidx];
 
+    // Runtime-LoRA flavour: which handles carry an adapter decides which lora nodes the graph
+    // holds. A change (attach of the first adapter, unload of the last) drops the captured graph
+    // and re-runs the warmup/capture sequence; an adapter SWAP with the same flavour only patches
+    // pointers below
+    int flavour = 0;
+    if (gate && gate->has_lora()) flavour |= 1;
+    if (up && up->has_lora()) flavour |= 2;
+    if (down->has_lora()) flavour |= 4;
+    bool lora = flavour != 0;
+    if (g.flavour != flavour)
+    {
+        g.reset();
+        g.flavour = flavour;
+    }
+
     if (g.disabled || (!g.ready && !g.ready_to_record))
     {
-        run_bszN_gr(x, d, num_tokens, nullptr);
+        run_bszN_gr(x, d, num_tokens, nullptr, lora);
         g.ready_to_record = true;
     }
     else
@@ -115,14 +155,27 @@ void BC_GatedMLP::run_bszN
         if (!g.ready)
         {
             g.capture_begin();
-            run_bszN_gr(x, d, num_tokens, &g);
+            run_bszN_gr(x, d, num_tokens, &g, lora);
             g.capture_end();
         }
 
         std::vector<PPTR> args;
+        // lora node sites are recorded x, A, B, C, rank; only the entries given here are patched
+        // (a static x or C is skipped by the site walk)
+        auto lora_args = [&](const std::shared_ptr<BC_LinearEXL3>& l, void* xptr, void* cptr)
+        {
+            if (xptr) args.emplace_back(GP_lora_x, xptr);
+            args.emplace_back(GP_lora_A, (void*) l->lora_a->data_ptr());
+            args.emplace_back(GP_lora_B, (void*) l->lora_b->data_ptr());
+            if (cptr) args.emplace_back(GP_lora_C, cptr);
+            args.emplace_back(GP_lora_rank, (void*) (uintptr_t) (uint32_t) l->lora_rank());
+        };
+        void* xptr = (void*) x.data_ptr();
         if (gu_ptrs_trellis)
         {
-            args.emplace_back(GP_mgemm_A, (void*) x.data_ptr());
+            args.emplace_back(GP_mgemm_A, xptr);
+            if (flavour & 1) lora_args(gate, xptr, nullptr);
+            if (flavour & 2) lora_args(up, xptr, nullptr);
         }
         else
         {
@@ -130,10 +183,12 @@ void BC_GatedMLP::run_bszN
             // The gate/up GEMMs record their own GP_gemm_C sites ahead of the down projection's;
             // patch them with their (static) values so the site walk stays aligned and the final
             // GP_gemm_C entry binds to the down projection
-            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+            args.emplace_back(GP_gemm_A, xptr);
             args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
-            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+            if (flavour & 1) lora_args(gate, xptr, nullptr);
+            args.emplace_back(GP_gemm_A, xptr);
             args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
+            if (flavour & 2) lora_args(up, xptr, nullptr);
         }
         args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
         if (down->bias)
@@ -141,6 +196,7 @@ void BC_GatedMLP::run_bszN
             args.emplace_back(GP_add_x, (void*) d.data_ptr());
             args.emplace_back(GP_add_z, (void*) d.data_ptr());
         }
+        if (flavour & 4) lora_args(down, nullptr, (void*) d.data_ptr());
 
         g.launch(args, stream);
     }

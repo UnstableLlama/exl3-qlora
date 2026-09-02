@@ -16,6 +16,7 @@
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
+#include "lora.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -71,6 +72,7 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("stloader_read", &stloader_read, "stloader_read");
+    m.def("lora_gemv", &lora_gemv, "lora_gemv");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
     m.def("stloader_close_file", &stloader_close_file, "stloader_close_file");
     py::class_<TensorLoadJob>(m, "TensorLoadJob")

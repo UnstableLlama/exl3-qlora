@@ -93,12 +93,17 @@ struct BC_GatedMLP
         gu_cache.resize(MAX_BSZN);
     }
 
+    // lora: emit the runtime-LoRA nodes for gate/up/down handles that carry an adapter (see
+    // BC_LinearEXL3::lora_a). Only run_bszN sets it, because it also patches their input/output
+    // pointers per replay; embedding callers (BC_BlockSparseMLP's shared experts) leave it off
+    // and the Python side keeps those graphs guarded while the shared experts carry a LoRA
     void run_bszN_gr
     (
         const at::Tensor& x,
         at::Tensor& d,
         int num_tokens,
-        Graph* graph
+        Graph* graph,
+        bool lora = false
     );
 
     void run_bszN

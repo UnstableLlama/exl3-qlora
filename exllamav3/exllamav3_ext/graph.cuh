@@ -95,7 +95,14 @@ enum GraphedParams
 
     GP_moe_bias_add_sel,
     GP_moe_bias_add_weighted_sel,
-    GP_moe_bias_add_weighted_weights
+    GP_moe_bias_add_weighted_weights,
+
+    // Runtime-LoRA node (lora.cuh): input x, packed A/B, output C, rank (4-byte scalar)
+    GP_lora_x,
+    GP_lora_A,
+    GP_lora_B,
+    GP_lora_C,
+    GP_lora_rank
 };
 
 class Graph
@@ -125,8 +132,17 @@ public:
     bool ready_to_record;
     bool disabled;
 
+    // Structural variant the graph was captured with (e.g. which projections carry a runtime-LoRA
+    // node). Owners compare against the variant they need per call and reset() on a mismatch, so
+    // a captured graph never replays a node set that no longer matches the module state
+    int flavour;
+
     Graph();
     ~Graph();
+
+    // Drop the captured graph and all recorded sites; the next run captures afresh (state machine
+    // back to "never run", as construction leaves it). flavour is left for the owner to set
+    void reset();
 
     cudaStream_t capture_begin();
     void capture_end();

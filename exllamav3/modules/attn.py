@@ -5,7 +5,7 @@ from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_graph_ok
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
@@ -894,14 +894,16 @@ class Attention(Module):
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too).
-        # The graph reads the projection trellis directly and never sees a runtime LoRA,
-        # so fall back to the python path while one is loaded (guard must sit here, per
-        # call: the graph is cached and a LoRA can be attached/detached after build).
+        # A runtime LoRA rides INSIDE the graph as lora_gemv nodes on the adapted
+        # projections (BC_Attention, doc/lora_inference_plan.md stage 1); lora_graph_ok
+        # pushes the current adapters to the projection handles and yields to the python
+        # path only for an adapter the graph can't take (a non-EXL3 projection, or
+        # EXL3_LORA_GRAPH=0). Checked per call: adapters attach/detach after build.
         if (
             _bc_attn_enable and non_causal_spans is None and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
-            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
-                                 getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
+            lora_graph_ok(self.q_proj, self.k_proj, self.v_proj,
+                          getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)

@@ -6,7 +6,7 @@ from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_graph_ok
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
@@ -673,8 +673,11 @@ class GatedMLP(Module):
                     self.activation_fn == "silu",
                     self.activation_fn == "gelu",
                     self.activation_fn == "relu2",
-                    g0.inner.bc if mgu is None else None,
-                    u0.inner.bc if mgu is None else None,
+                    # gate/up handles are passed even in fused-mgemm mode: the graph reads
+                    # their trellis through the pointer tables, but their runtime-LoRA slots
+                    # (BC_LinearEXL3.lora_a/b) live on the handles
+                    g0.inner.bc if g0.quant_type == "exl3" else None,
+                    u0.inner.bc if u0.quant_type == "exl3" else None,
                     self.downs[0].inner.bc,
                     self.act_limit,
                 )
@@ -715,22 +718,22 @@ class GatedMLP(Module):
             d = None
 
             # The fused paths below bypass Linear.forward, which is what applies
-            # a runtime LoRA. The BC graph fuses the whole MLP (gate/up/act/down)
-            # and cannot take a LoRA delta (gate/up inject before the activation
-            # inside the graph), so any adapter on the three forces the branches
-            # below. The mgemm branch stays LoRA-correct on its own: gate/up
-            # deltas are added onto the mgemm output pre-activation, and down
-            # goes through Linear.forward (which applies its LoRA). Checked
-            # across ALL slices so the BC decision is uniform.
+            # a runtime LoRA. The BC graph takes the adapter as in-graph lora_gemv
+            # nodes on gate/up (pre-activation) and down (BC_GatedMLP,
+            # doc/lora_inference_plan.md stage 1); lora_graph_ok pushes the
+            # current adapters to the handles and declines only for an adapter
+            # the graph can't take (non-EXL3 linear, EXL3_LORA_GRAPH=0). The
+            # mgemm branch stays LoRA-correct on its own: gate/up deltas are
+            # added onto the mgemm output pre-activation, and down goes through
+            # Linear.forward (which applies its LoRA). Checked across ALL slices
+            # so the BC decision is uniform.
             gu_lora = has_runtime_lora(*self.gates, *self.ups)
             down_lora = has_runtime_lora(*self.downs)
 
             for s in r:
 
-                # Fused/graph path reads base trellis weights only and never sees a runtime
-                # LoRA — fall back to the torch path while one is loaded.
                 if self.bc is not None and bsz * q_len <= MAX_BSZN \
-                        and not (gu_lora or down_lora):
+                        and lora_graph_ok(*self.gates, *self.ups, *self.downs):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     x = x.view(1, bsz * q_len, dim)
                     self.bc.run_bszN(x, d.view(x.shape))
