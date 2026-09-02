@@ -989,9 +989,25 @@ def set_runtime_lora(linear, owner, a: torch.Tensor, b: torch.Tensor) -> None:
     Install adapter tensors into a native ``Linear``'s runtime LoRA slots, keyed
     by ``owner``, so ``model.forward`` / generation applies them. ``a`` / ``b``
     are moved to the linear's device.
+
+    When ``owner`` already holds tensors of the same shape/dtype/device the
+    new values are copied IN PLACE, so the slot tensors keep their identity
+    and data pointers. That is what makes a real-time adapter update
+    (``RealtimeQLoRA.ingest`` -> ``apply_to_native``) free for anything that
+    baked those pointers -- the packed view in ``Linear.lora_packed`` today,
+    the captured decode graphs once the fused LoRA kernels land
+    (doc/lora_inference_plan.md, stages 1 and 4).
     """
-    linear.lora_a_tensors[owner] = a.to(linear.device)
-    linear.lora_b_tensors[owner] = b.to(linear.device)
+    def _install(slots, t):
+        cur = slots.get(owner)
+        if (cur is not None and cur.shape == t.shape and cur.dtype == t.dtype
+                and str(cur.device) == str(linear.device)):
+            cur.copy_(t)
+        else:
+            slots[owner] = t.to(linear.device)
+
+    _install(linear.lora_a_tensors, a)
+    _install(linear.lora_b_tensors, b)
 
 
 def clear_runtime_lora(linear, owner) -> None:

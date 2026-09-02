@@ -367,8 +367,21 @@ has neither a GPU nor `nvcc`. That splits the plan into two tracks:
   (`exl3_gemm_gr`'s `record_param` sequence, `BC_GatedMLP`'s flavour-keyed
   graphs are mechanical) but not compiled here. Landing uncompiled CUDA is
   not acceptable; keep it on a branch marked "needs box build".
-- Already done this session: the reference-logp cache and the stale MoE
-  warning (§1).
+- Already done this session (all CPU-tested, `tests/test_lora_state.py`,
+  `tests/test_ref_cache.py`):
+  - `exllamav3/modules/lora_state.py`: `pack_lora` (one effective adapter
+    per Linear; a single adapter aliases its slot tensors, several
+    concatenate along rank and equal the sum of products), `lora_pack_key`
+    (stable under in-place updates, changes on replacement) and
+    `lora_delta_reference`, the kernel's numerical contract: fp32 through
+    both stages, one rounding into the output dtype on the add.
+  - `Linear.lora_packed()` (`modules/linear.py`), cached by pack key.
+  - `backbone.set_runtime_lora` copies in place when shape/dtype/device
+    match, so a realtime ingest keeps the slot tensors' identity and data
+    pointers (stage 4's requirement, landed early because it costs nothing).
+  - `eval/perf.py --lora DIR [--lora_scaling S] [--lora_noop]` (stage 0's
+    harness; the numbers still need the box).
+  - The reference-logp cache and the stale MoE warning (§1).
 
 **Box track (needs any CUDA GPU, a 3090-class card is enough):**
 - Stage 0's measurements. Note they are not a gate for *deciding* anything:

@@ -9,6 +9,7 @@ from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from .lora_state import pack_lora, lora_pack_key
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -110,6 +111,8 @@ class Linear(Module):
         self.qgroup = qgroup or key
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
+        # (pack key, packed pair) cache for lora_packed(); see modules/lora_state.py
+        self._lora_packed = None
         # Optional fully fine-tuned replacement weight ([in, out], fp16) installed by
         # an adapter's modules_to_save (e.g. native QLoRA --train-head). When set, it
         # supersedes the quantized base matmul for this Linear. Default None -> no-op.
@@ -500,6 +503,7 @@ class Linear(Module):
         self.inner = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
+        self._lora_packed = None
 
 
     @override
@@ -666,6 +670,30 @@ class Linear(Module):
         if self.post_scale != 1.0:
             x *= self.post_scale
         return x
+
+
+    def lora_packed(self) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        """
+        The ONE effective runtime adapter for this Linear -- ``(A [K, R],
+        B [R, N], R)`` with every loaded adapter concatenated along the rank
+        dim -- or None when no adapter is loaded. This is what the fused
+        decode kernels consume (doc/lora_inference_plan.md, stage 1): a
+        single adapter packs to its own slot tensors with no copy, so an
+        in-place ``set_runtime_lora`` update keeps the same data pointers;
+        several adapters pack to a cached concatenation, rebuilt only when
+        the slot set changes (``lora_pack_key``).
+        """
+        if not self.lora_a_tensors:
+            self._lora_packed = None
+            return None
+        key = lora_pack_key(self.lora_a_tensors, self.lora_b_tensors)
+        cached = self._lora_packed
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        packed = pack_lora(self.lora_a_tensors, self.lora_b_tensors,
+                           self.in_features, self.out_features)
+        self._lora_packed = (key, packed)
+        return packed
 
 
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
