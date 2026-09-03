@@ -78,6 +78,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import backbone
+from . import vision
 from . import quant_aware as _qa
 from .qlora_linear import EXL3LoRAFunction, EXL3LoRAHadFunction
 from .fused_ce import (
@@ -787,11 +788,21 @@ class NativeLlamaQLoRA(nn.Module):
                       f"({n_exp} experts/layer). If the adapter count is too "
                       f"large, set --expert-r (PEFT's MoE recipe uses "
                       f"~r/num_experts, min 1).")
+        # Vision-language plumbing of the TEXT tower (the vision tower itself is
+        # a separate frozen component; see training.vision). has_mrope: the
+        # attention layers rotate 3-D positions when image tokens are present
+        # (text-only input reduces exactly to 1-D RoPE). _deepstack: which
+        # decoder blocks are followed by a DeepstackEmbed (Qwen3-VL /
+        # Qwen3.5-VL add vision intermediate features at the image positions
+        # there). _bidir_mm: image tokens attend bidirectionally within their
+        # span (Gemma4). All three are no-ops without an image batch.
+        self.has_mrope = has_mrope
+        self._deepstack = backbone.deepstack_layout(model)
+        self._bidir_mm = backbone.uses_noncausal_mm_spans(model)
         if has_mrope:
-            print(" -- note: mRoPE detected (Qwen-VL text tower); training "
-                  "TEXT-ONLY, where mRoPE reduces exactly to 1D NeoX RoPE. The "
-                  "vision tower is not built or targeted. Image+text multimodal "
-                  "fine-tuning is NOT supported (would need 3D positions).")
+            print(" -- note: mRoPE detected (Qwen-VL text tower). Text-only "
+                  "batches reduce exactly to 1D NeoX RoPE; image batches "
+                  "(--vision) rotate the 3D [t, h, w] positions per band.")
         if self.has_gdn and _fla_chunk_fn() is None:
             print(" -- note: GatedDeltaNet layers present but the fla package "
                   "(flash-linear-attention) is not importable; the delta rule "
@@ -1004,10 +1015,12 @@ class NativeLlamaQLoRA(nn.Module):
         return out.to(x.dtype)
 
     def _apply_rope(self, x: torch.Tensor, inv_freq: torch.Tensor, attn_factor: float,
-                    position_ids: torch.Tensor) -> torch.Tensor:
-        # x: [b, t, n_heads, head_dim]. position_ids: [b, t]. Rotation math runs in
-        # fp32 (position-dependent precision) and the result is cast back to x's
-        # dtype, so a bf16 activation stays bf16 instead of being upcast to fp32.
+                    position_ids: torch.Tensor, mrope_section=None) -> torch.Tensor:
+        # x: [b, t, n_heads, head_dim]. position_ids: [b, t], or [3, b, t] for
+        # 3-D mRoPE positions (image+text on a Qwen-VL tower). Rotation math
+        # runs in fp32 (position-dependent precision) and the result is cast
+        # back to x's dtype, so a bf16 activation stays bf16 instead of being
+        # upcast to fp32.
         in_dtype = x.dtype
         rot = 2 * inv_freq.numel()          # rotary_dim; == head_dim for full rotary
         if rot < x.shape[-1]:
@@ -1018,10 +1031,23 @@ class NativeLlamaQLoRA(nn.Module):
             # rotary width. The recursive call hits the full-rotary branch below
             # (rot == x_rot.shape[-1]); for full-rotary models rot == head_dim so
             # there is no split and behavior is byte-identical to before.
-            x_rot = self._apply_rope(x[..., :rot], inv_freq, attn_factor, position_ids)
+            x_rot = self._apply_rope(x[..., :rot], inv_freq, attn_factor, position_ids,
+                                     mrope_section)
             return torch.cat((x_rot, x[..., rot:]), dim=-1)
         xf = x.float()
-        freqs = position_ids.float().unsqueeze(-1) * inv_freq.float().unsqueeze(0).unsqueeze(0)  # [b,t,rot/2]
+        if position_ids.dim() == 3:
+            # mRoPE: [3, b, t] (t/h/w) positions. Text tokens carry the same
+            # value on all three axes, so a text-only batch reduces to the 1-D
+            # rotation below; image tokens spread over the axes and each
+            # frequency band picks its axis per mrope_section (the interleaved
+            # split RoPE.get_mrope_freqs applies at inference). A block without
+            # a section (1-D RoPE arch fed 3-D positions) uses the t axis.
+            if mrope_section is not None:
+                freqs = vision.mrope_freqs(position_ids, inv_freq, mrope_section)  # [b,t,rot/2]
+            else:
+                freqs = position_ids[0].float().unsqueeze(-1) * inv_freq.float().view(1, 1, -1)
+        else:
+            freqs = position_ids.float().unsqueeze(-1) * inv_freq.float().unsqueeze(0).unsqueeze(0)  # [b,t,rot/2]
         emb = torch.cat((freqs, freqs), dim=-1)                  # [b,t,hd]  (NeoX layout)
         cos = (emb.cos() * attn_factor).unsqueeze(2)             # [b,t,1,hd]
         sin = (emb.sin() * attn_factor).unsqueeze(2)
@@ -1029,7 +1055,8 @@ class NativeLlamaQLoRA(nn.Module):
 
     def _attn_bias(self, attention_mask: Optional[torch.Tensor], t: int,
                    device, dtype, window: int = -1,
-                   seg_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                   seg_ids: Optional[torch.Tensor] = None,
+                   bidir_spans: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Additive attention bias: causal (upper triangle masked) AND, if given, a
         # [b, t] key-padding mask. Assumes right-padding (pads at the end), so no
         # real-token query row is ever fully masked -> softmax can't produce NaN.
@@ -1044,14 +1071,27 @@ class NativeLlamaQLoRA(nn.Module):
         # at the small t of CPU/fp32/gradcheck/validate the [b,1,t,t] size is fine.
         # Pad positions carry the last real document's seg id (see pack_examples),
         # so a pad query still attends back into a real doc -> never fully masked.
+        #
+        # bidir_spans ([b, t]; -1 = text, k = image span k) lifts the causal /
+        # window masks INSIDE each image span: query i may attend to key j
+        # whenever both sit in the same span, in either direction. This is the
+        # Gemma4 multimodal rule (inference runs each image span non-causally
+        # over itself -- attention_fn's non_causal_spans, built by the arch's
+        # _prepare_noncausal_mm_spans); only used when
+        # backbone.uses_noncausal_mm_spans says the arch does it.
         neg = float("-inf")
         causal = torch.triu(torch.ones(t, t, dtype=torch.bool, device=device), diagonal=1)
-        bias = torch.zeros(1, 1, t, t, dtype=dtype, device=device)
-        bias = bias.masked_fill(causal[None, None], neg)
+        blocked = causal[None, None].clone()                     # [1,1,t,t]
         if window and window > 0:
             too_old = torch.tril(torch.ones(t, t, dtype=torch.bool, device=device),
                                  diagonal=-window)
-            bias = bias.masked_fill(too_old[None, None], neg)
+            blocked = blocked | too_old[None, None]
+        if bidir_spans is not None:
+            sp = bidir_spans.to(device)
+            same = (sp[:, :, None] == sp[:, None, :]) & (sp[:, :, None] >= 0)  # [b,t,t]
+            blocked = blocked & ~same[:, None]                   # [b,1,t,t]
+        bias = torch.zeros(blocked.shape, dtype=dtype, device=device)
+        bias = bias.masked_fill(blocked, neg)
         if seg_ids is not None:
             # [b,1,t,t]: True where query i and key j are in different documents.
             # Add -inf there (additive, so it composes with the causal/window
@@ -1109,8 +1149,9 @@ class NativeLlamaQLoRA(nn.Module):
         # NoPE layers (AFMoE full-attention layers) carry no RoPE table at all
         # -- skip the rotation exactly as the inference forward's `if self.rope:`.
         if meta["inv_freq"] is not None:
-            q = self._apply_rope(q, meta["inv_freq"], meta["attn_factor"], position_ids)
-            k = self._apply_rope(k, meta["inv_freq"], meta["attn_factor"], position_ids)
+            sec = meta.get("mrope_section")
+            q = self._apply_rope(q, meta["inv_freq"], meta["attn_factor"], position_ids, sec)
+            k = self._apply_rope(k, meta["inv_freq"], meta["attn_factor"], position_ids, sec)
 
         if attn_mode == "flash":
             # FlashAttention-2 (autograd-capable upstream flash_attn): O(t) memory,
@@ -1638,6 +1679,15 @@ class NativeLlamaQLoRA(nn.Module):
             line += ("  [gdn: fla chunked kernel]" if gdn_fast
                      else "  [gdn: torch reference -- SLOW, install "
                           "flash-linear-attention + use bf16/fp16 CUDA]")
+        vl = []
+        if getattr(self, "has_mrope", False):
+            vl.append("mrope")
+        if getattr(self, "_deepstack", None):
+            vl.append(f"deepstack after blocks {sorted(self._deepstack)}")
+        if getattr(self, "_bidir_mm", False):
+            vl.append("bidirectional image spans (eager attention on image batches)")
+        if vl:
+            line += "  [vision: " + ", ".join(vl) + "]"
         return line
 
     def forward(
@@ -1646,6 +1696,7 @@ class NativeLlamaQLoRA(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         seg_ids: Optional[torch.Tensor] = None,
+        mm: Optional[dict] = None,
     ) -> torch.Tensor:
         """Return final-norm hidden states ``[b, t, d]`` in fp32 -- the LM head's
         INPUT: on an arch with a head logit pre-scale (MuseGlimmer's
@@ -1657,7 +1708,16 @@ class NativeLlamaQLoRA(nn.Module):
         document within its packed sequence, so attention is restricted to the
         same document (flash-varlen via cu_seqlens on CUDA fp16/bf16; the
         block-diagonal eager/SDPA mask otherwise). ``position_ids`` must then be
-        per-document resets (built by ``pack_examples`` / ``collate``)."""
+        per-document resets (built by ``pack_examples`` / ``collate``).
+
+        ``mm`` (``training.vision.build_mm_batch``) is the image splice for an
+        image+text batch: the frozen vision features replace the token
+        embeddings at the image positions (``index`` / ``embeds``), the
+        deepstack maps are added after the blocks the arch marks
+        (``deepstack``), and on a bidirectional-image arch the ``spans`` lift
+        the causal mask inside each image. On an mRoPE tower ``position_ids``
+        is then the 3-D ``[3, b, t]`` tensor (``vision.mrope_position_ids``).
+        Not combinable with sample packing."""
         # Quant-aware noise tick: advance once per grad-enabled training
         # forward so each micro-batch draws fresh noise while the (up to 3)
         # weight reconstructions within its forward + backward all see the
@@ -1674,6 +1734,14 @@ class NativeLlamaQLoRA(nn.Module):
                 "ShortConv models: the recurrence and causal conv would carry "
                 "state across packed document boundaries. Train unpacked "
                 "(drop --pack).")
+        if mm is not None and seg_ids is not None:
+            raise ValueError("image batches (mm) cannot be sample-packed (seg_ids)")
+        # Image batch: only counts when at least one image token is present.
+        has_img = mm is not None and bool((mm["index"] >= 0).any())
+        # Bidirectional image spans (Gemma4) need the explicit [t, t] mask, so
+        # such a batch runs every attention block on the eager path.
+        bidir = (has_img and getattr(self, "_bidir_mm", False)
+                 and bool((mm["spans"] >= 0).any()))
         bsz, t = input_ids.shape
         # Under a layer-autosplit load each block lives on its own device; the
         # hidden state is migrated across boundaries below (mirroring exllamav3's
@@ -1701,6 +1769,14 @@ class NativeLlamaQLoRA(nn.Module):
             delta = F.embedding(input_ids.to(ea.device), ea) @ eb       # [b, t, hid]
             hidden = hidden + self._module_lora_scale * delta.to(hidden.device).to(hidden.dtype)
 
+        # Image splice: the frozen vision features take the image positions,
+        # AFTER the text embedding scaling and adapters (they are never scaled
+        # or adapted -- modules.Embedding inserts them raw after scaling the
+        # standard rows) and BEFORE any embedding norm (module order).
+        if has_img:
+            mm = vision.move_mm(mm, first_device)
+            hidden = vision.splice_embeddings(hidden, mm)
+
         # Norm on the embeddings (MuseGlimmer embed_norm), when the arch has one.
         # AFTER the embedding adapters, mirroring the module order: the adapter
         # replaces/shifts the Embedding's output, and the norm module then runs on
@@ -1718,6 +1794,9 @@ class NativeLlamaQLoRA(nn.Module):
                 position_ids = position_ids.clamp_min(0)
             else:
                 position_ids = torch.arange(t, device=first_device).unsqueeze(0).expand(bsz, t)
+        elif position_ids.dim() == 3:
+            assert position_ids.shape == (3, bsz, t), \
+                f"3-D (mRoPE) position_ids must be [3, b, t], got {tuple(position_ids.shape)}"
         position_ids = position_ids.to(first_device)
 
         # Gradient checkpointing needs at least one input that requires grad. With
@@ -1737,7 +1816,8 @@ class NativeLlamaQLoRA(nn.Module):
         # and eager is the fallback. Only eager blocks build the [t, t] bias --
         # flash and sdpa both isolate documents via the packing descriptor instead.
         mem_eff = (self._flash_ok and hidden.is_cuda
-                   and self.compute_dtype in (torch.float16, torch.bfloat16))
+                   and self.compute_dtype in (torch.float16, torch.bfloat16)
+                   and not bidir)
 
         # Attention bias per (window, device). Built for eager blocks (always) and,
         # under packing, also for SDPA big-head blocks (which take an explicit
@@ -1752,7 +1832,9 @@ class NativeLlamaQLoRA(nn.Module):
             if b is None:
                 am = attention_mask.to(dev) if attention_mask is not None else None
                 sg = seg_ids.to(dev) if seg_ids is not None else None
-                b = self._attn_bias(am, t, dev, torch.float32, window, seg_ids=sg)
+                sp = mm["spans"].to(dev) if bidir else None
+                b = self._attn_bias(am, t, dev, torch.float32, window, seg_ids=sg,
+                                    bidir_spans=sp)
                 bias_cache[key] = b
             return b
 
@@ -1828,6 +1910,13 @@ class NativeLlamaQLoRA(nn.Module):
                     else:
                         hidden = self._block_forward(meta, entry, hidden, position_ids,
                                                      attn_bias, mode, pack)
+                # Deepstack (Qwen3-VL / Qwen3.5-VL): the vision tower's
+                # intermediate feature map for this depth is added onto the
+                # image positions after the block -- the DeepstackEmbed module
+                # that follows this block in the inference module list. No-op
+                # on a text batch.
+                if has_img and bi in self._deepstack:
+                    hidden = vision.add_deepstack(hidden, mm, self._deepstack[bi])
                 # EBFT feature taps: stash the residual stream after selected
                 # blocks (see collect_hidden). The stream is the raw pre-norm
                 # residual, matching HF's output_hidden_states[bi+1] convention
@@ -1867,9 +1956,10 @@ class NativeLlamaQLoRA(nn.Module):
     def logits(self, input_ids: torch.Tensor,
                attention_mask: Optional[torch.Tensor] = None,
                position_ids: Optional[torch.Tensor] = None,
-               seg_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+               seg_ids: Optional[torch.Tensor] = None,
+               mm: Optional[dict] = None) -> torch.Tensor:
         """Materialize full logits ``[b, t, vocab]`` (validation / small batches)."""
-        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids)
+        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids, mm=mm)
         w = self.lm_head_weight_fn()()
         logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
         if self.final_softcap:
@@ -1885,6 +1975,7 @@ class NativeLlamaQLoRA(nn.Module):
         ignore_index: int = IGNORE_INDEX,
         position_ids: Optional[torch.Tensor] = None,
         seg_ids: Optional[torch.Tensor] = None,
+        mm: Optional[dict] = None,
     ) -> torch.Tensor:
         """Shifted causal-LM cross-entropy.
 
@@ -1899,8 +1990,8 @@ class NativeLlamaQLoRA(nn.Module):
         resets + block-diagonal attention). The shifted CE needs no packing special
         case: at a document boundary the shift predicts the next document's first
         token, which is always a masked (-100) prompt token, so it contributes no
-        loss."""
-        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids)
+        loss. ``mm`` is the image splice (see :meth:`forward`)."""
+        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids, mm=mm)
         # Materialize logits only at supervised positions when the head trains
         # (train_head OR lora_head) -- the fused heads are frozen-head only (no
         # weight/LoRA gradient). Memory scales with the supervised token count.
@@ -2053,6 +2144,8 @@ class NativeLlamaQLoRA(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         chunk: int = DEFAULT_CHUNK,
         ignore_index: int = IGNORE_INDEX,
+        position_ids: Optional[torch.Tensor] = None,
+        mm: Optional[dict] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-sequence summed completion log-probabilities (DPO / KTO).
 
@@ -2072,7 +2165,7 @@ class NativeLlamaQLoRA(nn.Module):
         assert not ((self.train_head or self.lora_head)
                     and not self._adapters_off), \
             "compute_logps supports the frozen LM head only (no --train-head/--lora-head)"
-        hidden = self.forward(input_ids, attention_mask)
+        hidden = self.forward(input_ids, attention_mask, position_ids, mm=mm)
         hidden = backbone.to_device(hidden, self._head_device)
         labels = labels.to(hidden.device)
         if self.head_vocab_chunk > 0 and self._head_slice is not None:

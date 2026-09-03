@@ -42,6 +42,108 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def check_vision(model, net, tokenizer, config, image_path, prompt, device, cdt):
+    """
+    Image+text gate (--image): the differentiable forward fed the frozen
+    vision features through the training splice (``mm``) must reproduce the
+    native inference forward fed the same ``MMEmbedding`` -- the exact path
+    the generator runs for a multimodal prompt (indexed embeddings, mRoPE
+    alt frequencies, Gemma4 bidirectional image spans). One vision forward
+    produces the features for BOTH sides, so this isolates the text tower's
+    multimodal handling: the embedding splice, the 3-D position ids + per-band
+    rotation, the deepstack adds, the span mask. Also cross-checks the Python
+    mRoPE position ids against the extension kernel on an mRoPE tower.
+    """
+    print("\n" + "-" * 78)
+    print(f"vision check: image+text forward vs native ({image_path})")
+    from PIL import Image
+    from exllamav3.training import vision as tv
+    from exllamav3.tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+    from vision_data import resolve_placeholder_id
+    if "vision" not in config.model_classes:
+        print("  this architecture has no vision component -- skipping")
+        return True
+    vision_model = Model.from_config(config, component="vision")
+    vision_model.load(device=device, progressbar=True)
+    image = Image.open(image_path)
+    image.load()
+    with torch.inference_mode():
+        mme = vision_model.get_image_embeddings(tokenizer=tokenizer, image=image)
+    n_ds = len(mme.deepstack_embeddings) if mme.deepstack_embeddings is not None else 0
+    print(f"  image -> {mme.mm_length} feature tokens, grid {mme.grid_thw}, "
+          f"merge {mme.mrope_merge_size}, deepstack maps {n_ds}; tower: "
+          f"mrope={net.has_mrope}, deepstack after blocks {sorted(net._deepstack) or 'none'}, "
+          f"bidirectional spans={net._bidir_mm}")
+
+    # Native oracle: the generator's prefill params for a multimodal prompt.
+    text = model.default_chat_prompt(mme.text_alias + "\n" + prompt)
+    ids = tokenizer.encode(text, encode_special_tokens=True, embeddings=[mme])   # [1, t]
+    params = {"indexed_embeddings": [mme]}
+    if model.caps.get("mrope"):
+        freqs, _ = model.g_rope.get_mrope_freqs(ids, [mme], ids.shape[-1])
+        params["inv_freq"] = freqs
+    with torch.inference_mode():
+        logits_native = model.forward(ids.to(device), params).float()          # [1, t, V]
+
+    # Differentiable side: the same features through the training splice.
+    feats = tv.features_from_mme(mme, store_dtype=torch.float32)
+    ids_cpu = ids[0].tolist()
+    mm_pos = [i for i, t in enumerate(ids_cpu) if t >= FIRST_MM_EMBEDDING_INDEX]
+    start = mm_pos[0] - feats.slot_offsets[0]
+    placeholder = resolve_placeholder_id(config, tokenizer)
+    train_ids = [placeholder if t >= FIRST_MM_EMBEDDING_INDEX else t for t in ids_cpu]
+    assert train_ids[start:start + len(feats.token_ids)] == \
+        [placeholder if t == tv.IMAGE_SLOT else t for t in feats.token_ids], \
+        "image token layout does not line up with the tokenized prompt"
+    t = len(train_ids)
+    mm = tv.build_mm_batch([[(start, feats)]], t, cdt)
+    pos = None
+    ok = True
+    if net.has_mrope:
+        pos = tv.mrope_position_ids(t, [(mm_pos[0], feats.n_tokens, feats.grid_thw)],
+                                    feats.merge_size)
+        # The kernel the generator uses -> must agree with the Python mirror.
+        from exllamav3.ext import exllamav3_ext as ext
+        ref = torch.zeros((3, t), dtype=torch.long)
+        ext.gen_mrope_pos_ids(ref, ids[0].contiguous(), feats.merge_size,
+                              [(mme.first_index, mme.last_index)], [tuple(mme.grid_thw)])
+        same = torch.equal(pos, ref)
+        ok &= same
+        print(f"  mRoPE position ids (python) == gen_mrope_pos_ids kernel: "
+              f"{'OK' if same else 'MISMATCH'}  (text resumes at {int(pos[0, -1])} "
+              f"for {t} tokens)")
+        pos = pos.unsqueeze(1).to(device)                                     # [3, 1, t]
+    with torch.no_grad():
+        logits_diff = net.logits(torch.tensor([train_ids], device=device),
+                                 mm=mm, position_ids=pos).float()
+    logits_diff = logits_diff.to(logits_native.device)
+
+    ln, ld = logits_native[0, -1], logits_diff[0, -1]
+    top1_native, top1_diff = int(ln.argmax()), int(ld.argmax())
+    match = top1_native == top1_diff
+    argmax_n = logits_native[0].argmax(-1)
+    argmax_d = logits_diff[0].argmax(-1)
+    agree_all = (argmax_n == argmax_d).float().mean().item()
+    after = mm_pos[-1] + 1
+    agree_text = (argmax_n[after:] == argmax_d[after:]).float().mean().item()
+    agree_img = (argmax_n[mm_pos] == argmax_d[mm_pos]).float().mean().item()
+    max_abs = (ln - ld).abs().max().item()
+    cos = torch.cosine_similarity(ln, ld, dim=0).item()
+    is_lowp = cdt in (torch.float16, torch.bfloat16)
+    good = (match and agree_text >= 0.9) or (is_lowp and agree_text >= 0.8 and cos >= 0.999)
+    ok &= good
+    dec = lambda i: repr(tokenizer.decode(torch.tensor([[i]]), decode_special_tokens=True)[0])
+    print(f"  prompt: {prompt!r} (+ image, {t} tokens)")
+    print(f"  native next-token : {dec(top1_native)}")
+    print(f"  diff   next-token : {dec(top1_diff)}   {'OK' if match else 'MISMATCH'}")
+    print(f"  per-position argmax agreement: all {agree_all*100:.1f}% | "
+          f"text after image {agree_text*100:.1f}% | image positions {agree_img*100:.1f}%")
+    print(f"  last-token logits: max|Δ|={max_abs:.4f}  cos={cos:.6f}")
+    print("  vision check:", "PASS" if ok else "FAIL")
+    vision_model.unload()
+    return ok
+
+
 def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto",
                    use_liger=False):
     """
@@ -624,6 +726,15 @@ def main():
     ap.add_argument("--init-svd-niter", type=int, default=16,
                     help="Randomized-SVD iterations for the init gate (0 = exact SVD).")
     ap.add_argument("--prompts", nargs="*", default=None)
+    ap.add_argument("--image", default=None, metavar="PATH",
+                    help="Image+text gate for --vision training: run the model's "
+                         "vision component on this image and compare the "
+                         "differentiable forward (features spliced through the "
+                         "training path, 3-D mRoPE / deepstack / bidirectional "
+                         "spans as the arch needs) against the native multimodal "
+                         "forward. REQUIRED green before any --vision run on a base.")
+    ap.add_argument("--image-prompt", default="Describe the image.",
+                    help="text that follows the image in the --image gate prompt")
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
     ap.add_argument("--check-packing", action="store_true",
@@ -731,6 +842,10 @@ def main():
         print(f"  diff   next-token : {tok_diff}   {status}")
         print(f"  per-position argmax agreement: {agree*100:.1f}%")
         print(f"  last-token logits: max|Δ|={max_abs:.4f}  cos={cos:.6f}")
+
+    if args.image:
+        all_ok &= check_vision(model, net, tokenizer, config, args.image,
+                               args.image_prompt, args.device, cdt)
 
     if not args.skip_head_slice_check:
         all_ok &= check_head_slice(net)

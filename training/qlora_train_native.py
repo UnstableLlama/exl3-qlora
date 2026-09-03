@@ -916,7 +916,7 @@ def resolve_resumed_datasets(out_dir, resume_dir, roles, interactive=True,
 
 def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
                               clean_text, min_response_words,
-                              uppercase_response):
+                              uppercase_response, vision=None, refs=None):
     """Segment-render one multi-turn conversation into an (input_ids, labels)
     example with only the assistant turns supervised. Returns
     ``(example, None)`` or ``(None, reason)`` where reason is a short skip
@@ -953,6 +953,12 @@ def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
         segments = seg_builder(turns)
     except ValueError:
         return None, "unrenderable"
+    if refs:
+        # Image row (--vision): the segment texts carry image sentinels; the
+        # vision-aware encoder splices the arch's image token layout in and
+        # attaches the per-image bookkeeping (see training/vision_data.py).
+        ids, labels, images, feats = vision.encode_segments(segments, refs)
+        return vision.finalize(ids, labels, images, feats, refs, seq_len)
     input_ids, labels = encode_segments(tokenizer, segments)
     input_ids, labels = input_ids[:seq_len], labels[:seq_len]
     if all(l == -100 for l in labels):
@@ -967,7 +973,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        uppercase_response=False, messages_key=None,
                        prompt_format="auto", shuffle=False, shuffle_seed=0,
                        config_name=None, chat_template_file=None,
-                       template_vars=None):
+                       template_vars=None, vision=None):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -1003,7 +1009,16 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
     CLI-level ``template_vars``. Rows the template can't segment-render
     (non-prefix-monotonic history, see chat_jinja) are skipped and counted.
     Rows with non-text content parts (images etc.) train on the rendered
-    text only -- placeholder tokens, no pixel features -- and are counted.
+    text only -- placeholder tokens, no pixel features -- and are counted,
+    UNLESS ``vision`` (a training/vision_data.VisionData, the ``--vision``
+    path) is given: then every messages row whose content parts carry
+    images -- on any prompt format, single- or multi-turn -- has its images
+    encoded by the frozen vision tower and spliced into the token stream at
+    the parts' positions (the arch's own image token layout, image tokens
+    masked), with the per-image bookkeeping the forward needs attached to
+    the example (``images``, and ``mrope_position_ids`` on a Qwen-VL tower).
+    Rows with video/audio parts are skipped and counted. Text-only rows are
+    unaffected.
 
     clean_text strips stage directions / inline actions and normalizes
     whitespace (helps play-script style sets like the Shakespeare default, whose
@@ -1047,8 +1062,27 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                                            eos_token=tokenizer.eos_token)
 
     examples = []
-    n_multi, n_mm, skipped = 0, 0, {}
-    for ex in ds:
+    n_multi, n_mm, n_img, skipped = 0, 0, 0, {}
+    resolver = (vision.resolver(dataset_name, ds, messages_key)
+                if vision is not None and messages_key else None)
+    for row_idx, ex in enumerate(ds):
+        # --vision: flatten image content parts to sentinels (one per image,
+        # the pixels resolved lazily) so the chat renderers below see plain
+        # strings; the encode step re-expands each sentinel into the arch's
+        # image token layout. refs is empty on a text-only row.
+        refs = []
+        if resolver is not None:
+            try:
+                msgs, refs = vision.prepare(resolver, ex, row_idx, ex.get(messages_key))
+            except ValueError as e:
+                skipped["unsupported_media"] = skipped.get("unsupported_media", 0) + 1
+                if skipped["unsupported_media"] <= 3:
+                    print(f" -- skipping row {row_idx}: {e}")
+                continue
+            if refs:
+                ex = dict(ex)
+                ex[messages_key] = msgs
+                n_img += 1
         if messages_key and jinja:
             # The template is the single source of truth: every messages row
             # (single- or multi-turn, tool calls, reasoning) takes the
@@ -1064,7 +1098,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                            seg_builder(t, **kw, **_x))
             built, reason = _build_multi_turn_example(
                 tokenizer, row_builder, turns, seq_len, clean_text,
-                min_response_words, uppercase_response)
+                min_response_words, uppercase_response,
+                vision=vision, refs=refs)
             if built is None:
                 skipped[reason] = skipped.get(reason, 0) + 1
             else:
@@ -1085,7 +1120,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                     raise SystemExit(AUTO_SINGLE_TURN_HINT)
                 built, reason = _build_multi_turn_example(
                     tokenizer, seg_builder, turns, seq_len, clean_text,
-                    min_response_words, uppercase_response)
+                    min_response_words, uppercase_response,
+                    vision=vision, refs=refs)
                 if built is None:
                     skipped[reason] = skipped.get(reason, 0) + 1
                 else:
@@ -1117,6 +1153,18 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         # encode_prompt_response tokenizes the prompt and the response SEPARATELY
         # (exact mask boundary) and normalizes to exactly one leading BOS.
         prompt_text = build_prompt(user, system=sys_text or None)
+        if refs:
+            # Single-turn image row: the same (prompt, response) split, encoded
+            # through the sentinel-aware segment encoder (prompt masked,
+            # response + eot supervised, image tokens masked).
+            ids, labels, images, feats = vision.encode_segments(
+                [(prompt_text, False), (resp + eot, True)], refs)
+            built, reason = vision.finalize(ids, labels, images, feats, refs, seq_len)
+            if built is None:
+                skipped[reason] = skipped.get(reason, 0) + 1
+            else:
+                examples.append(built)
+            continue
         prompt_ids, resp_ids = encode_prompt_response(
             tokenizer, prompt_text, resp, eot)
 
@@ -1127,6 +1175,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
             continue  # response got truncated away; skip
         examples.append({"input_ids": input_ids, "labels": labels})
 
+    if n_img and int(os.environ.get("RANK", "0") or 0) == 0:
+        print(f" -- vision: {n_img} rows carried images; {vision.describe()}")
     if (n_multi or skipped) and int(os.environ.get("RANK", "0") or 0) == 0:
         note = ", ".join(f"{v} {k}" for k, v in sorted(skipped.items()))
         what = ("rows rendered via the model's Jinja chat template" if jinja
@@ -1310,9 +1360,16 @@ def collate(batch, pad_id):
     """
     maxlen = max(len(b["input_ids"]) for b in batch)
     packed = "seg_ids" in batch[0]
+    # Image rows on an mRoPE (Qwen-VL) tower carry 3-D positions
+    # ([3, t] per example, from vision.mrope_position_ids); the batch's
+    # position_ids is then [3, b, t]. A text-only row in the same batch gets
+    # plain sequential positions on all three axes (== 1-D RoPE for it).
+    mrope = any("mrope_position_ids" in b for b in batch)
+    assert not (packed and mrope), "image rows cannot be sample-packed"
     input_ids, labels, attn = [], [], []
     seg_ids = [] if packed else None
     pos_ids = [] if packed else None
+    pos3 = [] if mrope else None
     for b in batch:
         n = len(b["input_ids"])
         pad = maxlen - n
@@ -1323,11 +1380,18 @@ def collate(batch, pad_id):
             last_seg = b["seg_ids"][-1] if b["seg_ids"] else 0
             seg_ids.append(b["seg_ids"] + [last_seg] * pad)
             pos_ids.append(b["position_ids"] + [0] * pad)
+        if mrope:
+            p = b.get("mrope_position_ids") or [list(range(n))] * 3
+            pos3.append([axis + [0] * pad for axis in p])
+    if mrope:
+        position_ids = torch.tensor(pos3, dtype=torch.long).permute(1, 0, 2).contiguous()
+    else:
+        position_ids = torch.tensor(pos_ids, dtype=torch.long) if packed else None
     return (
         torch.tensor(input_ids, dtype=torch.long),
         torch.tensor(labels, dtype=torch.long),
         torch.tensor(attn, dtype=torch.long),
-        torch.tensor(pos_ids, dtype=torch.long) if packed else None,
+        position_ids,
         torch.tensor(seg_ids, dtype=torch.long) if packed else None,
     )
 
@@ -1722,6 +1786,35 @@ def _run_main():
                          "next-fit, i.e. ~1.15-1.2x more real tokens per step. "
                          "nextfit: the pre-Session-11 arrival-order behavior, kept "
                          "for A/B comparison.")
+    ap.add_argument("--vision", action="store_true",
+                    help="Image+text SFT on a vision-language EXL3 model (Qwen2.5/3/"
+                         "3.5-VL, Gemma3/4, Mistral3, ...). Loads the model's own "
+                         "vision component (frozen, as at inference) and, for every "
+                         "--messages-key row whose content parts carry images "
+                         "(Axolotl/OpenAI layout: {type: image, path|url|base64|"
+                         "image}, or bare {type: image} parts drawn from the row's "
+                         "--images-key column), splices the image features into the "
+                         "token stream at the parts' positions. Only the language "
+                         "model's adapters train. Text-only rows in the same set "
+                         "train as usual. Not combinable with --pack. Gate a new base "
+                         "with qlora_validate_native.py --image first.")
+    ap.add_argument("--images-key", default="images",
+                    help="(--vision) row column holding the images that bare "
+                         "{type: image} parts refer to, in order (default: images).")
+    ap.add_argument("--image-max-pixels", type=int, default=0,
+                    help="(--vision) downscale images to at most this many pixels "
+                         "(aspect kept) BEFORE the arch's own preprocessing -- the "
+                         "lever on image token count / VRAM (e.g. 1000000 -> ~1.3k "
+                         "tokens on Qwen-VL). 0 = the model's own bounds.")
+    ap.add_argument("--vision-cache-gb", type=float, default=8.0,
+                    help="(--vision) CPU RAM budget for cached image features "
+                         "(fp16). Images past the budget are re-encoded each time "
+                         "they are batched (the vision tower then stays loaded); "
+                         "when everything fits, the tower is unloaded after the "
+                         "dataset build to free its VRAM.")
+    ap.add_argument("--vision-device", default=None,
+                    help="(--vision) device for the vision tower (default: the "
+                         "training device / first split device).")
     ap.add_argument("--inspect", type=int, default=0, metavar="N",
                     help="Tokenization check: decode the first N built examples "
                          "(prompt span vs supervised response span + whether the "
@@ -2061,6 +2154,7 @@ def _run_main():
         "parallel": args.parallel, "shuffle": int(bool(args.shuffle)),
         "pack": int(bool(args.pack)),
         "pack_algo": args.pack_algo if args.pack else "",
+        "vision": int(bool(args.vision)),
         "ga_loss": args.ga_loss, "max_samples": args.max_samples,
         "train_embeddings": int(bool(args.train_embeddings)),
         "train_head": int(bool(args.train_head)),
@@ -2181,6 +2275,38 @@ def _run_main():
         dist = Counter(str(d) for d in net._block_devices)
         print(f" -- decoder block devices: {dict(dist)}  (final norm + head on {net.device})")
 
+    # 2b. Vision (--vision): the model's own frozen vision component, encoding
+    # the dataset's images into the features the text tower's forward splices
+    # in (training/vision_data.py + exllamav3.training.vision).
+    vdata = None
+    if args.vision:
+        _FAIL_CTX["phase"] = "load_vision"
+        if args.pack:
+            raise SystemExit("--vision is not combinable with --pack (image rows "
+                             "are not sample-packed; drop --pack).")
+        if not args.messages_key:
+            raise SystemExit("--vision needs --messages-key: images ride the "
+                             "content parts of OpenAI-style messages rows.")
+        from vision_data import VisionData, resolve_placeholder_id
+        from exllamav3.training.vision import VisionEncoder
+        if args.vision_device:
+            vdev = args.vision_device
+        elif args.parallel == "split":
+            d0 = active_devices[0]
+            vdev = f"cuda:{d0}" if isinstance(d0, int) else str(d0)
+        else:
+            vdev = args.device
+        encoder = VisionEncoder(
+            config, tokenizer, device=vdev, max_pixels=args.image_max_pixels,
+            cache_bytes=int(args.vision_cache_gb * (1 << 30)), progressbar=True)
+        vdata = VisionData(encoder, tokenizer,
+                           placeholder_id=resolve_placeholder_id(config, tokenizer),
+                           mrope=net.has_mrope, images_key=args.images_key)
+        print(f" -- vision tower loaded on {vdev} (frozen); mrope={net.has_mrope}, "
+              f"deepstack={sorted(net._deepstack) or 'none'}, "
+              f"bidirectional image spans={net._bidir_mm}, "
+              f"image_max_pixels={args.image_max_pixels or 'model default'}")
+
     # 3. Data.
     _FAIL_CTX["phase"] = "build_dataset"
     from chat_jinja import parse_template_vars
@@ -2196,10 +2322,20 @@ def _run_main():
         prompt_format=args.prompt_format,
         shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
         chat_template_file=args.chat_template_file,
-        template_vars=template_vars,
+        template_vars=template_vars, vision=vdata,
     )
     print(f" -- {len(examples)} SFT examples{' (shuffled)' if args.shuffle else ''}")
     assert examples, "no usable training examples"
+    if vdata is not None and not any(ex.get("images") for ex in examples):
+        print(" -- WARNING: --vision is set but no training row carried an image "
+              "(check --messages-key / the content-parts layout / --images-key).")
+
+    def collate_mm(batch, input_ids):
+        # The image splice for a collated batch (None on text-only batches /
+        # without --vision); built on CPU, the forward moves it.
+        if vdata is None:
+            return None
+        return vdata.collate_mm(batch, input_ids.shape[1], cdt)
 
     # Tokenization check: decode the prompt span (labels==-100) and the supervised
     # response span (labels!=-100) separately, so the mask boundary and any
@@ -2224,8 +2360,14 @@ def _run_main():
             dec = lambda seq: tokenizer.decode(torch.tensor([seq]),
                                                decode_special_tokens=True)
             ends_eot = bool(eot_id) and sup[-len(eot_id):] == eot_id
+            img_note = ""
+            if ex.get("images"):
+                n_slots = sum(1 for t in ids if t == vdata.placeholder_id)
+                img_note = (f", {len(ex['images'])} image(s) / {n_slots} image "
+                            f"tokens at {[s for s, _ in ex['images']]}"
+                            + (", 3-D mRoPE positions" if "mrope_position_ids" in ex else ""))
             print(f"\n===== example {i} | {len(ids)} tokens "
-                  f"({n_masked} masked / {len(sup)} supervised) =====")
+                  f"({n_masked} masked / {len(sup)} supervised{img_note}) =====")
             # Decode contiguous masked/supervised spans in order: a single-turn
             # row is one prompt span + one response span (the old two-line
             # output); a multi-turn row interleaves several, and showing each
@@ -2289,7 +2431,7 @@ def _run_main():
                 prompt_format=args.prompt_format,
                 config_name=args.eval_config,
                 chat_template_file=args.chat_template_file,
-                template_vars=template_vars,
+                template_vars=template_vars, vision=vdata,
             )
             kind = "SFT"
         print(f" -- held-out eval: {len(val_examples)} {kind} examples from "
@@ -2333,6 +2475,20 @@ def _run_main():
     # losses). Done after the val carve so a packed block never straddles the
     # train/val boundary; resolve_steps below then counts packed blocks as the
     # training unit, so --epochs still means "passes over the data".
+    if vdata is not None:
+        # Every image the run can touch has now been encoded (train + eval
+        # builds). If all their features fit the cache, the tower's VRAM is
+        # better spent on activations -- drop it. Otherwise it stays loaded
+        # to re-encode the over-budget images per batch.
+        if vdata.encoder.all_cached:
+            vdata.encoder.unload()
+            print(" -- vision: all image features cached in RAM; vision tower "
+                  "unloaded (VRAM freed).")
+        else:
+            print(f" -- vision: {vdata.encoder.n_evicted} image(s) exceed "
+                  f"--vision-cache-gb {args.vision_cache_gb:g}; the vision tower "
+                  f"stays loaded to re-encode them per batch.")
+
     if args.pack:
         n_docs = len(examples)
         real_tokens = sum(len(ex["input_ids"]) for ex in examples)
@@ -2358,7 +2514,8 @@ def _run_main():
                 input_ids, _, attn, pos_ids, seg_ids = collate(batch, pad_id)
                 used += int(attn.sum())
                 yield dict(input_ids=input_ids, attention_mask=attn,
-                           position_ids=pos_ids, seg_ids=seg_ids)
+                           position_ids=pos_ids, seg_ids=seg_ids,
+                           mm=collate_mm(batch, input_ids))
 
         net.apply_init_lora("eva", svd_niter=args.init_svd_niter,
                             eva_batches=eva_prepass())
@@ -2523,7 +2680,8 @@ def _run_main():
                 input_ids, labels, attn, pos_ids, seg_ids = collate([ex], pad_id)
                 l = net.compute_loss(input_ids, labels, attention_mask=attn,
                                      chunk=args.ce_chunk,
-                                     position_ids=pos_ids, seg_ids=seg_ids)
+                                     position_ids=pos_ids, seg_ids=seg_ids,
+                                     mm=collate_mm([ex], input_ids))
                 total += l.item()
                 n += 1
         net.train()
@@ -2808,14 +2966,19 @@ def _run_main():
             # n_sup/total_sup makes the step gradient identical to one big batch.
             # Counts use the SHIFTED labels ([:, 1:]) to match the CE denominator.
             # A no-op when grad_accum == 1 (weight = 1).
-            window = [collate(next(bgen), pad_id) for _ in range(args.grad_accum)]
+            window = []
+            for _ in range(args.grad_accum):
+                mb = next(bgen)
+                col = collate(mb, pad_id)
+                window.append(col + (collate_mm(mb, col[0]),))
             n_sups = [int((w[1][:, 1:] != -100).sum()) for w in window]
             total_sup = max(sum(n_sups), 1)
             timer.mark("data")
-            for (input_ids, labels, attn, pos_ids, seg_ids), n_sup in zip(window, n_sups):
+            for (input_ids, labels, attn, pos_ids, seg_ids, mm), n_sup in zip(window, n_sups):
                 loss = net.compute_loss(input_ids, labels, attention_mask=attn,
                                         chunk=args.ce_chunk,
-                                        position_ids=pos_ids, seg_ids=seg_ids)
+                                        position_ids=pos_ids, seg_ids=seg_ids,
+                                        mm=mm)
                 # .item() before backward (harmless to the graph) so the fwd/bwd
                 # sections split cleanly at the sync.
                 loss_val = loss.item()

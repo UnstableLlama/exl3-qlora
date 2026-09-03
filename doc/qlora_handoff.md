@@ -4811,6 +4811,116 @@ chatml`).
    experts; the default targets adapt attention/conv + the dense layers).
 4. If it passes, promote the README row to "Box-proven".
 
+### Session 52 — Vision (image+text) training: frozen vision tower + differentiable multimodal text tower, Axolotl-style
+
+> 2026-09-03. Branch `claude/session-8faoz2`. CPU-tested only (torch in the
+> container; no GPU, no EXL3 VLM quant on hand) — the box list below is the
+> gate. Also fixes a silent regression: the Session-50 strict module-layout
+> check rejected every Qwen-VL / Qwen3.5-VL text tower (their interleaved
+> `DeepstackEmbed` modules), so the S22 "text-only VL training" path had
+> been broken since #154.
+
+**The ask**: add vision training, taking Axolotl's multimodal recipe as the
+model. What Axolotl does (docs/multimodal): OpenAI-style `messages` whose
+content is a parts list (`{type: image, path|url|base64|image}` + text
+parts), an `AutoProcessor` renders + expands the image tokens, the vision
+tower / projector are frozen, `lora_target_modules` is a regex over the
+language model only, no sample packing, no truncation of multimodal rows.
+This is the same shape here, minus the processor: exllamav3 already IS the
+processor (each VL arch's `get_image_embeddings` preprocesses + runs the
+tower + emits the exact token string the generator splices in).
+
+**Design (why it is exact, not approximate).** The vision tower is frozen
+at inference and in Axolotl, so its output is a CONSTANT of each example.
+So: run exllamav3's own vision component once per image
+(`Model.from_config(config, component="vision")`, the generator's forward),
+keep `(token layout, features[, deepstack maps], grid)` per image
+(`training.vision.ImageFeatures`, fp16 in a byte-budgeted CPU cache), and
+make the differentiable TEXT tower do exactly what the inference text tower
+does with them:
+
+1. **Embedding splice** (`vision.splice_embeddings`, in `forward(mm=)`):
+   the features replace the token embeddings at the image slots AFTER the
+   text scaling/adapters and BEFORE any embed norm — `modules.Embedding`
+   scales the standard rows, then inserts the indexed rows raw.
+2. **mRoPE** (Qwen2.5/3/3.5-VL): `vision.mrope_position_ids` is a Python
+   mirror of the `gen_mrope_pos_ids` CUDA kernel (INCLUDING its quirk that
+   two images with no text between index from the same base — unreachable in
+   practice, mirrored anyway; the CPU test compares against a per-token
+   transliteration on 40 random layouts), and `vision.mrope_freqs` mirrors
+   `RoPE.get_mrope_freqs`' interleaved per-band split. `_apply_rope` takes
+   `[3, b, t]` positions + `block_metadata["mrope_section"]`; equal-axis
+   positions reduce bit-exactly to the old 1-D path (tested), so text-only
+   runs are unchanged.
+3. **Deepstack** (Qwen3-VL / Qwen3.5-VL): `backbone._decoder_layout` now
+   accepts `DeepstackEmbed` modules between blocks (the regression fix) and
+   `backbone.deepstack_layout` maps block → deepstack index; the forward adds
+   `mm["deepstack"][k]` at the image positions after that block
+   (`vision.add_deepstack`), which is the module's `x += deepstack_emb[k]`.
+4. **Bidirectional image spans** (Gemma4 only — its `prepare_inputs` builds
+   `non_causal_spans`; Qwen/Gemma3/Mistral3 prefill images causally):
+   `backbone.uses_noncausal_mm_spans` detects it the way inference does
+   (the arch module defines `_prepare_noncausal_mm_spans`), `_attn_bias`
+   takes `bidir_spans` and opens the causal/window mask inside each span
+   (key-pad / seg rules kept), and such batches run every attention block
+   eager. Spans are maximal runs of feature positions, so Mistral3's
+   `[IMG_BREAK]` layout would yield one span per row — as inference builds.
+
+**Data path** (`training/vision_data.py`): image parts are flattened to a
+sentinel string `<$EXL3_IMAGE_k$>` per turn so ALL existing renderers
+(single-turn `build_prompt`, `chat_turns` segment builders, the Jinja
+path) see plain text; `encode_segments_with_images` then tokenizes the text
+pieces separately around each sentinel and substitutes the arch's token
+layout (placeholder id at the slots, `resolve_placeholder_id`), masks image
+tokens, and records `(start, key)` per image; `VisionData.finalize` attaches
+`images` + `mrope_position_ids` and DROPS rows that would be cut through
+an image (`too_long`). Sources: `path` (relative to the dataset file),
+`url`, `base64`, `image` (PIL / HF `{bytes,path}`), `image_url`, or the
+row's `images` column for bare parts — pixels are never retained (loaders
+re-read the dataset row). `collate` emits `[3, b, t]` positions when a row
+carries them (text rows in the same batch get equal axes); `collate_mm`
+builds the splice per batch (cache hit or re-encode on the still-loaded
+tower). Trainer flags: `--vision --images-key --image-max-pixels
+--vision-cache-gb --vision-device`; `--pack` rejected; the tower is
+unloaded after the dataset build when every feature fit the cache.
+
+**Validate gate** (`qlora_validate_native.py --image cat.png`): one vision
+forward feeds BOTH sides — native `model.forward(ids, {indexed_embeddings,
+inv_freq=get_mrope_freqs(...)})` (the generator's prefill params) vs
+`net.logits(train_ids, mm=, position_ids=)` — so the compare isolates the
+text tower's multimodal handling; also asserts the Python mRoPE ids equal
+`ext.gen_mrope_pos_ids`. Prints agreement over all / post-image text /
+image positions.
+
+**Tests** (`tests/test_vision_training.py`, 7/7; native_llama 8/8 still):
+kernel-transliteration mRoPE ids, `get_mrope_freqs` transliteration +
+1-D equivalence through `_apply_rope`, splice/deepstack rows + grads to
+text rows only, bidir bias rules + block == masked reference, sentinel
+encode masks / finalize / too_long / collate_mm, content-part resolution.
+
+**Box list (the gate — none of this has run on a GPU):**
+1. `qlora_validate_native.py --model $QWEN3_VL_EXL3 --image examples/media/cat.png`
+   fp32, then `--compute-dtype bfloat16`. Expect: mRoPE ids == kernel, image
+   feature tokens N, post-image text agreement ~100% / cos 0.9999. Repeat on
+   a Qwen3.5-VL quant (GDN + deepstack), a Gemma3 quant (fixed 256 tokens),
+   and a Gemma4 quant (bidirectional spans → eager attention). Also confirm
+   the text-only validate still passes on a Qwen3.5-VL quant (the
+   DeepstackEmbed layout fix).
+2. `qlora_train_native.py --vision --messages-key messages --prompt-format
+   chatml --inspect 3` on a small parts-list jsonl (paths relative to the
+   file) — check the image token positions / counts in the inspect print
+   and the "vision: ... cached" line; then a 20-step smoke: first loss sane
+   (not ~11), falling, `|dB|` climbing; watch VRAM vs `--image-max-pixels`.
+3. `qlora_infer_native.py` doesn't take images yet — check the adapter
+   steers on a text prompt, or add an `--image` there (small follow-up).
+4. `--parallel split` with `--vision-device` on the second card.
+5. If it passes, promote the README vision rows to "Box-proven".
+
+**Not built (scope)**: video / audio parts (skipped + counted), sample
+packing of image rows, DDP (`vision` keys are single/split only in the
+launcher), training the vision tower / projector (frozen by design, as in
+Axolotl's default), `qlora_infer_native.py --image`.
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)
@@ -4963,7 +5073,9 @@ the broken 5.x forward, final loss ~10.37 ≈ random). Discard it.
 
 ### Tests — `tests/` (all pass on CPU, torch only)
 - `test_qlora_grad.py` (tiers 1–2 always; tier 3 GPU/model opt-in),
-  `test_qlora_train_loop.py`, `test_fused_ce.py`.
+  `test_qlora_train_loop.py`, `test_fused_ce.py`, `test_vision_training.py`
+  (Session 52: mRoPE / splice / deepstack / bidirectional spans / image
+  content-parts).
 
 ### Library fix kept (legit, not a workaround)
 - `exllamav3/integration/transformers.py`: `Exl3HfLinear.weight` is now a frozen

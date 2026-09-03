@@ -62,6 +62,7 @@ optim: paged_adamw8bit
 - **Memory levers** for long context on consumer cards: gradient checkpointing, activation offload to CPU RAM, fused/chunked cross-entropy (chunked over the vocab too, for 256k-vocab models), 8-bit and paged optimizers, Liger kernels (RMSNorm/RoPE/SwiGLU).
 - **A real eval harness**: held-out loss from your dataset's own split (`eval_split`) or a carved fraction (`val_frac`), an optional second monitor set (`eval2_*`, e.g. wikitext LM loss watched next to your task loss), `save_best` checkpointing, periodic live sample generations, and a per-run CSV log of hyperparameters/losses/VRAM/throughput.
 - **Correctness gates, not vibes**: `qlora_validate_native.py` checks the differentiable forward against the native inference forward, the Liger backward against plain torch, packing isolation, and each adapter init's step-0 math — before you spend GPU-days. A CPU test suite covers the gradient path end-to-end.
+- **Vision (image+text) SFT** on the VLM bases exllamav3 serves — Qwen2.5/3/3.5-VL, Gemma3/4, Mistral3 (`vision: true`): the model's own vision tower runs frozen, its features are spliced into the text tower at the image positions with the arch's exact image token layout (3-D mRoPE, deepstack, Gemma4's bidirectional image spans all reproduced), and only the language model's adapters train — Axolotl's recipe, with the same content-parts dataset layout. See [Vision training](#vision-image--text-training) below.
 - **Standard outputs**: adapters save as PEFT-format safetensors, loadable by exllamav3's native LoRA loader (TabbyAPI), PEFT, or merge scripts. Runtime adapters apply correctly on every inference path; note that decode is slower **while an adapter is loaded** (the graph-fused decode paths can't run under one — `unload()` restores full speed), and deploying via merge-and-requantize has no hit at all.
 
 ### Supported architectures (training)
@@ -81,7 +82,8 @@ The differentiable forward reads every norm/activation/scale from the loaded mod
 | AFMoE | **Trinity-Nano** (Arcee), dots.llm1-style sigmoid routers | **Box-proven** (10-step SFT + fast-vs-legacy A/B + adapter steering generation at inference) — dots sigmoid router (selection bias, normalize-over-selected, route scale), full-width attention output gate, NoPE full-attention layers, muP embedding, ungated shared expert, dense-first-N layers |
 | MuseGlimmer | Muse Glimmer (text tower) | Accepted (full-width attention gate, scaleless q/k-norm + q scale factor, sandwich norms, per-layer RoPE theta with NoPE full-attention layers, embedding norm, logit pre-scale on the softcapped head) — **not yet box-tested**; run `qlora_validate_native.py` first, and use `--prompt-format jinja` (its `<\|eot\|>` turn-end and `to=user` recipient header come from the model's own template) |
 | Mixtral | Mixtral 8x7B | Accepted (std router, no shared expert) — not yet box-tested |
-| Qwen-VL text towers | Qwen2.5/3-VL | **Box-proven**, text-only (mRoPE collapses to 1D RoPE; vision tower not trained) |
+| Qwen-VL text towers | Qwen2.5/3-VL, Qwen3.5-VL | **Box-proven**, text-only (mRoPE collapses to 1D RoPE). Image+text via `vision: true` (3-D mRoPE + deepstack) — built, **not yet box-tested**; run `qlora_validate_native.py --image` first |
+| Gemma3 / Gemma4 / Mistral3 vision | Gemma3-4B/12B-it, Gemma4-12B-it, Mistral Small 3.1 | Text-only box-proven (Gemma). Image+text via `vision: true` (fixed-size soft tokens; Gemma4 bidirectional image spans; Mistral3 `[IMG_BREAK]` rows) — built, **not yet box-tested** |
 | Rejected loudly | Qwen3-Next (fused-qkvz GDN), grouped ds3-router MoE (DeepSeek-V3), headwise attention gating, non-NeoX RoPE | — |
 
 MoE note: the plain `gate_proj`/`up_proj`/`down_proj` targets adapt dense MLPs and the always-active shared expert; routed experts are opt-in (`expert_gate_proj` etc., with `--expert-r` for rank). Routers stay frozen. On AFMoE the *attention* gate is keyed `self_attn.gate_proj` in the checkpoint and rides the `gate_proj` target (or `attn_gate_proj` to adapt it alone).
@@ -99,6 +101,28 @@ MoE note: the plain `gate_proj`/`up_proj`/`down_proj` targets adapt dense MLPs a
 | `metharme` | `<\|system\|>/<\|user\|>/<\|model\|>` markers | Pygmalion-style tunes on any base |
 
 All formats do exact prompt/response boundary masking (prompt and response are tokenized separately) and single-BOS normalization; verify any new base with `--inspect 3` before training.
+
+### Vision (image + text) training
+
+`vision: true` turns the SFT trainer into a VLM fine-tuner on any base whose exllamav3 architecture has a vision component (Qwen2.5-VL, Qwen3-VL, Qwen3.5-VL incl. MoE, Gemma3, Gemma4, Mistral Small 3.x). The approach mirrors how [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) does multimodal fine-tuning: the vision tower + projector stay frozen, LoRA targets only the language model, and the dataset is OpenAI-style `messages` whose content is a parts list:
+
+```json
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "image", "path": "images/0001.png"},
+    {"type": "text",  "text": "What breed is this dog?"}]},
+  {"role": "assistant", "content": "A border collie."}]}
+```
+
+An image part names its pixels by `path` (relative to the dataset file), `url`, `base64`, `image` (a PIL image / HF `datasets.Image` column, e.g. from a parquet set) or OpenAI's `image_url`; a bare `{"type": "image"}` part takes the next entry of the row's `images` column (`images_key`), the layout of most HF VLM sets. Images can sit anywhere in any turn, several per row, on every prompt format (`auto`, the explicit formats, or `jinja`); text-only rows in the same set train as usual.
+
+What happens under the hood, and why it's exact:
+
+- **Features come from exllamav3's own vision component** (`Model.from_config(config, component="vision")` → `get_image_embeddings`), the forward the generator runs. They're encoded once at dataset build (cached in CPU RAM up to `vision_cache_gb`; if everything fits, the tower is unloaded again to free its VRAM) and spliced into the text tower's embedding stream at the image positions — the same `indexed_embeddings` substitution `modules.Embedding` performs at inference. The image token layout is the arch's own (`<|vision_start|>` + N slots + `<|vision_end|>` on Qwen-VL, `<start_of_image>` + 256 + `<end_of_image>` on Gemma3, `[IMG]`/`[IMG_BREAK]` rows on Mistral3, ...), so train and serve see identical token streams. Image tokens are always masked.
+- **The text tower's multimodal math is reproduced differentiably**: Qwen-VL's 3-D mRoPE position ids (a mirror of the `gen_mrope_pos_ids` kernel, CPU-tested against a transliteration of it) and the per-band interleaved rotation (a mirror of `RoPE.get_mrope_freqs`); Qwen3-VL / Qwen3.5-VL **deepstack** (vision intermediate features added after the first blocks — the `DeepstackEmbed` modules, which the training layout check now accepts instead of rejecting a VL text tower); Gemma4's **bidirectional attention inside each image span** (the eager attention path takes the span mask on those batches).
+- **A correctness gate**: `qlora_validate_native.py --image cat.png` runs one image through the vision tower and compares the differentiable forward (features through the training splice) against the native multimodal forward (the generator's prefill params), position by position — plus the Python mRoPE ids against the extension kernel. Run it on a new base before a `vision: true` run, exactly as for a new architecture.
+
+Knobs: `image_max_pixels` bounds the image token count (the VRAM lever — Qwen-VL at its default bounds can emit thousands of tokens per image), `vision_cache_gb` the feature cache, `vision_device` where the tower loads. `--inspect N` shows each example's image count / token positions. Not combinable with `pack` (image rows aren't packed, as in Axolotl); single/split only. Status: the whole path is built and CPU-tested but **awaits its first box run** (see the handoff log's box checklist).
 
 ### Modern PEFT: SVD adapter initializations
 

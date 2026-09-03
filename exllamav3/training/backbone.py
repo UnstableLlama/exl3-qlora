@@ -56,9 +56,19 @@ def _decoder_layout(model):
     idxs = [i for i, m in enumerate(mods) if isinstance(m, TransformerBlock)]
     assert idxs, "no TransformerBlock modules found; unsupported architecture"
     first, last = idxs[0], idxs[-1]
-    assert idxs == list(range(first, last + 1)), \
-        "non-TransformerBlock module interleaved between the decoder blocks; " \
-        "unsupported architecture"
+    # The ONE non-block module allowed between decoder blocks: Qwen-VL's
+    # DeepstackEmbed (Qwen3-VL / Qwen3.5-VL text towers build one after each of
+    # the first N blocks). It holds no weights and is a pure no-op on text-only
+    # input; under image input it adds the vision tower's intermediate-layer
+    # ("deepstack") features onto the image positions of the residual stream.
+    # The native forward reproduces it (see ``deepstack_layout``), so it is
+    # accepted here rather than rejected -- everything else stays rejected.
+    between = [i for i in range(first, last + 1)
+               if not isinstance(mods[i], TransformerBlock)]
+    bad = [i for i in between if not _is_deepstack_embed(mods[i])]
+    assert not bad, \
+        f"non-TransformerBlock module(s) interleaved between the decoder " \
+        f"blocks: {[type(mods[i]).__name__ for i in bad]}; unsupported architecture"
     assert last == len(mods) - 3, \
         f"unexpected module(s) between the last decoder block and the final " \
         f"norm: {[type(m).__name__ for m in mods[last + 1:-2]]}"
@@ -70,17 +80,71 @@ def _decoder_layout(model):
     return mods, first, last
 
 
+def _is_deepstack_embed(module) -> bool:
+    """True for the Qwen-VL ``DeepstackEmbed`` module (imported lazily: it lives
+    under ``modules.arch_specific`` and is absent on old library versions)."""
+    try:
+        from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
+    except ImportError:            # pragma: no cover - library without VL support
+        return False
+    return isinstance(module, DeepstackEmbed)
+
+
 def split_decoder(model):
     """
     Return ``(embed, blocks, final_norm, lm_head)`` from a loaded exllamav3
     ``Model``, validating the overall module layout. ``blocks`` is the list of
-    ``TransformerBlock`` modules, in order.
+    ``TransformerBlock`` modules, in order (any interleaved ``DeepstackEmbed``
+    modules are skipped here; see ``deepstack_layout``).
 
     NOTE: an architecture may also carry a norm on the token embeddings, which
     this tuple does NOT include -- get it from ``embed_norm(model)``.
     """
+    from ..modules import TransformerBlock
     mods, first, last = _decoder_layout(model)
-    return mods[0], mods[first:last + 1], mods[-2], mods[-1]
+    blocks = [m for m in mods[first:last + 1] if isinstance(m, TransformerBlock)]
+    return mods[0], blocks, mods[-2], mods[-1]
+
+
+def deepstack_layout(model) -> dict:
+    """
+    ``{block_index: deepstack_index}`` for every ``DeepstackEmbed`` module that
+    follows decoder block ``block_index`` (0-based over the TransformerBlocks),
+    empty on every architecture without them. ``deepstack_index`` selects which
+    of the vision tower's deepstack feature maps the module adds
+    (``MMEmbedding.deepstack_embeddings[deepstack_index]``); the inference
+    module adds ``params["deepstack_emb"][deepstack_index]`` -- a [b, t, hidden]
+    tensor that is zero everywhere except the image token positions -- onto
+    the residual stream in place. The native forward mirrors that add.
+    """
+    from ..modules import TransformerBlock
+    mods, first, last = _decoder_layout(model)
+    layout, bi = {}, -1
+    for m in mods[first:last + 1]:
+        if isinstance(m, TransformerBlock):
+            bi += 1
+        elif _is_deepstack_embed(m):
+            assert bi >= 0, "DeepstackEmbed before the first decoder block"
+            assert bi not in layout, f"two DeepstackEmbed modules after block {bi}"
+            layout[bi] = int(m.deepstack_index)
+    return layout
+
+
+def uses_noncausal_mm_spans(model) -> bool:
+    """
+    True when this architecture's INFERENCE forward lets image tokens attend
+    bidirectionally within their own image span (Gemma4: ``prepare_inputs``
+    builds ``params["non_causal_spans"]`` from the multimodal token mask, and
+    the attention kernels run each image span non-causally over itself). The
+    native forward must mirror that for image+text parity; every other VL arch
+    in exllamav3 (Qwen-VL, Gemma3, Mistral3) prefills image tokens causally.
+    Detected the same way the inference path does it -- by the arch module
+    defining the span preparer that its ``prepare_inputs`` calls -- so it can't
+    drift from inference by a hand-kept list.
+    """
+    import sys
+    arch_mod = sys.modules.get(type(model).__module__)
+    return callable(getattr(arch_mod, "_prepare_noncausal_mm_spans", None))
 
 
 def embed_norm(model):
@@ -297,10 +361,13 @@ def assert_block_supported(block):
     # sequence every section shares the same position, so mRoPE collapses
     # EXACTLY to 1D RoPE, which is precisely what native_llama._apply_rope
     # computes (one position_id per token against the loaded inv_freq). All our
-    # training paths are text-only, so no forward-math change is needed; the
-    # native validate gate confirms the forward still matches the (mRoPE-aware)
-    # inference oracle. Actual image+text multimodal fine-tuning would need true
-    # per-token 3D positions and the vision tower -- a separate project.
+    # text-only training needs no forward-math change, and the native validate
+    # gate confirms the forward still matches the (mRoPE-aware) inference
+    # oracle. Image+text training passes true 3-D [t, h, w] positions (built
+    # by training.vision.mrope_position_ids from the image grids) and the
+    # block forward then applies the per-band split (block_metadata's
+    # mrope_section; native_llama._apply_rope) exactly as the inference
+    # get_mrope_freqs does.
     assert attn.rope.rope_settings.rope_style.name == "NEOX", \
         f"{key}: only NeoX-style RoPE is supported, got {attn.rope.rope_settings.rope_style.name}"
     # Partial rotary (rotary_dim < head_dim, e.g. Qwen-VL partial_rotary_factor)
@@ -451,6 +518,16 @@ def block_metadata(block) -> dict:
         # forward then skips the rotation, mirroring inference.
         "inv_freq": attn.rope.inv_freq if attn.rope is not None else None,
         "attn_factor": attn.rope.attn_factor if attn.rope is not None else 1.0,
+        # mRoPE (Qwen-VL text towers): the per-axis frequency-band split
+        # ([t, h, w] counts over the inv_freq entries) that the multimodal
+        # forward applies to 3-D [t, h, w] position ids -- see
+        # training.vision.mrope_freqs. None on 1-D RoPE archs; also unused
+        # whenever the positions passed in are 1-D (text-only training, where
+        # mRoPE collapses exactly to 1-D RoPE).
+        "mrope_section": (list(attn.rope.mrope_section)
+                          if attn.rope is not None
+                          and getattr(attn.rope, "mrope_section", None) is not None
+                          else None),
         # Per-layer attention window: >0 means sliding (band) attention, else full
         # causal (Gemma alternates local-sliding / global-full layers).
         "sliding_window": int(sw) if sw not in (None, 0) else -1,

@@ -45,6 +45,16 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   such rows fail fast instead of being silently truncated, which is what the
   old `extract_single_turn` path did). CPU-tested in
   `tests/test_chat_turns.py`.
+- `vision_data.py` — `--vision`: image+text rows. Flattens content-parts
+  messages (Axolotl/OpenAI layout: `{type: image, path|url|base64|image}`,
+  or bare image parts drawn from the row's `--images-key` column) into
+  sentinel-carrying strings so every renderer above works unchanged, then
+  splices the architecture's own image token layout in at the sentinels and
+  attaches the per-image bookkeeping (feature keys, 3-D mRoPE positions) the
+  differentiable forward needs. The frozen vision tower and the splice math
+  live in `exllamav3/training/vision.py`. CPU-tested in
+  `tests/test_vision_training.py`; the box gate is
+  `qlora_validate_native.py --image`.
 - `chat_jinja.py` — `--prompt-format jinja`: the same segment contract, but
   rendered through the model directory's own Jinja chat template
   (`chat_template.jinja` / `chat_template.json` / `tokenizer_config.json`;

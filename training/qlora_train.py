@@ -92,6 +92,8 @@ SINGLE_ONLY_KEYS = {
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
     "torch_profile",   # torch.profiler window; DDP backend has no such flag
     "wandb_project", "wandb_run_name", "wandb_entity",  # not mirrored to DDP yet
+    # Image+text SFT (the frozen vision tower + image splice); single/split only.
+    "vision", "images_key", "image_max_pixels", "vision_cache_gb", "vision_device",
 }
 DDP_ONLY_KEYS = set()
 

@@ -267,6 +267,31 @@ pack: false                   # sample packing: concatenate short documents into
 pack_algo: bfd                # bin packing for pack: bfd (best-fit decreasing, ~97%+ fill) |
                               #   nextfit (old arrival-order, ~80-85% fill; kept for A/B)
 
+# Image+text SFT on a vision-language base (Qwen2.5/3/3.5-VL, Gemma3/4,
+# Mistral3, ...): the model's OWN vision component is loaded (frozen, as at
+# inference) and every messages_key row whose content parts carry images gets
+# the image features spliced into the token stream at the parts' positions --
+# the arch's exact image token layout, image tokens masked, only the language
+# model's adapters train (Axolotl's recipe). Row layout (Axolotl / OpenAI):
+#   {"messages": [{"role": "user", "content": [
+#        {"type": "image", "path": "cat.png"},        # or url / base64 / image (PIL)
+#        {"type": "text", "text": "What is this?"}]},
+#      {"role": "assistant", "content": "A cat."}]}
+# A bare {"type": "image"} part takes the next entry of the row's images_key
+# column (LLaVA / TheCauldron-style sets). Text-only rows in the same set
+# train as usual; video/audio parts are skipped. single/split only, not with
+# pack. Gate a new base first:
+#   python training/qlora_validate_native.py --model ... --image cat.png
+vision: false                 # enable the image path (needs messages_key)
+images_key: images            # row column the bare image parts draw from, in order
+image_max_pixels: 0           # downscale images to <= this many pixels (aspect kept) BEFORE the
+                              #   arch's preprocessing -- the image-token-count / VRAM lever
+                              #   (1000000 -> ~1.3k tokens on Qwen-VL). 0 = the model's own bounds
+vision_cache_gb: 8.0          # CPU RAM budget for cached image features (fp16). If everything
+                              #   fits, the vision tower is unloaded after the dataset build (VRAM
+                              #   freed); images past the budget are re-encoded per batch
+vision_device: null           # device for the vision tower (null = the training / first split device)
+
 # ---------------------------------------------------------------------------
 # Compute / VRAM levers
 #
