@@ -476,10 +476,11 @@ def _run_main():
         expert_r=args.expert_r, lora_dropout=args.lora_dropout,
     )
     net.train()
-    if args.pack and getattr(net, "has_gdn", False):
+    if args.pack and (getattr(net, "has_gdn", False)
+                      or getattr(net, "has_shortconv", False)):
         raise SystemExit(
-            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6) models: the "
-            "linear-attention recurrence and causal conv would carry state "
+            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6) or ShortConv "
+            "(LFM2) models: the recurrence / causal conv would carry state "
             "across packed document boundaries. Drop --pack and train unpacked.")
     if is_main(rank):
         ms = net.modules_to_save_parameters()

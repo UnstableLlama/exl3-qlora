@@ -88,6 +88,7 @@ from .gdn import (
     gdn_delta_rule_reference, gdn_causal_conv1d_silu, gdn_gated_rmsnorm,
     gdn_beta_g,
 )
+from .short_conv import shortconv_mix
 
 
 # FlashAttention-2 fast path. exllamav3's own FA2 usage is inference-only
@@ -191,6 +192,19 @@ _GDN_TARGET_ALIASES = {
     "in_proj_b": ("in_proj_b", "b_proj"),
     "in_proj_a": ("in_proj_a", "a_proj"),
     "out_proj": ("out_proj", "o_proj"),
+}
+
+# ShortConv leaf -> the target names that select it (LFM2 / LFM2-MoE conv
+# layers). Same idea as the GDN aliases: the fused in_proj ([hidden, 3*hidden]
+# emitting b|c|x) plays the q/k/v role, out_proj plays o, so the familiar
+# Llama-style target list adapts the conv mixer too, and LFM2's own
+# checkpoint names (in_proj/out_proj) select them directly. conv_in_proj /
+# conv_out_proj pick the conv layers alone (out_proj also names the
+# attention output projection on LFM2's self_attn layers, which the plain
+# attention path adapts under o_proj).
+_SHORTCONV_TARGET_ALIASES = {
+    "in_proj": ("in_proj", "conv_in_proj", "q_proj", "k_proj", "v_proj"),
+    "out_proj": ("out_proj", "conv_out_proj", "o_proj"),
 }
 
 # Routed-expert leaf -> the target names that select it. The routed experts
@@ -607,6 +621,7 @@ class NativeLlamaQLoRA(nn.Module):
         wrappers: list[DiffLinear] = []
         satisfied_targets: set[str] = set()   # requested names that matched a linear
         self.has_gdn = False
+        self.has_shortconv = False
         self.has_moe = False
 
         def wrap(linear, leaf, aliases=None, r_override=None):
@@ -709,6 +724,17 @@ class NativeLlamaQLoRA(nn.Module):
                                     _GDN_TARGET_ALIASES["in_proj_a"])
                 entry.o_proj = wrap(o_l, "out_proj",
                                     _GDN_TARGET_ALIASES["out_proj"])
+            elif meta["kind"] == "shortconv":
+                # ShortConv layer (LFM2 / LFM2-MoE gated causal conv). Two
+                # native Linears (in_proj / out_proj), so LoRA / pissa /
+                # quant-aware compose exactly as on softmax layers; the
+                # depthwise conv tensor itself stays frozen (meta).
+                self.has_shortconv = True
+                in_l, out_l = backbone.short_conv_projections(blk)
+                entry.in_proj = wrap(in_l, "in_proj",
+                                     _SHORTCONV_TARGET_ALIASES["in_proj"])
+                entry.out_proj = wrap(out_l, "out_proj",
+                                      _SHORTCONV_TARGET_ALIASES["out_proj"])
             else:
                 q_proj, k_proj, v_proj, o_proj = backbone.attn_projections(blk)
                 q_norm, k_norm, v_norm = backbone.attn_qkv_norms(blk)   # Qwen3 / Gemma
@@ -720,7 +746,13 @@ class NativeLlamaQLoRA(nn.Module):
                 # Some Gemma layers reuse K as V (no v_proj); the block forward then
                 # takes V from the raw K projection.
                 entry.v_proj = wrap(v_proj, "v_proj") if v_proj is not None else None
-                entry.o_proj = wrap(o_proj, "o_proj")
+                # The attention output projection answers to o_proj and, when
+                # the checkpoint keys it differently (LFM2's
+                # self_attn.out_proj), to its own leaf name as well -- so a
+                # target list written in the model's own names works.
+                o_leaf = str(getattr(o_proj, "key", "o_proj")).split(".")[-1]
+                entry.o_proj = wrap(o_proj, "o_proj",
+                                    ("o_proj", o_leaf) if o_leaf != "o_proj" else None)
                 # AFMoE full-width attention output gate (a separate linear the
                 # checkpoint keys as self_attn.gate_proj). It answers to the
                 # plain gate_proj target -- PEFT's suffix matching would adapt
@@ -1495,6 +1527,38 @@ class NativeLlamaQLoRA(nn.Module):
             hidden = (hidden * ls).to(hidden.dtype)
         return hidden
 
+    # --- ShortConv (LFM2 gated causal conv) block forward ------------------
+
+    def _shortconv_forward(self, meta, entry, hidden):
+        """One ShortConv decoder block (LFM2 / LFM2-MoE ``conv`` layer):
+        pre-norm -> in_proj -> ``b | c | x`` split -> causal depthwise conv over
+        ``b * x`` -> ``c`` gate -> out_proj residual, then the standard MLP
+        half (dense or MoE). Stateless (sequences start at position 0), so the
+        inference path's zero conv state is reproduced exactly by a left pad of
+        ``kernel - 1`` zeros; no RoPE, no attention mask (the conv is causal
+        by construction). Right-padding is safe: pad positions only ever feed
+        later pad positions, which are masked from the loss."""
+        normed = self._norm(hidden, entry.attn_norm_spec)
+        bcx = entry.in_proj(normed)                        # [b, t, 3*hidden]
+        y = shortconv_mix(bcx, meta["conv1d_weight"], meta["conv1d_bias"])
+        attn_out = entry.out_proj(y)
+        if entry.attn_post_spec is not None:
+            hidden = hidden + self._norm(attn_out, entry.attn_post_spec)
+        else:
+            hidden = hidden + attn_out
+
+        normed2 = self._norm(hidden, entry.mlp_norm_spec)
+        mlp_out = self._mlp_out(meta, entry, normed2, residual=hidden)
+        if entry.mlp_post_spec is not None:
+            hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
+        else:
+            hidden = hidden + mlp_out
+
+        ls = meta.get("layer_scalar")
+        if ls is not None:
+            hidden = (hidden * ls).to(hidden.dtype)
+        return hidden
+
     # --- attention backend selection -------------------------------------
 
     def _attn_mode_for(self, meta, mem_eff: bool) -> str:
@@ -1553,9 +1617,11 @@ class NativeLlamaQLoRA(nn.Module):
         mem_eff = (self._flash_ok and is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
         counts = Counter(
-            "gdn" if m.get("kind", "attn") == "gdn" else self._attn_mode_for(m, mem_eff)
+            m["kind"] if m.get("kind", "attn") in ("gdn", "shortconv")
+            else self._attn_mode_for(m, mem_eff)
             for m in self._block_meta)
-        plan = ", ".join(f"{counts[k]}×{k}" for k in ("flash", "sdpa", "eager", "gdn")
+        plan = ", ".join(f"{counts[k]}×{k}" for k in
+                         ("flash", "sdpa", "eager", "gdn", "shortconv")
                          if counts[k])
         avail = "available" if _flash_attn_func() is not None else "NOT importable"
         why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
@@ -1601,11 +1667,12 @@ class NativeLlamaQLoRA(nn.Module):
         if (qa_state is not None and self.training and torch.is_grad_enabled()
                 and not self._adapters_off):
             qa_state["tick"] += 1
-        if seg_ids is not None and getattr(self, "has_gdn", False):
+        if seg_ids is not None and (getattr(self, "has_gdn", False)
+                                    or getattr(self, "has_shortconv", False)):
             raise ValueError(
-                "sample packing (seg_ids) is not supported on GatedDeltaNet "
-                "models: the linear-attention recurrence and causal conv would "
-                "carry state across packed document boundaries. Train unpacked "
+                "sample packing (seg_ids) is not supported on GatedDeltaNet / "
+                "ShortConv models: the recurrence and causal conv would carry "
+                "state across packed document boundaries. Train unpacked "
                 "(drop --pack).")
         bsz, t = input_ids.shape
         # Under a layer-autosplit load each block lives on its own device; the
@@ -1735,6 +1802,16 @@ class NativeLlamaQLoRA(nn.Module):
                         )
                     else:
                         hidden = self._gdn_forward(meta, entry, hidden)
+                elif meta.get("kind", "attn") == "shortconv":
+                    # ShortConv block (LFM2): causal conv, no RoPE, no
+                    # attention bias, no packing (rejected above).
+                    if ckpt:
+                        hidden = torch.utils.checkpoint.checkpoint(
+                            self._shortconv_forward, meta, entry, hidden,
+                            use_reentrant=False,
+                        )
+                    else:
+                        hidden = self._shortconv_forward(meta, entry, hidden)
                 else:
                     mode = self._attn_mode_for(meta, mem_eff)
                     # eager: seg-aware additive bias. flash + sdpa both isolate
