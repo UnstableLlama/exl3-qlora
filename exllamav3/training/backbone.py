@@ -112,6 +112,14 @@ def is_gated_delta_net(attn) -> bool:
     return isinstance(attn, GatedDeltaNet)
 
 
+def is_short_conv(attn) -> bool:
+    """True when a block's ``attn`` slot holds a ``ShortConv`` (LFM2 /
+    LFM2-MoE gated short causal convolution -- the ``conv`` layers of
+    LFM2.5-8B-A1B) rather than softmax attention."""
+    from ..modules import ShortConv
+    return isinstance(attn, ShortConv)
+
+
 def is_block_sparse_mlp(mlp) -> bool:
     """True when a block's ``mlp`` slot holds a ``BlockSparseMLP`` (mixture of
     experts -- Qwen3-MoE, Qwen3.5-MoE, Mixtral, ...) rather than a dense
@@ -194,7 +202,9 @@ def assert_block_supported(block):
     scale factor folded into sm_scale + sandwich norms + per-layer RoPE theta
     with NoPE full-attention layers; its embedding norm and head logit
     pre-scale are handled outside the block, see ``embed_norm`` /
-    ``head_pre_scale``),
+    ``head_pre_scale``), LFM2 / LFM2-MoE ShortConv layers (gated short causal
+    depthwise conv in the attention slot -- LFM2.5-8B-A1B builds ~3/4 of its
+    layers this way, the rest as q/k-normed softmax attention),
     and BlockSparseMLP mixtures of experts with the "std" softmax or "dots"
     sigmoid top-k router incl. the optional shared expert + sigmoid shared
     gate (Qwen3-MoE, Qwen3.5-MoE), the ungated shared expert (AFMoE) and the
@@ -238,10 +248,30 @@ def assert_block_supported(block):
         assert attn.a_log is not None and attn.dt_bias is not None, \
             f"{key}: GatedDeltaNet a_log/dt_bias not loaded (load the model first)"
         return
+    if is_short_conv(attn):
+        # Differentiable ShortConv (LFM2 / LFM2-MoE): in_proj -> b|c|x split ->
+        # causal depthwise conv over b*x -> c gate -> out_proj. Two native
+        # Linears plus one small depthwise conv tensor; no norm, no RoPE, no
+        # state beyond the conv's kernel-1 history (zero for a fresh sequence).
+        for name in ("in_proj", "out_proj"):
+            assert getattr(attn, name, None) is not None, \
+                f"{key}: ShortConv missing {name}"
+        assert attn.conv1d_weight is not None, \
+            f"{key}: ShortConv conv weight not loaded (load the model first)"
+        w = attn.conv1d_weight
+        assert w.dim() in (2, 3) and w.shape[0] == attn.hidden_size, \
+            f"{key}: ShortConv conv weight shape {tuple(w.shape)} does not " \
+            f"match hidden_size {attn.hidden_size} (depthwise [hidden, 1, kernel])"
+        assert w.shape[-1] == attn.conv_kernel_size, \
+            f"{key}: ShortConv conv weight kernel {w.shape[-1]} != " \
+            f"conv_kernel_size {attn.conv_kernel_size}"
+        assert not getattr(attn, "tp_reduce", False), \
+            f"{key}: tensor-parallel ShortConv is not supported for training"
+        return
     # Softmax attention path.
     assert isinstance(attn, (Attention, SlidingAttention)), \
-        f"{key}: only softmax Attention/SlidingAttention or GatedDeltaNet is " \
-        f"supported, got {type(attn).__name__}"
+        f"{key}: only softmax Attention/SlidingAttention, GatedDeltaNet or " \
+        f"ShortConv is supported, got {type(attn).__name__}"
     # q/k/v norms and output gating ARE supported (read from the modules):
     # the interleaved gate (Qwen3.5 full-attn layers, folded into q_proj) and
     # the separate FULL-width g_proj (AFMoE: sigmoid over the whole flattened
@@ -355,11 +385,28 @@ def block_metadata(block) -> dict:
     Plain-data description of one decoder block's attention / RoPE / norm config,
     consumed by the differentiable block forward. Tensors are referenced, not
     copied (``inv_freq`` is the loaded RoPE table itself). ``kind`` is
-    ``"attn"`` (softmax attention) or ``"gdn"`` (GatedDeltaNet); the two kinds
-    carry different keys. ``mlp_kind`` is ``"dense"`` or ``"moe"`` (see
+    ``"attn"`` (softmax attention), ``"gdn"`` (GatedDeltaNet) or
+    ``"shortconv"`` (LFM2 ShortConv); the kinds carry different keys. ``mlp_kind`` is ``"dense"`` or ``"moe"`` (see
     ``_mlp_metadata``).
     """
     attn = block.attn
+    if is_short_conv(attn):
+        # Depthwise causal conv weight, stored [hidden, 1, kernel]; squeezed to
+        # [hidden, kernel] for F.conv1d's groups=hidden layout. Laundered out
+        # of inference-mode like the GDN conv (see _frozen_normal).
+        w = attn.conv1d_weight
+        if w.dim() == 3:
+            w = w.squeeze(1)
+        return {
+            "kind": "shortconv",
+            "hidden_size": attn.hidden_size,
+            "conv_kernel_size": attn.conv_kernel_size,
+            "conv1d_weight": _frozen_normal(w),               # [hidden, kernel]
+            "conv1d_bias": _frozen_normal(attn.conv1d_bias),  # [hidden] or None
+            # MLP half (activation + dense/moe description).
+            **_mlp_metadata(block),
+            "layer_scalar": getattr(block, "layer_scalar_f", None),
+        }
     if is_gated_delta_net(attn):
         # Depthwise causal conv weight: one fused [dim, 1, kernel] tensor, or
         # (older checkpoints) separate q/k/v parts that concatenate along the
@@ -555,6 +602,14 @@ def gdn_projections(block):
     GatedDeltaNet block (split projection layout -- Qwen3.5/3.6)."""
     a = block.attn
     return a.qkv_proj, a.z_proj, a.b_proj, a.a_proj, a.o_proj
+
+
+def short_conv_projections(block):
+    """Return the ``(in_proj, out_proj)`` linears of a ShortConv block (LFM2 /
+    LFM2-MoE ``conv`` layers). ``in_proj`` is ``[hidden, 3*hidden]`` (the
+    ``b | c | x`` split), ``out_proj`` is ``[hidden, hidden]``."""
+    a = block.attn
+    return a.in_proj, a.out_proj
 
 
 def gdn_norm_spec(block) -> dict:

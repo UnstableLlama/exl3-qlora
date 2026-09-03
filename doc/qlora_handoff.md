@@ -4743,6 +4743,76 @@ is never built (text-only training, as with the Qwen-VL towers).
 
 ---
 
+### Session 51 — LFM2 / LFM2-MoE (LFM2.5-8B-A1B): differentiable ShortConv layers
+
+> 2026-09-03. Branch `claude/lfm2-5-shortconv-error-ip135t`. CPU-tested only
+> (torch installed in-container; no GPU, no EXL3 quant on hand) — the box
+> list below is the gate.
+
+**The report** (pineapple): `qlora_train_native.py` on an LFM2.5-8B-A1B EXL3
+quant aborted at construction with `AssertionError: model.layers.0: only
+softmax Attention/SlidingAttention or GatedDeltaNet is supported, got
+ShortConv`. Correct behaviour for the code as it was — `assert_block_supported`
+rejecting a layer kind the native forward can't reproduce — but the kind is
+small enough to just build.
+
+**What LFM2 is** (`architecture/lfm2_moe.py`, `Lfm2MoeForCausalLM`): ~3/4 of
+the blocks put a `ShortConv` in the attention slot — `in_proj` `[hidden,
+3·hidden]` → `b | c | x` → causal depthwise conv (kernel `conv_L_cache` = 3)
+over `b·x` → `c` gate → `out_proj`; no norm, no nonlinearity, no RoPE. The
+rest are q/k-normed softmax `Attention` (NEOX RoPE, `out_proj` for o). MLP is
+dense `GatedMLP` for the first `num_dense_layers`, then `BlockSparseMLP`
+with the **dots** sigmoid router + `expert_bias` — all already supported.
+Final norm `embedding_norm`, plain `lm_head`. ChatML prompt (`--prompt-format
+chatml`).
+
+**Built:**
+- **`exllamav3/training/short_conv.py`** (new; pure torch, CPU-loadable):
+  `shortconv_causal_conv1d` (left-pad `kernel−1` zeros == the inference
+  conv from a fresh zero state) and `shortconv_mix` (the b|c|x split + gate,
+  transcribed from `ShortConv.forward`).
+- **`backbone.py`**: `is_short_conv`, `short_conv_projections`;
+  `assert_block_supported` accepts ShortConv (checks in/out_proj present,
+  conv weight loaded and `[hidden, 1, kernel]`-shaped, kernel == config,
+  no TP reduce); `block_metadata` returns `kind: "shortconv"` with the
+  squeezed `[hidden, kernel]` conv weight + bias laundered via
+  `_frozen_normal` (same inference-tensor trap as the GDN conv).
+- **`native_llama.py`**: `_shortconv_forward` (norm → in_proj → mix →
+  out_proj residual → shared `_mlp_out`; sandwich norms / layer_scalar
+  honoured like the other block kinds; grad-checkpointed), block-loop
+  dispatch, `describe_attn` counts `N×shortconv`, `has_shortconv`.
+  **Target aliases** (`_SHORTCONV_TARGET_ALIASES`): q/k/v_proj → `in_proj`,
+  o_proj → `out_proj`, so the default `--targets` adapts the conv mixer;
+  `in_proj`/`out_proj` (LFM2's own names) and `conv_in_proj`/
+  `conv_out_proj` select them explicitly. Adapters save under the real keys
+  (`model.layers.N.conv.in_proj` …) so PEFT / `LoRA.from_directory` load
+  them, and runtime LoRA works at inference because `ShortConv.forward`
+  goes through the plain `Linear.forward` (no fused decode path to guard).
+- **Packing rejected** on ShortConv models exactly like GDN (the conv would
+  read across packed document boundaries): `net.forward` raises on
+  `seg_ids`, both trainers abort `--pack`, validate skips `--check-packing`.
+- **Tests** (`tests/test_shortconv.py`, 6/6 pass; gdn / moe / native_llama /
+  qlora_grad / lora_init / preference / quant_aware / fused_ce / ebft /
+  offload suites pass unchanged): conv vs a verbatim transcription of
+  `_causal_conv1d` from zero state, mix vs the inference forward, full block
+  vs an independent plain-torch composition (max|Δ| = 0), causality
+  (perturbing token j never moves outputs < j — the right-padding
+  guarantee), backward reaches in/out adapters with the base frozen, and
+  `backbone.block_metadata` / `assert_block_supported` on a mock module.
+
+**Box list (the gate — none of this has run on a GPU):**
+1. `qlora_validate_native.py --model $LFM25` fp32 eager, then
+   `--compute-dtype bfloat16`, then `--check-backward`. `describe_attn`
+   should print `N×flash, M×shortconv [moe: …]`.
+2. A 10-step SFT smoke with `--prompt-format chatml`; check the loss falls
+   and `qlora_infer_native.py` shows the adapter steering generation.
+3. Consider `--targets ... expert_gate_proj expert_up_proj expert_down_proj
+   --expert-r 1` for the routed experts (LFM2.5-8B-A1B has many small
+   experts; the default targets adapt attention/conv + the dense layers).
+4. If it passes, promote the README row to "Box-proven".
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
