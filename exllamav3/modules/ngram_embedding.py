@@ -3,6 +3,7 @@ from typing_extensions import override
 import os
 import torch
 from ..model.config import Config
+from ..loader.safetensors import DiskTensorHandle
 from ..ext import exllamav3_ext as ext
 from . import Module
 from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, words_per_row
@@ -37,9 +38,6 @@ def _find_nth_prime_after(start: int, count: int) -> int:
         while not is_prime(p):
             p += 1
     return p
-
-
-_warned_windows_stream = False
 
 
 class NGramEmbedding(Module):
@@ -179,19 +177,30 @@ class NGramEmbedding(Module):
         if stream_from_disk is None:
             infer_params = getattr(self.config, "infer_params", None)
             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
-        if stream_from_disk and os.name == "nt":
-            # The streamed gather path is pread-based (ngram_gather_cpu, DiskTensorHandle) with
-            # no Windows implementation yet
-            global _warned_windows_stream
-            if not _warned_windows_stream:
-                _warned_windows_stream = True
-                print(" !! n-gram table streaming is not implemented on Windows, loading table into system RAM")
-            stream_from_disk = False
         if stream_from_disk:
             self.mode = "trellis_disk" if quantized else "fp16_disk"
             self.handles = [stc.get_tensor_handle(k) for k in keys]
             if not quantized:
                 self._row_dtype = self.handles[0].dtype
+            # Shards that sit back-to-back in one file (the layout convert_ngram.py writes)
+            # collapse into a single handle spanning the whole table: _gather_rows issues one
+            # synchronous gather call per handle segment
+            h0 = self.handles[0]
+            if len(self.handles) > 1 and all(
+                h.filename == h0.filename and h.row_bytes == h0.row_bytes and
+                h.abs_offset == h0.abs_offset + s * self.rows_per_shard * h0.row_bytes
+                for s, h in enumerate(self.handles)
+            ):
+                merged = DiskTensorHandle(
+                    key = self.key, filename = h0.filename, abs_offset = h0.abs_offset,
+                    shape = [self.num_rows, *h0.row_shape], dtype = h0.dtype)
+                stc.find_stc(keys[0]).disk_handles.append(merged)   # closed with the collection
+                self.handles = [merged]
+                self.rows_per_shard = self.num_rows
+            if os.name == "nt":
+                # Release the loader's handles to the table files now
+                for h in set(h.filename for h in self.handles):
+                    stc.release_file(h)
         else:
             # loaded shard by shard and KEPT as individual tensors (never concatenated)
             self.mode = "trellis_ram" if quantized else "fp16_ram"

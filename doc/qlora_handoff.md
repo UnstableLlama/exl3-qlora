@@ -4923,6 +4923,84 @@ Axolotl's default), `qlora_infer_native.py --image`.
 
 ---
 
+### Session 53 — upstream v1.4.6 parity + DPO / KTO in real-time training
+
+> 2026-09-03. Branch `claude/dpo-kto-realtime-training-eal4ir`. CPU-tested
+> (`tests/test_realtime.py` extended; preference / chat_turns / chat_jinja
+> regressions pass); **not box-verified** — smoke list below.
+
+**Upstream sync.** Merged turboderp-org/exllamav3 master at v1.4.6 (7 commits
+past v1.4.5: `SlidingAttention` qsa_indexer regression fix, autosplit
+worst-case accounting for QSA/MLA/KDA, loader arena thresholds, PLE n-gram
+streaming for Windows + parallel reads across tensors, incremental Markdown
+rendering in `chat_console.py`). Clean auto-merge; the only files both sides
+touched were `attn.py` (fork: runtime-LoRA guards on the fused/graph paths;
+upstream: `autosplit_extra_measure` for QSA) and `env_vars.md` (fork: the
+Training section) — disjoint hunks. README parity note bumped to v1.4.6.
+
+**DPO / KTO in `RealtimeQLoRA`** (pineapple's request: "a realtime example
+adapted for DPO"; TRL's *explicit prompt* format, which he found more
+intuitive than the implicit one — the prompt is its own field, never
+repeated inside the completions). Ingest now takes, mixed with the SFT
+forms in one call:
+
+- `{"prompt", "chosen", "rejected"}` — one DPO pair;
+- `{"prompt", "completion", "label"}` — one unpaired KTO row;
+- the pre-tokenized `prompt_ids` variants of both.
+
+`prompt` is a rendered string or a message list; the latter goes through a
+new `render_prompt(sample)` callable (history rendered WITH the generation
+prompt, the pref trainer's `_encode_prompt_ids` contract) — `realtime_chat.py`
+wires the model's chat template for it. Completions are strings or assistant
+message lists, `+ config.eot_text` (the demo now passes the template's own
+turn-close there, so `prompt/response` samples close correctly too).
+Completion-tail truncation to `seq_len`; a prompt that fills the window is
+skipped and reported in `stats["skipped"]`.
+
+Losses are the offline trainer's, unchanged (`exllamav3/training/preference.py`
+— `dpo_loss` sigmoid/hinge/ipo + cDPO smoothing, `kto_loss` kto/
+apo_zero_unpaired with desirable/undesirable weights), reference = the same
+net under `adapters_disabled()`. New `RealtimeConfig` knobs: `beta`,
+`dpo_loss`, `label_smoothing`, `kto_loss`, `desirable_weight`,
+`undesirable_weight` (validated in `__post_init__`). Batching: consecutive
+same-kind samples form the micro-batches and **a kind change closes the
+accumulation window** (SFT windows token-weighted as before, preference
+windows example-weighted = TRL's batch-mean). KTO's mismatched-pair KL rows
+need `batch_size >= 2`; a singleton batch trains with KL = 0, which is
+exactly the apo_zero_unpaired loss (documented, not hidden). Stats gained
+`skipped`, `sft_samples`, and nested `dpo` (pairs / loss / reward acc /
+margin) and `kto` (samples / loss / kl / reward_d / reward_u) blocks;
+`mean_loss` stays the SFT token-weighted mean (`None` without SFT rows) so
+existing callers keep their meaning.
+
+Demo commands: `/prefer <better reply>` (history = prompt, model's reply =
+rejected, yours = chosen; the history then continues with yours), `/good` /
+`/bad` (one KTO row on the last reply). CLI: `--beta --dpo-loss
+--label-smoothing --kto-loss --desirable-weight --undesirable-weight`.
+
+**Tests** (`tests/test_realtime.py`, stub net gained `compute_logps` +
+`adapters_disabled`: reference scores every completion token at -1, policy
+at -1 + p): encoding of every preference form + label coercion + fit/skip,
+DPO batch layout (chosen block then rejected block, policy then reference
+forward), the ln-2 step-0 anchor, reward direction and accuracy after a
+step, hinge/ipo through the same path, KTO KL rows (swapped completions,
+4 forwards at batch 2, 2 at batch 1), row weights, all-desirable batches,
+mixed ingests closing windows on kind changes, skip accounting.
+
+**Box list:** (1) `realtime_chat.py --lr 1e-5` on a small quant: chat, then
+`/prefer` a better reply — expect the first report at `dpo ... loss 0.6931
+reward acc 0.00 margin +0.000` (ln 2 anchor) and `/again` to drift toward
+the chosen wording after a few pairs; (2) `/bad` then `/again` on a
+degenerate reply; (3) `/ingest` a small `{"prompt": [...], "chosen":
+[...], "rejected": [...]}` JSONL with `--batch 2` — KL non-zero in the
+`kto` report on a labeled file; (4) VRAM: a DPO pair is 2 sequences + one
+no-grad reference forward, so size `--seq-len` accordingly next to the
+cache. **Not built:** SimPO on the realtime path (reference-free, would be
+a `pair_loss` switch on the same pair form), RPO's SFT mix-in, and any
+change to the offline preference trainer.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
