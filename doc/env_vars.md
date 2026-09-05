@@ -347,26 +347,25 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 
-Slab allocation for small weight tensors during (deferred) module loads: tensors up to 64 MB
-are carved out of shared 128 MB per-device blocks instead of getting one CUDA caching-allocator
+Slab allocation for small weight tensors during (deferred) module loads: tensors up to 16 MB
+are carved out of shared 128 MB per-device blocks (first-fit over the open blocks, so partially
+filled tails are packed by later small tensors) instead of getting one CUDA caching-allocator
 allocation each. MoE models with many small per-expert tensors otherwise shatter the allocator
-into tens of thousands of segments with large reserved-but-unallocated overhead (measured on a
-512-expert model: 37k segments, 15.3 GB waste, fixed to 611 segments / 0.16 GB). Unloading a
+into tens of thousands of segments with large reserved-but-unallocated overhead. Unloading a
 module frees its blocks; at most one boundary block shared with a neighboring module stays
 pinned. Set to `0` to fall back to per-tensor allocations.
 
 ### `EXL3_NGRAM_STREAM` (default: `1`)
 
 Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table
-(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (threaded,
-run-coalesced preads into pinned staging) instead of loading the whole table into system RAM.
-The quantized table is tens of GB, and streaming costs little on SSD-class storage (decode is
-latency-tolerant at ~30 rows/token; prefill gathers are batched). Set to `0` to hold the table
-in RAM — worthwhile only when the table lives on high-latency storage (e.g. HDD, where
-per-row seeks make streaming unusable). Also settable per load via
-`config.infer_params.ngram_stream_from_disk` or `--ngram_ram` in `model_init`-based scripts.
-The streamed path is `pread`-based and not implemented on Windows: there the table always
-loads into RAM (with a warning when streaming was requested).
+(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (run-coalesced
+positioned reads into pinned staging — threaded preads on Linux, overlapped `ReadFile` at high
+queue depth on Windows) instead of loading the whole table into system RAM. The quantized table
+is tens of GB, and streaming costs little on SSD-class storage (decode is latency-tolerant at
+~30 rows/token; prefill gathers are batched). Set to `0` to hold the table in RAM — worthwhile
+only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
+unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
+`--ngram_ram` in `model_init`-based scripts.
 
 ### `EXL3_VISION_PINNED` (default: `0`)
 
@@ -379,8 +378,13 @@ component.
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)
 
-When set, device-to-device tensor moves in the layer split bounce through host memory instead
-of using peer-to-peer copies. Workaround for platforms with broken or misreported P2P support.
+Controls device-to-device tensor moves (the layer split boundary, draft/MTP heads reading the
+target model's states, sparse-attention selections shared between layers). On some platforms
+the driver reports peer-to-peer access that the PCIe fabric does not deliver, and a direct copy
+silently yields garbage. Unset: the first move between each pair of GPUs probes it (a few
+random floats there and back, checked on the host) and, if the probe fails, every later move
+between that pair bounces through system memory, with a warning printed once. Set to `1`: always
+bounce, no probing. Set to `0`: always copy directly, no probing.
 
 ### `EXLLAMA_MASTER_ADDR` (default: `127.0.0.1`), `EXLLAMA_MASTER_PORT` (default: auto)
 
@@ -444,6 +448,13 @@ offloaded forward), not at import. Raise it only if a legit shape-stable run is
 re-allocating; lower it to cap host RAM harder on a tight box.
 
 ## Debug
+
+### `EXL3_NGRAM_GATHER_PROF` (default: unset)
+
+Windows only: print per-gather statistics from the streamed n-gram table path (unique rows,
+coalesced runs, reads completed synchronously vs left pending, span tasks drained by pool
+workers vs the calling thread). Activation check for the overlapped-`ReadFile` gather when
+validating a streamed-table model on Windows.
 
 ### `EXLLAMA_DEBUGLOG_<CATEGORY>` (default: unset)
 
