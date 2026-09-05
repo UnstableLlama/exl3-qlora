@@ -1415,10 +1415,23 @@ def main(args, job_state):
             save_dict("ckpt_new/job.json", job_state, args)
             save_tensor(state, "ckpt_new/state.safetensors", args)
             save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)
-            if os.path.exists(ckpt_dir_old):
-                shutil.rmtree(ckpt_dir_old)
-            os.rename(ckpt_dir, ckpt_dir_old)
-            os.rename(ckpt_dir_new, ckpt_dir)
+            # Rotate ckpt_new -> ckpt -> ckpt_old using renames only, so the window in which
+            # the checkpoint is not recoverable is a single atomic operation. The slow recursive
+            # delete happens last, on a directory nothing else refers to any more. Deleting
+            # ckpt_old in place first would race anything that touches the work dir concurrently
+            # and take the whole job down with ENOTEMPTY, hours in, for a purely cosmetic failure.
+            ckpt_dir_trash = os.path.join(args["work_dir"], "ckpt_trash")
+            try:
+                if os.path.exists(ckpt_dir_trash):
+                    shutil.rmtree(ckpt_dir_trash, ignore_errors = True)
+                if os.path.exists(ckpt_dir_old):
+                    os.rename(ckpt_dir_old, ckpt_dir_trash)
+                if os.path.exists(ckpt_dir):
+                    os.rename(ckpt_dir, ckpt_dir_old)
+                os.rename(ckpt_dir_new, ckpt_dir)
+            except OSError as e:
+                print(f" !! Checkpoint rotation failed: {e}")
+            shutil.rmtree(ckpt_dir_trash, ignore_errors = True)
             last_checkpoint_time = time.time()
 
     # Quantize additional modules (uncalibrated side models: MTP head, vision tower)
