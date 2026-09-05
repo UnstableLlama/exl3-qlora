@@ -1019,7 +1019,7 @@ def main(args, job_state):
     devices = [int(d) for d in args["devices"].split(",")]
     device = torch.device(devices[0])
     if args.get("device_ratios"):
-        device_ratios = [int(d) for d in args["device_ratios"].split(",")]
+        device_ratios = [float(d) for d in args["device_ratios"].split(",")]
         assert len(devices) == len(device_ratios), "--devices and --device_ratios must be same length"
     else:
         device_ratios = None
