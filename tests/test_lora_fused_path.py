@@ -325,3 +325,57 @@ def test_has_runtime_lora_semantics():
     assert has_runtime_lora(Stub(True))
     assert has_runtime_lora(Stub(False), Stub(True))
     assert has_runtime_lora(None, Stub(True))
+
+
+@pytest.mark.parametrize("bsz,q_len", [(1, 1), (2, 3)])
+@pytest.mark.parametrize("fuse_qg,fuse_kv", [(True, True), (True, False), (False, True)])
+def test_sliding_attention_padded_mgemm_lora(bsz, q_len, fuse_qg, fuse_kv):
+    """Padded kernel inputs must still apply adapters to the original channels."""
+    import ast
+    from types import SimpleNamespace
+    import torch
+
+    # Execute the real method with a CPU replacement for the base-weight kernel.
+    # This isolates adapter/input geometry from CUDA and model loading.
+    tree = ast.parse(_src("exllamav3", "modules", "sliding_attn.py"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SlidingAttention")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "project_qkv")
+    dim, padded, width = 6, 8, 4
+    torch.manual_seed(17)
+    x = torch.randn(bsz, q_len, dim, dtype=torch.float16)
+
+    class Projection:
+        in_features = padded
+
+        def __init__(self):
+            self.a = torch.randn(dim, 2, dtype=torch.float16)
+            self.b = torch.randn(2, width, dtype=torch.float16)
+
+        def apply_lora(self, inputs, output):
+            assert inputs.shape == (bsz * q_len, dim)
+            output.add_((inputs @ self.a) @ self.b)
+
+        def forward(self, inputs, params):
+            return ((inputs[..., :dim] @ self.a) @ self.b).reshape(bsz, q_len, width)
+
+    def mgemm(inputs, ptrs, output, *args):
+        assert inputs.shape == (1, bsz * q_len, padded)
+        assert torch.count_nonzero(inputs[..., dim:]) == 0
+        output.zero_()
+
+    ns = {"torch": torch, "ext": SimpleNamespace(exl3_mgemm=mgemm),
+          "has_runtime_lora": lambda *args: True}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "sliding_attn.py", "exec"), ns)
+    multi = SimpleNamespace(ptrs_trellis=None, ptrs_suh=None, ptrs_svh=None, K=4, mcg=False, mul1=False)
+    layer = SimpleNamespace(
+        q_proj=Projection(), g_proj=Projection(), k_proj=Projection(), v_proj=Projection(),
+        multi_qg=multi if fuse_qg else None, multi_kv=multi if fuse_kv else None,
+        num_q_heads=1, num_kv_heads=1, head_dim=width, v_norm=None,
+        prealloc_qgh_1=torch.empty(2, 1, padded, dtype=torch.float16),
+        prealloc_kvh_1=torch.empty(2, 1, padded, dtype=torch.float16),
+        prealloc_qg_1=torch.empty(2, 1, width, dtype=torch.float16),
+        prealloc_kv_1=torch.empty(2, 1, width, dtype=torch.float16),
+    )
+    actual = ns["project_qkv"](layer, x, {})
+    for result, proj in zip(actual, [layer.q_proj, layer.k_proj, layer.v_proj, layer.g_proj]):
+        torch.testing.assert_close(result.reshape(bsz, q_len, width), proj.forward(x, {}))

@@ -398,7 +398,7 @@ class Attention(Module):
     def optimizer_targets(self):
         q = self.q_proj.optimizer_targets()
         k = self.k_proj.optimizer_targets()
-        v = self.v_proj.optimizer_targets()
+        v = self.v_proj.optimizer_targets() if self.v_proj is not None else []   # use_k_as_v: no V projection
         o = self.o_proj.optimizer_targets()
         return [[q, k + v, o]]
 
@@ -855,6 +855,58 @@ class Attention(Module):
             "QSA attention currently supports only the fp16 cache layer"
         return CacheLayer_qsa, kwargs
 
+
+    def autosplit_extra_measure(self, params):
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        if self.qsa_indexer is None or self.device is None:
+            return
+        cache = params.get("cache")
+        if cache is None:
+            return
+        from ..cache import CacheLayer
+        from ..cache.qsa import CacheLayer_qsa
+        layer = cache if isinstance(cache, CacheLayer) else \
+            cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+        if not isinstance(layer, CacheLayer_qsa):
+            return
+        chunk = params["batch_shape"][1]
+
+        # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= MAX_QLEN) slot family
+        # can request, both regimes (sparse slots are single-job, and the regime-1 score
+        # statics are sized to the full pooled-plane capacity at configure time). Backings
+        # are bucketed and shared across slots and layers, so configuring the largest and
+        # smallest shapes bounds the whole family
+        key = id(layer)
+        bca = self.bc_attn.get(key)
+        if bca is None:
+            bca = self.bc_attn[key] = (build_bc_attn(self, layer) or False)
+        if bca:
+            for b, q in ((1, 1), (_bc_max_bsz, _bc_max_qlen)):
+                bca._configure(b, q, True, 0)
+            if bca.qsa:
+                for q in (1, _bc_max_qlen):
+                    bca._configure(1, q, True, 1)
+
+        # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
+        # page 0, zeroed so the math stays finite
+        num_pages = layer.k.shape[0]
+        t_syn = num_pages * PAGE_SIZE - chunk
+        if t_syn + chunk <= self.qsa_indexer.sparse_threshold():
+            return   # cache too small to ever reach the sparse regime
+        layer.k[0].zero_()
+        layer.v[0].zero_()
+        layer.raw_k[0].zero_()
+        layer.pooled[0].zero_()
+        p2 = {k2: v2 for k2, v2 in params.items() if k2 not in
+              ("dev_cache", "positions", "position_ids")}
+        p2["cache_seqlens"] = torch.tensor([t_syn], dtype = torch.int32)
+        p2["block_table"] = torch.zeros((1, num_pages), dtype = torch.int32)
+        p2["position"] = t_syn
+        x = torch.zeros((1, chunk, self.hidden_size), dtype = torch.half, device = self.device)
+        self.forward(x, p2)
+
+
     def decode_flash_attn(
         self,
         x: torch.Tensor,
@@ -1021,6 +1073,8 @@ class Attention(Module):
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
+        assert getattr(self, "qsa_indexer", None) is None, \
+            "TP export of Attention with a QSA indexer is not implemented"
 
         def _export(child):
             nonlocal producer
@@ -1048,6 +1102,9 @@ class Attention(Module):
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,
                 "interleaved_gate": self.interleaved_gate,
+                "full_gate": self.full_gate,
+                "gate_softplus": self.gate_softplus,
+                "use_cu_seqlens": self.use_cu_seqlens,
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -1092,8 +1149,13 @@ class Attention(Module):
             if num_kv_heads else None
         if interleaved_gate and num_kv_heads:
             q_split = q_split[0], q_split[1] * 2, q_split[2] * 2
-        qh_split = (True, first * n_gqa, last * n_gqa) \
-            if num_kv_heads else None
+        # Full gate spans head_dim channels per q head, headwise gate is one channel per q head
+        if exported["kwargs"].get("full_gate", False):
+            qh_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+                if num_kv_heads else None
+        else:
+            qh_split = (True, first * n_gqa, last * n_gqa) \
+                if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
         o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \

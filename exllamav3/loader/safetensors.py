@@ -182,12 +182,96 @@ class STCMetrics:
         print(f" -- Direct: {self.direct_tensors:,} tensors")
 
 
+# Windows positioned reads. DiskTensorHandle opens Win32 HANDLEs with FILE_FLAG_OVERLAPPED, where
+# every ReadFile carries its own offset in the OVERLAPPED (the pread equivalent). C++ gather
+# (ngram_gather_win.cpp) can additionally leave many reads in flight on the same handle, which is
+# where the streamed n-gram path gets its queue depth. The persistent streaming handle is also
+# unbuffered, the reference-read handles transient and buffered.
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes as _wt
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    # HANDLEs travel as c_ssize_t so INVALID_HANDLE_VALUE compares as -1 and the value passes to
+    # the extension as a plain int
+    _k32.CreateFileW.argtypes = [_wt.LPCWSTR, _wt.DWORD, _wt.DWORD, ctypes.c_void_p, _wt.DWORD,
+                                 _wt.DWORD, ctypes.c_void_p]
+    _k32.CreateFileW.restype = ctypes.c_ssize_t
+    _k32.ReadFile.argtypes = [ctypes.c_ssize_t, ctypes.c_void_p, _wt.DWORD, ctypes.c_void_p,
+                              ctypes.c_void_p]
+    _k32.ReadFile.restype = _wt.BOOL
+    _k32.GetOverlappedResult.argtypes = [ctypes.c_ssize_t, ctypes.c_void_p,
+                                         ctypes.POINTER(_wt.DWORD), _wt.BOOL]
+    _k32.GetOverlappedResult.restype = _wt.BOOL
+    _k32.CreateEventW.argtypes = [ctypes.c_void_p, _wt.BOOL, _wt.BOOL, _wt.LPCWSTR]
+    _k32.CreateEventW.restype = ctypes.c_ssize_t
+    _k32.CloseHandle.argtypes = [ctypes.c_ssize_t]
+    _k32.CloseHandle.restype = _wt.BOOL
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_void_p),
+            ("InternalHigh", ctypes.c_void_p),
+            ("Offset", _wt.DWORD),
+            ("OffsetHigh", _wt.DWORD),
+            ("hEvent", ctypes.c_ssize_t),
+        ]
+
+    def _win_open(filename: str, flags: int) -> int:
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_ALL = 0x00000007            # READ | WRITE | DELETE, like os.open on Windows
+        OPEN_EXISTING = 3
+        h = _k32.CreateFileW(filename, GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING,
+                             flags, None)
+        if h == -1:
+            raise OSError(f"CreateFileW failed for {filename} (error {ctypes.get_last_error()})")
+        return h
+
+    def _win_open_stream(filename: str) -> int:
+        # The persistent streaming handle: overlapped (positioned, many reads in flight) and
+        # unbuffered.
+        FILE_FLAG_OVERLAPPED = 0x40000000
+        FILE_FLAG_NO_BUFFERING = 0x20000000
+        return _win_open(filename, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING)
+
+    def _win_open_ref(filename: str) -> int:
+        # Transient handle for the Python reference reads: buffered (arbitrary offsets), opened
+        # per call and closed immediately so it never sustains a cache map on the file
+        return _win_open(filename, 0x40000000)
+
+    def _win_pread_into(handle: int, mv: memoryview, offset: int) -> int:
+        """pread equivalent for an overlapped HANDLE: positioned read into a writable memoryview,
+        thread-safe (the offset travels in the OVERLAPPED, not in handle state). May return
+        short, like pread."""
+        ev = _k32.CreateEventW(None, True, False, None)
+        if ev in (0, -1):
+            raise OSError(f"CreateEventW failed (error {ctypes.get_last_error()})")
+        try:
+            ov = _OVERLAPPED()
+            ov.Offset = offset & 0xffffffff
+            ov.OffsetHigh = (offset >> 32) & 0xffffffff
+            ov.hEvent = ev
+            n = len(mv)
+            dst = (ctypes.c_char * n).from_buffer(mv)
+            got = _wt.DWORD(0)
+            ok = _k32.ReadFile(handle, dst, n, None, ctypes.byref(ov))
+            if not ok and ctypes.get_last_error() != 997:   # ERROR_IO_PENDING
+                raise OSError(f"ReadFile failed (error {ctypes.get_last_error()})")
+            if not _k32.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(got), True):
+                raise OSError(f"overlapped read failed (error {ctypes.get_last_error()})")
+            return got.value
+        finally:
+            _k32.CloseHandle(ev)
+
+
 class DiskTensorHandle:
     """
     Handle to a tensor that stays on disk: full shape/dtype metadata plus the file location, with
     on-demand row reads. Returned by SafetensorsCollection.get_tensor_handle() so modules can
     stream rows of very large tensors (e.g. hashed n-gram embedding tables) instead of loading
-    them. Reads use pread on a shared fd and are thread-safe.
+    them. Reads are positioned and thread-safe: pread on a shared fd (Linux), ReadFile with
+    per-call OVERLAPPED offsets on a shared overlapped HANDLE (Windows).
     """
 
     def __init__(self, key: str, filename: str, abs_offset: int, shape: list, dtype: torch.dtype):
@@ -205,27 +289,55 @@ class DiskTensorHandle:
 
     def _ensure_open(self):
         if self.fd is None:
-            self.fd = os.open(self.filename, os.O_RDONLY)
+            if os.name == "nt":
+                # overlapped + unbuffered HANDLE as an int; ngram_gather_cpu takes it in place
+                # of an fd and requires exactly these flags (it reads sector-aligned spans)
+                self.fd = _win_open_stream(self.filename)
+            else:
+                self.fd = os.open(self.filename, os.O_RDONLY)
         return self.fd
 
     def close(self):
         if self.fd is not None:
-            os.close(self.fd)
+            if os.name == "nt":
+                _k32.CloseHandle(self.fd)
+            else:
+                os.close(self.fd)
             self.fd = None
+
+    def _ref_fd(self):
+        # Reference reads on Windows go through a transient handle, not self.fd: buffered reads
+        # on a long-lived file object leave a live cache map on the file, which serializes the
+        # unbuffered fast-path gathers at ~QD 1 for as long as the file object stays open (see
+        # ngram_gather_win.cpp). A transient object's map dies shortly after close.
+        if os.name == "nt":
+            return _win_open_ref(self.filename), True
+        return self._ensure_open(), False
+
+    @staticmethod
+    def _ref_fd_close(fd, transient):
+        if transient:
+            _k32.CloseHandle(fd)
 
     def read_range(self, start: int, end: int) -> torch.Tensor:
         """Contiguous rows [start, end) as a CPU tensor in the stored dtype."""
         assert 0 <= start <= end <= self.num_rows
-        fd = self._ensure_open()
+        fd, transient = self._ref_fd()
         nbytes = (end - start) * self.row_bytes
         buf = bytearray(nbytes)
         mv = memoryview(buf)
         pos = 0
         base = self.abs_offset + start * self.row_bytes
-        while pos < nbytes:
-            got = os.preadv(fd, [mv[pos:]], base + pos)
-            assert got > 0, f"short read from {self.filename}"
-            pos += got
+        try:
+            while pos < nbytes:
+                if os.name == "nt":
+                    got = _win_pread_into(fd, mv[pos:], base + pos)
+                else:
+                    got = os.preadv(fd, [mv[pos:]], base + pos)
+                assert got > 0, f"short read from {self.filename}"
+                pos += got
+        finally:
+            self._ref_fd_close(fd, transient)
         return torch.frombuffer(buf, dtype = self.dtype).view(end - start, *self.row_shape)
 
     def read_rows(self, indices: torch.Tensor) -> torch.Tensor:
@@ -238,24 +350,32 @@ class DiskTensorHandle:
         out = torch.empty((n, *self.row_shape), dtype = self.dtype)
         if n == 0:
             return out
-        fd = self._ensure_open()
+        fd, transient = self._ref_fd()
         order = torch.argsort(idx)
         sidx = idx[order].tolist()
         out_flat = out.view(n, -1)
         rb = self.row_bytes
         run_start = 0
         j = 0
-        while j < n:
-            # extend run while file rows stay consecutive
-            k = j + 1
-            while k < n and sidx[k] == sidx[k - 1] + 1:
-                k += 1
-            nbytes = (k - j) * rb
-            buf = os.pread(fd, nbytes, self.abs_offset + sidx[j] * rb)
-            assert len(buf) == nbytes, f"short read from {self.filename}"
-            rows = torch.frombuffer(bytearray(buf), dtype = self.dtype).view(k - j, -1)
-            out_flat[order[j:k]] = rows
-            j = k
+        try:
+            while j < n:
+                # extend run while file rows stay consecutive
+                k = j + 1
+                while k < n and sidx[k] == sidx[k - 1] + 1:
+                    k += 1
+                nbytes = (k - j) * rb
+                if os.name == "nt":
+                    buf = bytearray(nbytes)
+                    got = _win_pread_into(fd, memoryview(buf), self.abs_offset + sidx[j] * rb)
+                    assert got == nbytes, f"short read from {self.filename}"
+                else:
+                    buf = bytearray(os.pread(fd, nbytes, self.abs_offset + sidx[j] * rb))
+                    assert len(buf) == nbytes, f"short read from {self.filename}"
+                rows = torch.frombuffer(buf, dtype = self.dtype).view(k - j, -1)
+                out_flat[order[j:k]] = rows
+                j = k
+        finally:
+            self._ref_fd_close(fd, transient)
         return out
 
 
@@ -304,6 +424,7 @@ class SafetensorsCollection:
         # partially-external block per module stays pinned after an unload
         self.arena = {}                    # device index -> [block (uint8), fill offset]
         self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
+        self.deferred_arena = True
 
 
     def add_tensor_files(
@@ -508,23 +629,51 @@ class SafetensorsCollection:
 
 
     ARENA_BLOCK = 128 << 20        # slab block size
-    ARENA_MAX_TENSOR = 64 << 20    # larger tensors get their own allocation (few, no waste)
+    # Larger tensors get their own allocation (few, negligible allocator overhead at this
+    # size). The cap matters even with first-fit backfill: a dense model's 32-64MB projections
+    # shed block tails faster than its scarce small-tensor traffic can pack them (issue #313)
+    ARENA_MAX_TENSOR = 16 << 20
     ARENA_ALIGN = 256
+    ARENA_MAX_OPEN = 8             # open (partially filled) blocks kept per device
+    ARENA_PRUNE = 4096             # remaining bytes below which a block counts as full
+
+    def release_arena(self):
+        """Drop the open-block list. Blocks stay alive exactly as long as tensors sliced from
+        them do; the list itself would otherwise keep partially filled blocks resident after
+        their tensors are gone (model unload)"""
+        self.arena = {}
+
 
     def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool):
-        """Persistent weight-tensor allocation: carve from the device's slab block while a
-        deferred-load bracket is open, falling back to a plain allocation otherwise."""
+        """Persistent weight-tensor allocation: carve from the device's slab blocks while a
+        deferred-load bracket is open, falling back to a plain allocation otherwise. First-fit
+        over the open blocks, oldest first, so a block tail left by a tensor that did not fit
+        is packed by later small tensors instead of being abandoned (issue #313: with a single
+        bump block, a dense model's 32-64MB projections left GBs of dead tails). The open list
+        is bounded: blocks are dropped once effectively full, and past ARENA_MAX_OPEN the
+        smallest remainder is dropped, so load/unload churn cannot pin unbounded tails (the
+        weight tensors themselves keep their blocks alive)."""
         device = torch.device(device)
         nbytes = math.prod(shape) * dtype.itemsize
-        if not (self.arena_enable and self.deferred_mode and device.type == "cuda"
+        if not (self.arena_enable and self.deferred_mode and self.deferred_arena and device.type == "cuda"
                 and 0 < nbytes <= self.ARENA_MAX_TENSOR):
             return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
-        blk, off = self.arena.get(device.index, (None, 0))
-        off = -(-off // self.ARENA_ALIGN) * self.ARENA_ALIGN
-        if blk is None or off + nbytes > blk.numel():
-            blk = torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device)
-            off = 0
-        self.arena[device.index] = (blk, off + nbytes)
+        blocks = self.arena.setdefault(device.index, [])
+        for entry in blocks:
+            blk = entry[0]
+            off = -(-entry[1] // self.ARENA_ALIGN) * self.ARENA_ALIGN
+            if off + nbytes <= blk.numel():
+                break
+        else:
+            blk, off = torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device), 0
+            entry = [blk, 0]
+            blocks.append(entry)
+            if len(blocks) > self.ARENA_MAX_OPEN:
+                # index-based removal: list.remove would compare entries elementwise (tensors)
+                del blocks[min(range(len(blocks)), key = lambda i: blocks[i][0].numel() - blocks[i][1])]
+        entry[1] = off + nbytes
+        if blk.numel() - entry[1] < self.ARENA_PRUNE:
+            blocks[:] = [e for e in blocks if e is not entry]
         t = blk[off : off + nbytes].view(dtype).view(shape)
         if zeros:
             t.zero_()
@@ -633,6 +782,7 @@ class SafetensorsCollection:
                     else:
                         temp_tensor = None
                     self.deferred_loads.append({
+                        "key": key,
                         "filename": filename,
                         "file_offset": offset + beg,
                         "bytesize": bytesize,
@@ -713,6 +863,19 @@ class SafetensorsCollection:
         return tensor
 
 
+    def release_file(self, filename: str):
+        """
+        Close the loader's persistent handle for one file (reopened on demand if a later load
+        needs it). Modules that stream a file with unbuffered reads call this after their
+        buffered loads from it: on Windows, a file object that has done cached reads keeps a
+        live cache map on the file, and noncached reads coherency-check against it at ~QD 1
+        until it dies with the file object (see ngram_gather_win.cpp).
+        """
+        h = self.handles.get(filename)
+        if h:
+            ext.stloader_close_file(h)
+            self.handles[filename] = None
+
     def close(self):
         assert self.new_tensors is None
         if self.first_open_time is not None:
@@ -741,9 +904,13 @@ class SafetensorsCollection:
         self.new_tensors = new_tensors
 
 
-    def begin_deferred_load(self):
+    def begin_deferred_load(self, arena: bool = True):
+        """arena = False keeps this load's tensors out of the slab arena: for modules whose
+        weights leave the device right after loading (vision_pinned), slab slices would pin
+        their whole 128 MB blocks in VRAM for the lifetime of the neighbouring tensors."""
         assert not self.deferred_mode
         self.deferred_mode = True
+        self.deferred_arena = arena
 
 
     def end_deferred_load(self):
@@ -818,7 +985,14 @@ class SafetensorsCollection:
                         if w["transpose"]:
                             src = src.T
                         unpadded_idx = tuple(slice(0, s) for s in src.shape)
-                        w["dest_tensor"][unpadded_idx].copy_(src)
+                        try:
+                            w["dest_tensor"][unpadded_idx].copy_(src)
+                        except RuntimeError as e:
+                            raise ValueError(
+                                f"Deferred load of {w['key']}: source shape {tuple(src.shape)} "
+                                f"(transpose = {w['transpose']}) does not fit destination "
+                                f"{tuple(w['dest_tensor'].shape)}"
+                            ) from e
 
             if cpu_loads:
                 loads = flatten(cpu_loads)
@@ -891,6 +1065,11 @@ class VariantSafetensorsCollection(SafetensorsCollection):
             if rx.fullmatch(key):
                 return stc
         return self.main
+
+
+    def release_file(self, filename: str):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.release_file(filename)
 
 
     def has_tensor(
@@ -1029,9 +1208,9 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         raise NotImplementedError()
 
 
-    def begin_deferred_load(self):
+    def begin_deferred_load(self, arena: bool = True):
         for stc in [s for _, _, s in self.stcs] + [self.main]:
-            stc.begin_deferred_load()
+            stc.begin_deferred_load(arena)
 
 
     def end_deferred_load(self):
@@ -1042,3 +1221,8 @@ class VariantSafetensorsCollection(SafetensorsCollection):
     def abort_deferred_load(self):
         for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.abort_deferred_load()
+
+
+    def release_arena(self):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.release_arena()

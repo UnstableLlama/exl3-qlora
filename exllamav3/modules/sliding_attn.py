@@ -504,7 +504,8 @@ class SlidingAttention(Module):
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
-            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            # Staging buffers span the padded K, not hidden_size (see attn.py)
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.k_proj.in_features), torch.half, "kvh_1")
             self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
 
         # Test if Q and G proj can be fused
@@ -525,7 +526,7 @@ class SlidingAttention(Module):
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
-            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.q_proj.in_features), torch.half, "qgh_1")
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
@@ -552,6 +553,8 @@ class SlidingAttention(Module):
     def unload(self):
         super().unload()
 
+        for rl in self.recurrent_layers:
+            rl.free()
         self.bc_attn = {}
         self.rope = None
         self.sinks = None
@@ -626,12 +629,16 @@ class SlidingAttention(Module):
             else:
                 g = None
         else:
-            x = x.view(1, bsz * q_len, dim)
+            # The fused path doesn't zero-extend the input for padded in_features: do it here (K is the
+            # padded width the mgemm kernel reads)
+            if x.shape[-1] < self.q_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.q_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.q_proj.in_features)
             if bsz * q_len == 1:
                 qgh = self.prealloc_qgh_1
                 qg = self.prealloc_qg_1
             else:
-                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qgh = torch.empty((2, bsz * q_len, self.q_proj.in_features), dtype = torch.half, device = x.device)
                 qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -653,7 +660,9 @@ class SlidingAttention(Module):
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
             if has_runtime_lora(self.q_proj, self.g_proj):
-                xf = x.view(bsz * q_len, dim)
+                xf = x.view(bsz * q_len, -1)
+                if xf.shape[-1] != dim:
+                    xf = xf[:, :dim].contiguous()
                 self.q_proj.apply_lora(xf, q.view(bsz * q_len, -1))
                 self.g_proj.apply_lora(xf, g.view(bsz * q_len, -1))
 
@@ -662,12 +671,14 @@ class SlidingAttention(Module):
             v = self.v_proj.forward(x, params)
 
         else:
-            x = x.view(1, bsz * q_len, dim)
+            if x.shape[-1] < self.k_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.k_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.k_proj.in_features)
             if bsz * q_len == 1:
                 kvh = self.prealloc_kvh_1
                 kv = self.prealloc_kv_1
             else:
-                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kvh = torch.empty((2, bsz * q_len, self.k_proj.in_features), dtype = torch.half, device = x.device)
                 kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -689,7 +700,9 @@ class SlidingAttention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             if has_runtime_lora(self.k_proj, self.v_proj):
-                xf = x.view(bsz * q_len, dim)
+                xf = x.view(bsz * q_len, -1)
+                if xf.shape[-1] != dim:
+                    xf = xf[:, :dim].contiguous()
                 self.k_proj.apply_lora(xf, k.view(bsz * q_len, -1))
                 self.v_proj.apply_lora(xf, v.view(bsz * q_len, -1))
 
@@ -1059,6 +1072,7 @@ class SlidingAttention(Module):
                 "sliding_window_overp": self.sliding_window_overp,
                 "logit_softcapping": self.logit_softcapping,
                 "full_gate": self.full_gate,
+                "gate_softplus": self.gate_softplus,
             },
             "num_kv_heads": self.num_kv_heads,
             "n_gqa": self.num_q_heads // self.num_kv_heads,

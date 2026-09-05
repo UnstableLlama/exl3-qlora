@@ -732,8 +732,8 @@ class GatedMLP(Module):
                 if self.bc is not None and bsz * q_len <= MAX_BSZN \
                         and not (gu_lora or down_lora):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-                    x = x.view(1, bsz * q_len, dim)
-                    self.bc.run_bszN(x, d.view(x.shape))
+                    xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
+                    self.bc.run_bszN(xv, d.view(xv.shape))
 
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
@@ -747,11 +747,11 @@ class GatedMLP(Module):
                     del d_
 
                 else:
-                    x = x.view(1, bsz * q_len, dim)
+                    xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     guh = torch.empty((2, bsz * q_len, dim), dtype = self.interm_dtype, device = x.device)
                     gu = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
                     ext.exl3_mgemm(
-                        x,
+                        xv,
                         self.multi_gu[s].ptrs_trellis,
                         gu,
                         self.multi_gu[s].ptrs_suh,
