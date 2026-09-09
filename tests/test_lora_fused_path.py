@@ -78,25 +78,52 @@ def test_gated_mlp_fused_branches_guarded():
     assert "self.ups[s].apply_lora(xf" in gu_block, \
         "GatedMLP: multi_gu branch lost its up LoRA delta"
     # the BC bszN graph (v1.2.0: generalized from bsz-1 to bsz*q_len <=
-    # MAX_BSZN) fuses the whole MLP (gate/up/act/down) and cannot take a
-    # post-hoc delta, so it must yield to an unfused branch when ANY of the
-    # three carries a LoRA
+    # MAX_BSZN) fuses the whole MLP (gate/up/act/down); since stage 1 of
+    # doc/lora_inference_plan.md it takes the adapter as in-graph lora_gemv
+    # nodes, and the dispatch must go through lora_graph_ok (which pushes the
+    # adapters to the C++ handles and declines for ones the graph can't take)
     assert re.search(
         r"self\.bc is not None and bsz \* q_len <= MAX_BSZN[^:]*?"
-        r"not \(gu_lora or down_lora\)",
-        src, re.S), "GatedMLP: BC bszN branch lost its runtime-LoRA guard"
+        r"lora_graph_ok\(\*self\.gates, \*self\.ups, \*self\.downs\)",
+        src, re.S), "GatedMLP: BC bszN branch lost its runtime-LoRA dispatch check"
+    # the handles must reach the C++ class even in fused-mgemm mode, or the
+    # graph has no LoRA slots to read
+    assert "g0.inner.bc if g0.quant_type == \"exl3\" else None" in src, \
+        "GatedMLP: BC_GatedMLP no longer receives the gate handle in mgemm mode"
 
 
-@pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
-def test_bc_attn_graph_dispatch_guarded(fname):
-    # bc_attn/bc_swa graph-captured decode blocks run projections through
-    # o_proj as one C++ call; the dispatch (not the cached graph build) must
-    # check for a runtime LoRA on every involved projection
-    src = _src("exllamav3", "modules", fname)
+def test_bc_attn_graph_dispatch_lora_aware():
+    # bc_attn graph-captured decode blocks run projections through o_proj as
+    # one C++ call and, since stage 1, carry the adapter as in-graph nodes; the
+    # dispatch (not the cached graph build) must go through lora_graph_ok on
+    # every involved projection so the handles hold the current adapters
+    src = _src("exllamav3", "modules", "attn.py")
+    assert re.search(
+        r"bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and\s*"
+        r"lora_graph_ok\(self\.q_proj, self\.k_proj, self\.v_proj,",
+        src), "attn.py: graph-captured decode dispatch lost its runtime-LoRA dispatch check"
+
+
+def test_bc_swa_graph_dispatch_guarded():
+    # sliding_attn's bc_swa graph is NOT wired for in-graph LoRA yet; it must
+    # still yield to the python path while any involved projection is adapted
+    src = _src("exllamav3", "modules", "sliding_attn.py")
     assert re.search(
         r"bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and\s*"
         r"not has_runtime_lora\(self\.q_proj, self\.k_proj, self\.v_proj,",
-        src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA guard"
+        src), "sliding_attn.py: graph-captured decode dispatch lost its runtime-LoRA guard"
+
+
+def test_lora_graph_ok_falls_back_for_unsupported_adapters():
+    # lora_graph_ok is the one place that decides graph-vs-fallback under an
+    # adapter: it must honor EXL3_LORA_GRAPH=0, refuse non-EXL3 / handle-less
+    # linears, and push the adapters to the handles it approves
+    src = _src("exllamav3", "modules", "linear.py")
+    body = src[src.index("def lora_graph_ok("):src.index("class Linear(")]
+    assert "if not _lora_graph_enable:\n        return False" in body
+    assert 'l.quant_type != "exl3"' in body and 'getattr(inner, "bc", None) is None' in body
+    assert "l.sync_lora_bc()" in body
+    assert 'os.environ.get("EXL3_LORA_GRAPH", "1")' in src
 
 
 def test_mla_graph_dispatch_guarded():

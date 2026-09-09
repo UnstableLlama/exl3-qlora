@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from functools import cached_property
 from typing_extensions import override
 import torch
@@ -9,6 +10,7 @@ from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from .lora_state import pack_lora, lora_pack_key
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -40,6 +42,41 @@ def has_runtime_lora(*linears) -> bool:
     projections like g_proj).
     """
     return any(l is not None and l.lora_a_tensors for l in linears)
+
+
+# EXL3_LORA_GRAPH=0 restores the pre-stage-1 behavior: every graph path yields to the unfused
+# dispatch while an adapter is loaded (the A/B reference for the in-graph LoRA nodes)
+_lora_graph_enable = os.environ.get("EXL3_LORA_GRAPH", "1") != "0"
+
+
+def lora_graph_ok(*linears) -> bool:
+    """
+    May a graph-captured path that supports in-graph runtime LoRA (BC_Attention, BC_GatedMLP;
+    doc/lora_inference_plan.md stage 1) run over these Linears? True with no adapter loaded, or
+    when every adapted Linear is an EXL3 one with a BC handle -- in which case its packed
+    adapter is pushed to that handle here (``Linear.sync_lora_bc``), so the C++ side sees the
+    current tensors when it decides its graph flavour. False sends the caller to the unfused
+    dispatch, which applies the adapter through ``Linear.forward`` / the mgemm delta-add.
+    Cheap on the no-adapter path (one empty-dict check per Linear, plus clearing a handle that
+    still holds an adapter that was just unloaded). ``None`` entries are allowed.
+    """
+    present = [l for l in linears if l is not None]
+    if not has_runtime_lora(*present):
+        for l in present:
+            if l._lora_bc_key is not None:
+                l.sync_lora_bc()
+        return True
+    if not _lora_graph_enable:
+        return False
+    for l in present:
+        if not l.lora_a_tensors:
+            continue
+        inner = l.inner
+        if l.quant_type != "exl3" or inner is None or getattr(inner, "bc", None) is None:
+            return False
+    for l in present:
+        l.sync_lora_bc()
+    return True
 
 
 class Linear(Module):
@@ -110,6 +147,10 @@ class Linear(Module):
         self.qgroup = qgroup or key
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
+        # (pack key, packed pair) cache for lora_packed(); see modules/lora_state.py
+        self._lora_packed = None
+        # pack key last pushed to inner.bc (sync_lora_bc); None = handle holds no adapter
+        self._lora_bc_key = None
         # Optional fully fine-tuned replacement weight ([in, out], fp16) installed by
         # an adapter's modules_to_save (e.g. native QLoRA --train-head). When set, it
         # supersedes the quantized base matmul for this Linear. Default None -> no-op.
@@ -500,6 +541,8 @@ class Linear(Module):
         self.inner = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
+        self._lora_packed = None
+        self._lora_bc_key = None
 
 
     @override
@@ -666,6 +709,54 @@ class Linear(Module):
         if self.post_scale != 1.0:
             x *= self.post_scale
         return x
+
+
+    def lora_packed(self) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        """
+        The ONE effective runtime adapter for this Linear -- ``(A [K, R],
+        B [R, N], R)`` with every loaded adapter concatenated along the rank
+        dim -- or None when no adapter is loaded. This is what the fused
+        decode kernels consume (doc/lora_inference_plan.md, stage 1): a
+        single adapter packs to its own slot tensors with no copy, so an
+        in-place ``set_runtime_lora`` update keeps the same data pointers;
+        several adapters pack to a cached concatenation, rebuilt only when
+        the slot set changes (``lora_pack_key``).
+        """
+        if not self.lora_a_tensors:
+            self._lora_packed = None
+            return None
+        key = lora_pack_key(self.lora_a_tensors, self.lora_b_tensors)
+        cached = self._lora_packed
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        packed = pack_lora(self.lora_a_tensors, self.lora_b_tensors,
+                           self.in_features, self.out_features)
+        self._lora_packed = (key, packed)
+        return packed
+
+
+    def sync_lora_bc(self) -> bool:
+        """
+        Push the packed adapter (or its absence) to this Linear's ``inner.bc`` handle, the
+        BC_LinearEXL3 the graph-captured decode paths read. No-op when the pushed state already
+        matches (compared by pack key, which an in-place ``set_runtime_lora`` update leaves
+        unchanged -- the C++ side then sees the new values through the same pointers).
+        Returns True when the handle now carries an adapter.
+        """
+        inner = self.inner
+        bc = getattr(inner, "bc", None) if inner is not None else None
+        packed = self.lora_packed()
+        key = self._lora_packed[0] if packed is not None else None
+        if bc is None:
+            self._lora_bc_key = None
+            return False
+        if key != self._lora_bc_key:
+            if packed is None:
+                bc.clear_lora()
+            else:
+                bc.set_lora(packed[0], packed[1])
+            self._lora_bc_key = key
+        return packed is not None
 
 
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):

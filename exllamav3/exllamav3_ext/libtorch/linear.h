@@ -61,4 +61,23 @@ struct BC_LinearEXL3
     void run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph);
     void run(const at::Tensor& x, at::Tensor& y);
     at::Tensor run_alloc(const at::Tensor& x, int64_t out_features, bool output_fp32);
+
+    // Runtime LoRA (doc/lora_inference_plan.md, stage 1): the packed A (K, R) / B (R, N) fp16
+    // pair for this linear, pushed from Python (Linear.sync_lora_bc). DATA ONLY: run()/run_gr()
+    // never apply it -- the graph classes that support an in-graph adapter (BC_GatedMLP,
+    // BC_Attention) emit the lora_gemv node explicitly, because its input pointer has to be
+    // patched per replay exactly like the GEMM's, which only the owning graph can do
+    c10::optional<at::Tensor> lora_a;
+    c10::optional<at::Tensor> lora_b;
+
+    void set_lora(at::Tensor a, at::Tensor b)
+    {
+        TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && a.size(1) == b.size(0), "set_lora: A (K, R) / B (R, N) shape mismatch");
+        TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "set_lora: A/B must be contiguous");
+        lora_a = std::move(a);
+        lora_b = std::move(b);
+    }
+    void clear_lora() { lora_a.reset(); lora_b.reset(); }
+    bool has_lora() const { return lora_a.has_value(); }
+    int lora_rank() const { return has_lora() ? (int) lora_a->size(1) : 0; }
 };

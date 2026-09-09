@@ -185,6 +185,23 @@ def main(args):
 
     print(f" -- Bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
     print(f" -- Chunk size: {args.chunk_size}")
+
+    # Runtime adapter: measures the adapted decode path (doc/lora_inference_plan.md).
+    # --lora_noop keeps the adapted branch selection but zeroes every B so the LoRA
+    # math contributes nothing: the gap between that and --lora is the cost of the
+    # low-rank math itself, the gap to the no-adapter run is the cost of leaving
+    # the fused/graph paths (the Session-27 decomposition, reproducible here)
+    lora = None
+    if args.lora:
+        from exllamav3.model.lora import LoRA
+        lora = LoRA.from_directory(model, args.lora, lora_scaling = args.lora_scaling)
+        if args.lora_noop:
+            for target in lora.target_modules.values():
+                for b in target.lora_b_tensors.values():
+                    b.zero_()
+            print(f" -- Adapter loaded with B zeroed (--lora_noop): branch selection as adapted, LoRA math no-op")
+        else:
+            print(f" -- Adapter loaded: {len(lora.target_modules)} target modules")
     print()
 
     if not args.skip_prefill:
@@ -220,5 +237,8 @@ if __name__ == "__main__":
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
     parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")
     parser.add_argument("-sd", "--spec_dec", action = "store_true", help = "Test spec-decode seqlens 1..4")
+    parser.add_argument("-lora", "--lora", type = str, help = "Load a PEFT LoRA adapter directory before measuring (adapted decode path)", default = None)
+    parser.add_argument("-lora_scaling", "--lora_scaling", type = float, help = "Extra adapter scaling on top of alpha/r (default: 1.0)", default = 1.0)
+    parser.add_argument("-lora_noop", "--lora_noop", action = "store_true", help = "With --lora: zero the adapter's B matrices so the adapted branches run but the LoRA math contributes nothing (diagnostic)")
     _args = parser.parse_args()
     main(_args)

@@ -325,7 +325,8 @@ struct BC_Attention
         const c10::optional<at::Tensor>& inv_freq_override,
         int regime,
         int64_t t_total,
-        Graph* graph
+        Graph* graph,
+        bool lora = false
     );
 
 private:
