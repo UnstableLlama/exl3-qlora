@@ -186,11 +186,19 @@ def test_moe_expert_dispatch_guarded():
     assert re.search(
         r"self\.bc is not None and self\.support_quant_paths and not experts_lora",
         src), "BlockSparseMLP: BC single-expert path lost its runtime-LoRA guard"
-    # bszN graph (v1.2.0: replaces the bsz-1 graph; may embed shared experts
-    # + shared gate) skipped when the fused shared-expert linears carry a LoRA
+    # bszN kernels (v1.2.0: replace the bsz-1 graph; may embed shared experts
+    # + shared gate) are the last tier since v1.5.0, so a LoRA on the fused
+    # shared-expert linears must divert into the torch/fused branch instead
     assert "sh_fused_lora" in src and re.search(
-        r"elif bszn_eligible and not sh_fused_lora",
-        src), "BlockSparseMLP: bszN graph lost its shared-experts LoRA guard"
+        r"no_reconstruct or experts_lora or sh_fused_lora or",
+        src), "BlockSparseMLP: bszN kernels lost their shared-experts LoRA guard"
+    assert re.search(
+        r"assert bszn_eligible and not experts_lora and not sh_fused_lora",
+        src), "BlockSparseMLP: bszN tier lost its LoRA assertion"
+    # batched reconstruct tier (v1.5.0) reads the base trellis; skipped under LoRA
+    assert re.search(
+        r"if not experts_lora:\s*\n\s*recon = self\._batch_recon_layer\(y\)",
+        src), "BlockSparseMLP: batched reconstruct tier lost its runtime-LoRA guard"
     # raw-weight shared gate projection falls back to Linear.forward
     assert re.search(
         r"bsz > 32 or has_runtime_lora\(self\.shared_gate\)",
