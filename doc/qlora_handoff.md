@@ -1,5 +1,23 @@
 # QLoRA-on-EXL3 — Handoff & Next-Step Plan
 
+> **Verification follow-up (2026-09-16):** on
+> `claude/laughing-fermat-bepdmc`, verified the realtime head-chunking change
+> in `2f0860e`. The new coordinator test passed in isolation. Reproduced the
+> `test_model_parker` missing-`infer_params` failure using the parent commit's
+> test; `aux_offload.py` is byte-identical across those commits. Fixed the
+> stub to provide `infer_params.vision_pinned=False`, matching the real Config
+> surface; no production parker change needed. Expanded the coordinator test
+> to cover default 32768, opt-out 0, and a dict-loaded 8192 override reaching
+> the native constructor, with temporary module replacement restored on exit.
+> All 21 realtime tests and all 11 fused-CE tests pass on CPU PyTorch
+> 2.14.0+cpu (Python 3.14) in `/tmp/exl3-verify-venv`:
+> `OMP_NUM_THREADS=1 /tmp/exl3-verify-venv/bin/python tests/test_realtime.py`
+> and the same command with `tests/test_fused_ce.py`.
+> **Still pending:** actual Qwen 9B/27B ingests on the serving GPU; CPU tests
+> establish configuration wiring and loss/gradient parity, not peak VRAM or
+> resolution of the reported CUDA failures. Retry with the default first;
+> if memory remains tight, set realtime `head_vocab_chunk=8192`.
+
 > Working session handoff. Branch: **`claude/magical-mayer-fq6z4i`**.
 > Goal of the original task: prove whether **QLoRA fine-tuning on EXL3-quantized
 > weights** is possible, and get a visible end-to-end demo (fine-tune a small
@@ -66,6 +84,10 @@ bpw; ~50 GB on a 27B). Numbering below unchanged.
    **AFMoE (Trinity-Nano) added Session 31: dots sigmoid router + full-width
    attention gate + NoPE layers, box-validated with a fast-vs-legacy A/B —
    see the Session 31 notes,**
+   **Spark-X2.5 (headwise sigmoid attention gate + 3:1 sliding/full) added
+   Session 54, built + CPU-tested, awaiting its box validation — that session
+   also fixed a one-token sliding-window convention gap on every
+   sliding-window arch; see the Session 54 notes.**
    `unload()` restores base). Remaining here: the **full-curve Qwen3.6
    attention-only vs +experts A/B** — the 20-step matched read (Session 28)
    says experts ≈ tie (2.243 vs 2.260, baseline 2.616) and exonerates them
@@ -2478,7 +2500,9 @@ o_proj). Both were rejected by `assert_block_supported`. Both are now built:
   `assert_block_supported` accepts GDN blocks with the **split** projection
   layout (in_proj_qkv/z/b/a — Qwen3.5/3.6) and interleaved-gate attention,
   still rejects: fused qkvz/ba (Qwen3-Next layout), MoE (`BlockSparseMLP` →
-  Qwen3.5-MoE unsupported), headwise g_proj gating, mRoPE.
+  Qwen3.5-MoE unsupported), headwise g_proj gating, mRoPE. (Both of the
+  last two accepted later: mRoPE in Session 52, headwise gating in
+  Session 54.)
 - **`native_llama.py`**: `_gdn_forward` (norm → split projections → conv+silu
   → delta rule → gated norm → o_proj residual → shared `_mlp_out` MLP half;
   no RoPE, no attention bias — the recurrence is causal by construction;
@@ -5022,6 +5046,96 @@ the `mtp.*` tensors (by design). Pre-existing and unrelated:
 `tests/test_realtime.py` crashes on master since the v1.4.7 sync
 (`aux_offload.unpark` reads `config.infer_params` that the test's mock
 config lacks).
+
+### Session 54 — Spark-X2.5 (XHToken Spark-X2.5-4B): headwise attention output gate — built, awaiting box validation
+
+> Asked: does the trainer support `XHToken/Spark-X2.5-4B`? The inference
+> arch (`Spark2_5ForCausalLM`, `exllamav3/architecture/spark2_5.py`) came
+> in with the v1.4.9 sync; training rejected it at
+> `assert_block_supported` on the one feature nothing else here had: a
+> HEADWISE sigmoid attention output gate. Config (4B): 36 layers, hidden
+> 2560, 16 q / 4 kv heads, head_dim 256, `layer_types` 3 sliding : 1 full,
+> `sliding_window` 512, `headwise_attn_output_gate: true` with
+> `gate_attn_act_mode: sigmoid`, `hidden_act: gelu` (GeGLU), tied
+> embeddings, vocab 131072, `rope_parameters` per layer kind (full:
+> theta 5e6, `partial_rotary_factor` 0.25 → 64 of 256 dims rotated;
+> sliding: theta 1e4, full rotary). Everything but the gate was already a
+> read-from-modules feature (Gemma sliding/full + per-layer RoPE, Qwen-VL
+> partial rotary, GeGLU, tied head).
+
+**The gate.** `Attention` builds `g_proj` as `[hidden, num_q_heads]`
+(fp16, unquantized, `pad_to=1`) and the inference forward does
+`ext.mul_sigmoid_broadcast_(o, g)` on the `[b, t, nq, hd]` context — one
+sigmoid scalar per q head broadcast over head_dim — before the flatten and
+`o_proj` (`modules/attn.py`, `if self.headwise_gate:`). Now:
+
+- `backbone.assert_block_supported`: the headwise gate is accepted; what is
+  rejected instead is `gate_softplus` (Laguna's `mul_softplus_broadcast_`
+  variant) — the native forward applies sigmoid and must refuse rather than
+  gate with the wrong function.
+- `backbone.block_metadata` gains `headwise_gate`; `attn_gate_linear`
+  returns the gate for the headwise variant too (the caller reads
+  `full_gate` / `headwise_gate` to know which multiply).
+- `native_llama._block_forward`: `head_gate = g_proj(normed)` (`[b,t,nq]`)
+  on the block input; after attention, `ctx.view(b,t,nq,hd) *
+  sigmoid(head_gate)[..., None]`, sigmoid in fp32, before `o_proj` — the
+  same op the kernel does. All three attention paths (eager / flash /
+  varlen-packed) produce `ctx` first, so one multiply covers them.
+- **Adapter targets:** the headwise gate does NOT ride the default
+  `gate_proj` target (unlike AFMoE's full-width gate): it is a 16-output
+  linear, and a rank-64 adapter on it is r > out_features — and PEFT's
+  suffix match on `gate_proj` would not select `g_proj` either. It answers
+  to its own leaf `g_proj` and to `attn_gate_proj`, opt-in. Its `DiffLinear`
+  takes the fp16 path (`frozen_trellis_parts` → None → `get_weight_tensor`,
+  the same path the MoE routers take).
+
+**Sliding-window convention fix (affects Gemma3/4, MuseGlimmer, LFM2 too).**
+Found while checking Spark's 512 window against the inference forward. The
+module's `sliding_window` is the number of PREVIOUS tokens a query may see:
+the inference forward hands it to FlashAttention as `window_size=(w, 0)`
+(`attention_fn/common.get_window_size`), i.e. itself + `w` past keys — the
+Gemma3 arch subtracts 1 from HF's query-inclusive count for exactly this
+reason. The native forward's window has always been QUERY-INCLUSIVE
+(`_attn_bias` masks with a `-window` diagonal, flash passes
+`(window - 1, 0)`, `attn_varlen` documents "itself + window-1 previous"), but
+`block_metadata` copied `attn.sliding_window` through unchanged — so a
+training block saw one key FEWER than the inference block on every sliding
+layer. Invisible to every validate run so far: the argmax-parity prompts are
+far shorter than a 512/1024 window, so no query ever reached the band edge.
+`block_metadata` now emits `sliding_window + 1`; the eager mask, flash and
+varlen paths are untouched (they were consistent with each other).
+`tests/test_headwise_gate.py::test_native_window_semantics_match_inference`
+pins the mask to the `(w, 0)` rule. **Box implication:** Gemma / Spark runs
+at seq_len above the window now attend to exactly the inference window; the
+old one-token-short band was a tiny train/serve mismatch, not a corruption.
+Note that upstream's `spark2_5.py` passes HF's `sliding_window` (512)
+through raw where `gemma3.py` passes `sliding_window - 1`; if HF Spark2.5
+masks query-inclusively (the usual HF rule), exllamav3's Spark inference is
+one token wider than HF. Training mirrors exllamav3 inference, as the
+validate gate demands; that upstream question is out of scope here.
+
+**Tests (CPU).** `tests/test_native_llama.py` grew
+`test_spark_headwise_gate_block_matches_reference` (headwise gate on a
+sliding and a full layer vs an independent reference, GeGLU; a zeroed gate
+weight must change the output; grads reach the gate adapter when opted in).
+New `tests/test_headwise_gate.py`: backbone seam on mock modules (sigmoid
+accepted / softplus rejected / `attn_gate_linear` resolution; the
+`sliding_window` +1 conversion; native mask == FA2 `(w, 0)`). The full CPU
+gate (the v1.4.9 sync list + the new file) passes.
+
+**Not done / box checklist:** (1) quantize the 4B, run
+`qlora_validate_native.py --model <quant> --compute-dtype bfloat16` — and
+include at least one prompt LONGER than 512 tokens (`--prompts` with a long
+text) so the sliding band is actually exercised by the parity check; (2) a
+short SFT run with `prompt_format: auto` (its `default_chat_prompt` renders
+`<｜start▁of▁sentence｜><|System|>…<|Bot|></think>` and the turn-end token
+resolves to the tokenizer's `<｜end▁of▁sentence｜>` eos; verify with
+`--inspect 3`), then `qlora_infer_native.py --adapter` to see the adapter
+steer generation on the native path; (3) the fused `q_k_v_proj` source
+tensor is split into per-projection trellises at conversion, so the trainer
+sees ordinary q/k/v linears — but no training-supported arch had this
+layout before, so watch the validate gate; (4) `g_proj` adapter training is
+wired and unit-tested but has no box evidence.
 
 ---
 

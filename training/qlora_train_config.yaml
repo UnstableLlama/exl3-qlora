@@ -101,7 +101,11 @@ targets: null             # target module leaf names; null = default attn+mlp pr
                           #   (q/k/v/o_proj + gate/up/down_proj); [] = no per-linear LoRA (for
                           #   embed/head-only runs). MoE models: plain gate/up/down_proj adapt the
                           #   dense/shared-expert paths only; add expert_gate_proj expert_up_proj
-                          #   expert_down_proj to also adapt the routed experts (router always frozen)
+                          #   expert_down_proj to also adapt the routed experts (router always frozen).
+                          #   Attention output gates: AFMoE's full-width self_attn.gate_proj rides
+                          #   gate_proj (or attn_gate_proj alone); Spark-X2.5's headwise
+                          #   self_attn.g_proj (one scalar per head) is opt-in only -- add g_proj
+                          #   or attn_gate_proj (use a small r: it has num_heads outputs)
 expert_r: null            # rank for ROUTED-expert adapters when it should differ from r. One
                           #   adapter pair per expert per layer, so on a many-expert model use a
                           #   small value (PEFT's MoE recipe: ~r/num_experts, min 1). null = same as r

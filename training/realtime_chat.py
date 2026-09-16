@@ -76,6 +76,11 @@ def parse_args():
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--seq-len", type=int, default=2048)
+    p.add_argument("--head-vocab-chunk", type=int, default=None,
+                   help="LM-head loss in vocab-column tiles of this size "
+                        "(default: the coordinator's 32768; 0 = reconstruct "
+                        "the whole head at once, which spikes ~12 GB on a "
+                        "248k-vocab 27B and OOMs a serving card)")
     p.add_argument("--checkpoint-dir", default=None)
     p.add_argument("--checkpoint-every", type=int, default=0,
                    help="checkpoint every N optimizer steps (0 = manual only)")
@@ -134,6 +139,8 @@ def main():
             r=args.r, alpha=args.alpha, target_modules=args.targets,
             lr=args.lr, batch_size=args.batch, grad_accum=args.grad_accum,
             seq_len=args.seq_len, checkpoint_dir=args.checkpoint_dir,
+            **({} if args.head_vocab_chunk is None
+               else {"head_vocab_chunk": args.head_vocab_chunk}),
             checkpoint_every=args.checkpoint_every,
             keep_checkpoints=args.keep_checkpoints,
             offload_when_idle=not args.no_idle_offload,

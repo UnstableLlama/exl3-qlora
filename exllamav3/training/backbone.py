@@ -323,11 +323,13 @@ def assert_block_supported(block):
     sigmoid top-k router incl. the optional shared expert + sigmoid shared
     gate (Qwen3-MoE, Qwen3.5-MoE), the ungated shared expert (AFMoE) and the
     Gemma4 MoE layout (alt residual channel + router/routed/shared extra
-    norms). What it still cannot do is rejected here: fused-qkvz
-    GatedDeltaNet (the Qwen3-Next layout), grouped ds3-router MoE, HEADWISE
-    attention gating (per-head scalar g_proj), and non-NeoX RoPE. mRoPE and
-    partial rotary (Qwen-VL text towers) are ACCEPTED for text-only training
-    -- see the notes at the assertions below.
+    norms), and the HEADWISE sigmoid attention output gate (Spark-X2.5: a
+    per-head scalar ``g_proj`` ``[hidden, nq]`` broadcast over head_dim).
+    What it still cannot do is rejected here: fused-qkvz GatedDeltaNet (the
+    Qwen3-Next layout), grouped ds3-router MoE, the softplus headwise gate
+    (Laguna), and non-NeoX RoPE. mRoPE and partial rotary (Qwen-VL text
+    towers, Spark-X2.5 full-attention layers) are ACCEPTED for text-only
+    training -- see the notes at the assertions below.
     """
     from ..modules import GatedMLP, Attention, SlidingAttention
     key = getattr(block, "key", "?")
@@ -387,14 +389,18 @@ def assert_block_supported(block):
         f"{key}: only softmax Attention/SlidingAttention, GatedDeltaNet or " \
         f"ShortConv is supported, got {type(attn).__name__}"
     # q/k/v norms and output gating ARE supported (read from the modules):
-    # the interleaved gate (Qwen3.5 full-attn layers, folded into q_proj) and
-    # the separate FULL-width g_proj (AFMoE: sigmoid over the whole flattened
-    # context, applied before o_proj). Only the headwise variant (a scalar
-    # gate per head, broadcast over head_dim) is not wired up.
+    # the interleaved gate (Qwen3.5 full-attn layers, folded into q_proj), the
+    # separate FULL-width g_proj (AFMoE: sigmoid over the whole flattened
+    # context, applied before o_proj) and the HEADWISE g_proj (Spark-X2.5: one
+    # scalar per q head, sigmoid, broadcast over head_dim -- the inference
+    # mul_sigmoid_broadcast_ kernel). The softplus headwise variant (Laguna's
+    # mul_softplus_broadcast_) is not wired up: the native forward applies
+    # sigmoid, so it must refuse rather than silently gate with the wrong
+    # function.
     if getattr(attn, "g_proj", None) is not None:
-        assert not getattr(attn, "headwise_gate", False), \
-            f"{key}: headwise attention gating (per-head scalar g_proj) is " \
-            f"not supported; only the full-width gate is"
+        assert not getattr(attn, "gate_softplus", False), \
+            f"{key}: softplus headwise attention gating is not supported; " \
+            f"only the sigmoid gates (headwise / full-width / interleaved) are"
     # NoPE layers (AFMoE full-attention layers) are built with no rope_settings
     # and skip RoPE entirely -- accepted (block_metadata carries inv_freq=None
     # and the native forward skips the rotation, mirroring the inference
@@ -579,8 +585,18 @@ def block_metadata(block) -> dict:
                           and getattr(attn.rope, "mrope_section", None) is not None
                           else None),
         # Per-layer attention window: >0 means sliding (band) attention, else full
-        # causal (Gemma alternates local-sliding / global-full layers).
-        "sliding_window": int(sw) if sw not in (None, 0) else -1,
+        # causal (Gemma / Spark-X2.5 alternate local-sliding / global-full
+        # layers). CONVENTION: the module's ``sliding_window`` is the number of
+        # PREVIOUS tokens a query may see -- the inference forward hands it to
+        # FlashAttention as ``window_size=(sliding_window, 0)`` (attention_fn
+        # common.get_window_size), i.e. itself + ``sliding_window`` past keys
+        # (Gemma3's arch subtracts 1 from HF's query-inclusive count for this
+        # reason). The native forward's window is the QUERY-INCLUSIVE count
+        # (eager mask ``-window`` diagonal; flash ``(window - 1, 0)``; see
+        # attn_varlen), so convert here: +1, and the training block attends to
+        # exactly the keys the inference block does. Matters at any sequence
+        # longer than the window (Spark-X2.5: 512).
+        "sliding_window": int(sw) + 1 if sw not in (None, 0) and int(sw) > 0 else -1,
         # tanh logit softcapping on the attention scores (Gemma2; 0 = none).
         "softcap": float(getattr(attn, "logit_softcapping", 0.0) or 0.0),
         # MLP half (activation + dense/moe description).
@@ -597,6 +613,12 @@ def block_metadata(block) -> dict:
         # (attn_gate_linear).
         "full_gate": bool(getattr(attn, "full_gate", False)
                           and getattr(attn, "g_proj", None) is not None),
+        # Spark-X2.5: a headwise gate projection ([hidden, nq], fp16) on the
+        # block input; the per-head context [b, t, nq, hd] is multiplied by
+        # sigmoid(gate)[..., None] before the flatten + o_proj (inference:
+        # ext.mul_sigmoid_broadcast_(o, g)). Sourced from attn_gate_linear.
+        "headwise_gate": bool(getattr(attn, "headwise_gate", False)
+                              and getattr(attn, "g_proj", None) is not None),
         # Gemma applies a learned per-layer scalar to the whole residual stream at
         # block end (TransformerBlock.forward: x *= layer_scalar_f). None elsewhere.
         "layer_scalar": getattr(block, "layer_scalar_f", None),
@@ -711,17 +733,20 @@ def attn_projections(block):
 
 
 def attn_gate_linear(block):
-    """The separate full-width attention output gate ``Linear`` (AFMoE:
-    ``self_attn.gate_proj``, ``[hidden, nq*hd]``), or ``None``. The inference
-    forward multiplies the flattened attention context by ``sigmoid(g)``
-    before ``o_proj`` (``ext.mul_sigmoid_``); only returned when the module
-    gates full-width (the headwise variant is rejected at
-    ``assert_block_supported``)."""
+    """The separate attention output gate ``Linear`` of one block, or ``None``:
+    the full-width gate (AFMoE: ``self_attn.gate_proj``, ``[hidden, nq*hd]``;
+    inference multiplies the flattened context by ``sigmoid(g)`` before
+    ``o_proj`` -- ``ext.mul_sigmoid_``) or the headwise gate (Spark-X2.5:
+    ``self_attn.g_proj``, ``[hidden, nq]``, unquantized; inference multiplies
+    each head's context by its own ``sigmoid(g)`` -- ``ext.mul_sigmoid_broadcast_``).
+    ``block_metadata``'s ``full_gate`` / ``headwise_gate`` say which."""
     a = block.attn
     g = getattr(a, "g_proj", None)
-    if g is None or not getattr(a, "full_gate", False):
+    if g is None:
         return None
-    return g
+    if getattr(a, "full_gate", False) or getattr(a, "headwise_gate", False):
+        return g
+    return None
 
 
 def gdn_projections(block):
@@ -838,9 +863,10 @@ def attn_varlen(q, k, v, cu_seqlens, max_seqlen, sm_scale,
     wrapped in ``inference_mode`` and has a real backward. Requires
     ``head_dim <= 256`` (FA2 limit; the caller routes larger heads elsewhere).
 
-    ``window > 0`` is a sliding window expressed as exllamav3's per-layer
-    ``sliding_window`` (a token attends to itself + ``window - 1`` previous tokens
-    = ``window`` total). We hand ``attn_dispatch`` ``window - 1`` because its
+    ``window > 0`` is the native forward's QUERY-INCLUSIVE sliding window (a
+    token attends to itself + ``window - 1`` previous tokens = ``window`` total;
+    ``block_metadata`` derives it as the module's past-tokens-only
+    ``sliding_window`` + 1). We hand ``attn_dispatch`` ``window - 1`` because its
     ``get_window_size`` wraps the value as the FA2 left-window ``(w, 0)`` -- so the
     result matches the eager reference's ``-window`` diagonal exactly. ``softcap``
     applies tanh logit softcapping. Returns ``[total_tokens, num_heads, head_dim]``.

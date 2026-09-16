@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import types
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -563,7 +564,10 @@ class StubAuxModel:
     def __init__(self, devices, log=None, defer_idx=()):
         self.log = log if log is not None else []
         self.loaded_tp = False
-        self.config = types.SimpleNamespace(stc=StubSTC(self.log))
+        self.config = types.SimpleNamespace(
+            stc=StubSTC(self.log),
+            infer_params=types.SimpleNamespace(vision_pinned=False),
+        )
         self.modules = [
             StubAuxModule(d, self.log, str(i), defer=(i in defer_idx))
             for i, d in enumerate(devices)
@@ -673,6 +677,32 @@ def test_aux_offload_disabled():
     print("aux offload disabled: OK")
 
 
+def test_internal_net_build_passes_head_vocab_chunk():
+    """The coordinator's own net build must hand RealtimeConfig.head_vocab_chunk
+    to NativeLlamaQLoRA: the single-shot fused head reconstructs the whole
+    [hidden, vocab] weight plus two fp32 copies (~12 GB on a 248k-vocab 27B),
+    which OOMs a card that is also serving -- seen as CUDA driver errors under
+    expandable segments. Chunked by default; 0 opts out."""
+    captured = []
+
+    class FakeNative(StubNet):
+        def __init__(self, model, **kw):
+            super().__init__()
+            captured.append(kw)
+
+    fake = types.ModuleType("exl3train.native_llama")
+    fake.NativeLlamaQLoRA = FakeNative
+    with patch.dict(sys.modules, {"exl3train.native_llama": fake}):
+        RealtimeQLoRA(None, StubTokenizer(), RealtimeConfig())
+        assert captured[-1]["head_vocab_chunk"] == 32768
+        RealtimeQLoRA(None, StubTokenizer(), RealtimeConfig(head_vocab_chunk=0))
+        assert captured[-1]["head_vocab_chunk"] == 0
+        config = RealtimeConfig.from_dict({"head_vocab_chunk": 8192})
+        RealtimeQLoRA(None, StubTokenizer(), config)
+        assert captured[-1]["head_vocab_chunk"] == 8192
+    print("internal net build passes head_vocab_chunk: OK")
+
+
 def test_unload_reload():
     net = StubNet()
     rt = make_rt(net=net)
@@ -709,5 +739,6 @@ if __name__ == "__main__":
     test_aux_offload_in_ingest()
     test_aux_offload_restored_on_error()
     test_aux_offload_disabled()
+    test_internal_net_build_passes_head_vocab_chunk()
     test_unload_reload()
     print("\nALL OK")

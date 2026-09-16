@@ -40,6 +40,9 @@ dense-first-N-layers), MuseGlimmer text towers (the same full-width attention
 gate, scaleless q/k-norm with a q scale factor folded into sm_scale, sandwich
 norms, per-layer RoPE theta with NoPE full-attention layers, an unweighted
 norm on the token embeddings, and a logit pre-scale on the softcapped head),
+Spark-X2.5 (a HEADWISE sigmoid attention output gate keyed ``self_attn.g_proj``
+-- one scalar per q head broadcast over head_dim -- on 3:1 sliding/full
+layers with per-layer RoPE theta and partial rotary on the full layers, GeGLU),
 and BlockSparseMLP mixtures of experts with the std
 softmax top-k
 router (Qwen3-MoE, Qwen3.5-MoE incl. the shared expert + sigmoid shared
@@ -51,7 +54,7 @@ shared expert) -- see ``_moe_out``. It reduces bit-identically to
 the original Llama
 path when those features are absent. Still rejected loudly
 (``assert_block_supported``): fused-qkvz GatedDeltaNet (Qwen3-Next layout),
-grouped ds3-router MoE, HEADWISE attention gating (per-head scalar g_proj),
+grouped ds3-router MoE, the softplus headwise gate (Laguna),
 and non-NeoX RoPE (mRoPE and partial
 rotary are accepted for text-only training). Sample packing is not
 supported on GatedDeltaNet
@@ -813,15 +816,26 @@ class NativeLlamaQLoRA(nn.Module):
                 o_leaf = str(getattr(o_proj, "key", "o_proj")).split(".")[-1]
                 entry.o_proj = wrap(o_proj, "o_proj",
                                     ("o_proj", o_leaf) if o_leaf != "o_proj" else None)
-                # AFMoE full-width attention output gate (a separate linear the
-                # checkpoint keys as self_attn.gate_proj). It answers to the
-                # plain gate_proj target -- PEFT's suffix matching would adapt
-                # it under that name too -- and to attn_gate_proj for
-                # adapting it alone.
+                # Separate attention output gate linear, two flavours:
+                # - AFMoE full-width gate (checkpoint key self_attn.gate_proj).
+                #   It answers to the plain gate_proj target -- PEFT's suffix
+                #   matching would adapt it under that name too -- and to
+                #   attn_gate_proj for adapting it alone.
+                # - Spark-X2.5 headwise gate (checkpoint key self_attn.g_proj,
+                #   [hidden, nq] fp16 -- 16 outputs on the 4B). It answers to
+                #   its own leaf name and attn_gate_proj ONLY: the default
+                #   gate_proj target must not attach a rank-r adapter to a
+                #   16-wide linear (r > out_features), and PEFT's suffix
+                #   matching on gate_proj would not select g_proj either.
                 g_lin = backbone.attn_gate_linear(blk)
-                entry.g_proj = (wrap(g_lin, "gate_proj",
-                                     ("gate_proj", "attn_gate_proj"))
-                                if g_lin is not None else None)
+                if g_lin is None:
+                    entry.g_proj = None
+                elif meta.get("headwise_gate"):
+                    g_leaf = str(getattr(g_lin, "key", "g_proj")).split(".")[-1]
+                    entry.g_proj = wrap(g_lin, g_leaf, (g_leaf, "attn_gate_proj"))
+                else:
+                    entry.g_proj = wrap(g_lin, "gate_proj",
+                                        ("gate_proj", "attn_gate_proj"))
             entry.gates = nn.ModuleList(gates)
             entry.ups = nn.ModuleList(ups)
             entry.downs = nn.ModuleList(downs)
@@ -1262,6 +1276,11 @@ class NativeLlamaQLoRA(nn.Module):
         else:
             q = entry.q_proj(normed).view(bsz, t, nq, hd)
             out_gate = None
+        # Spark-X2.5 headwise gate: one scalar per q head from its own linear
+        # on the block input; applied per head to the context below (inference:
+        # g = g_proj(x), then ext.mul_sigmoid_broadcast_(o, g) on the
+        # [b, t, nq, hd] context before the flatten + o_proj).
+        head_gate = entry.g_proj(normed) if meta.get("headwise_gate") else None  # [b,t,nq]
         k = entry.k_proj(normed).view(bsz, t, nkv, hd)
         # use_k_as_v: V is the raw K projection (taken before k-norm/RoPE).
         v = k if entry.v_proj is None else entry.v_proj(normed).view(bsz, t, nkv, hd)
@@ -1400,6 +1419,13 @@ class NativeLlamaQLoRA(nn.Module):
         # fidelity, back to ctx dtype.
         if out_gate is not None:
             ctx = ctx * torch.sigmoid(out_gate.float()).to(ctx.dtype)
+        # Headwise gate (Spark-X2.5): sigmoid(gate) per head, broadcast over
+        # head_dim -- the same multiply the inference mul_sigmoid_broadcast_
+        # kernel does on the [b, t, nq, hd] context. sigmoid in fp32, back to
+        # ctx dtype.
+        if head_gate is not None:
+            hg = torch.sigmoid(head_gate.float()).to(ctx.dtype)      # [b,t,nq]
+            ctx = (ctx.reshape(bsz, t, nq, hd) * hg.unsqueeze(-1)).reshape(bsz, t, nq * hd)
         # o_proj re-casts its input to compute_dtype and outputs in it, so attn_out is
         # bf16 in a training run regardless of ctx's dtype -- no fp32 upcast of the
         # residual stream here (that is what the old `.float()` was costing).

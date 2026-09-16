@@ -119,7 +119,7 @@ from typing import Callable, Optional, Sequence
 import torch
 
 from .aux_offload import ModelParker
-from .fused_ce import DEFAULT_CHUNK
+from .fused_ce import DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK
 
 IGNORE_INDEX = -100
 
@@ -208,6 +208,19 @@ class RealtimeConfig:
     lora_dropout: float = 0.0
     compute_dtype: str = "bfloat16"             # "bfloat16" | "float16" | "float32"
     gradient_checkpointing: bool = True
+    head_vocab_chunk: int = DEFAULT_VOCAB_CHUNK # LM-head loss in vocab-column
+                                                # tiles of this many columns
+                                                # (0 = single-shot head). The
+                                                # one-shot path reconstructs
+                                                # the full [hidden, vocab]
+                                                # head plus two fp32 copies of
+                                                # it -- ~12 GB for a 248k-vocab
+                                                # 27B, on a card that is ALSO
+                                                # holding the served model and
+                                                # its KV cache. Tiled, the peak
+                                                # is a [hidden, chunk] slice;
+                                                # same total dequant work, same
+                                                # loss to within fp16 rounding.
 
     # -- optimization (lr is live-settable afterwards via ``rt.lr``) --
     lr: float = 1e-4                            # constant; no schedule (streams
@@ -406,6 +419,7 @@ class RealtimeQLoRA:
                 lora_dropout=self.config.lora_dropout,
                 compute_dtype=self.config.torch_compute_dtype(),
                 gradient_checkpointing=self.config.gradient_checkpointing,
+                head_vocab_chunk=self.config.head_vocab_chunk,
             )
         self.net = net
         self.net.train()
