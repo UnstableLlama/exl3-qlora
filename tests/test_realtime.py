@@ -673,6 +673,33 @@ def test_aux_offload_disabled():
     print("aux offload disabled: OK")
 
 
+def test_internal_net_build_passes_head_vocab_chunk():
+    """The coordinator's own net build must hand RealtimeConfig.head_vocab_chunk
+    to NativeLlamaQLoRA: the single-shot fused head reconstructs the whole
+    [hidden, vocab] weight plus two fp32 copies (~12 GB on a 248k-vocab 27B),
+    which OOMs a card that is also serving -- seen as CUDA driver errors under
+    expandable segments. Chunked by default; 0 opts out."""
+    captured = []
+
+    class FakeNative(StubNet):
+        def __init__(self, model, **kw):
+            super().__init__()
+            captured.append(kw)
+
+    fake = types.ModuleType("exl3train.native_llama")
+    fake.NativeLlamaQLoRA = FakeNative
+    sys.modules["exl3train.native_llama"] = fake
+    try:
+        RealtimeQLoRA(None, StubTokenizer(), RealtimeConfig())
+        assert captured[-1]["head_vocab_chunk"] == RealtimeConfig().head_vocab_chunk > 0
+        RealtimeQLoRA(None, StubTokenizer(), RealtimeConfig(head_vocab_chunk=0))
+        assert captured[-1]["head_vocab_chunk"] == 0
+        assert RealtimeConfig.from_dict({"head_vocab_chunk": 8192}).head_vocab_chunk == 8192
+    finally:
+        del sys.modules["exl3train.native_llama"]
+    print("internal net build passes head_vocab_chunk: OK")
+
+
 def test_unload_reload():
     net = StubNet()
     rt = make_rt(net=net)
@@ -709,5 +736,6 @@ if __name__ == "__main__":
     test_aux_offload_in_ingest()
     test_aux_offload_restored_on_error()
     test_aux_offload_disabled()
+    test_internal_net_build_passes_head_vocab_chunk()
     test_unload_reload()
     print("\nALL OK")

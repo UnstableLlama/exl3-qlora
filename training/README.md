@@ -136,7 +136,15 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   draft_model)` parks them OUT of VRAM for the duration of every ingest and
   restores them — same devices, value-exact, guaranteed even if the ingest
   fails — before serving resumes (`offload_aux_when_training`, on by default;
-  `exllamav3.training.ModelParker` is the reusable mechanism). The demo's
+  `exllamav3.training.ModelParker` is the reusable mechanism). The LM-head
+  loss runs in vocab-column tiles (`head_vocab_chunk`, default 32768;
+  `--head-vocab-chunk 0` for the single-shot head): the one-shot fused head
+  reconstructs the full `[hidden, vocab]` weight plus two fp32 copies of it,
+  ~12 GB on a 248k-vocab 27B (Qwen3.5), on a card that is also holding the
+  served model, its KV cache and a draft model — that surfaced as CUDA
+  driver errors (`device not ready`, an allocator INTERNAL ASSERT) under
+  expandable segments rather than a clean OOM. Tiled, the peak is one
+  `[hidden, 32768]` slice, same total dequant work. The demo's
   `--mtp` flag loads the model's MTP head for speculative decoding and wires
   exactly this. The offline trainer loads a component only when asked to
   (`--vision` for the tower, `--mtp-targets` to *train* the head — see the
