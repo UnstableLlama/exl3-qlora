@@ -14,6 +14,7 @@ import os
 import sys
 import types
 import importlib.util
+import weakref
 import torch
 import torch.nn.functional as F
 
@@ -51,6 +52,28 @@ def _slice_fn(weight):
 def _naive(hidden, weight, labels, ignore_index=IGNORE_INDEX):
     logits = hidden @ weight
     return F.cross_entropy(logits, labels, ignore_index=ignore_index)
+
+
+def test_vocab_weight_tile_released_before_next_reconstruction():
+    weight = torch.randn(8, 24, dtype=torch.float64)
+    hidden = torch.randn(5, 8, dtype=torch.float64, requires_grad=True)
+    labels = torch.arange(5)
+    previous = None
+    calls = 0
+
+    def reconstruct(start, width):
+        nonlocal previous, calls
+        assert previous is None or previous() is None, "previous weight tile still live"
+        tile = weight[:, start:start + width].clone()
+        previous = weakref.ref(tile)
+        calls += 1
+        return tile
+
+    loss = FusedLinearCrossEntropyVocabChunked.apply(
+        hidden, labels, reconstruct, 24, 8, 3, IGNORE_INDEX, 1, 0.0, "mean")
+    loss.backward()
+    assert calls == 6  # three tiles in each of forward and backward
+    assert previous() is None
 
 
 def test_loss_and_grad_parity():
@@ -332,6 +355,7 @@ def test_softcap_gradcheck():
 def main():
     from util import run_timed
     run_timed([
+        test_vocab_weight_tile_released_before_next_reconstruction,
         test_loss_and_grad_parity,
         test_ignore_index,
         test_chunk_invariance,

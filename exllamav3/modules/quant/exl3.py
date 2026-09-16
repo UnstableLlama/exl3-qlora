@@ -10,6 +10,8 @@ from ...util import profile_opt
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
+# Bound the fp32 Hadamard workspace independently of the CE vocabulary tile.
+MAX_WEIGHT_TRANSFORM_SLICE_N = 2048
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
@@ -271,13 +273,23 @@ class LinearEXL3:
             f"slice [{n_start}:{n_start + n_features}] out of range for out_features {self.out_features}"
         suh = self.unpack_bf(self.su).unsqueeze(1) if self.su else self.suh.unsqueeze(1)
         svh = self.unpack_bf(self.sv).unsqueeze(0) if self.sv else self.svh.unsqueeze(0)
-        w = torch.empty((self.in_features, n_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
-        w = preapply_had_l(w, had_k)
-        w *= suh
-        w = preapply_had_r(w, had_n)
-        w *= svh[:, n_start:n_start + n_features]
-        return w
+        # A 5120 x 32768 CE tile is 320 MiB in half, but each Hadamard
+        # preapply also holds two 640 MiB fp32 tensors. Reconstruct and transform
+        # smaller, aligned tiles so those temporaries never span the CE tile.
+        # Keep the original fp32 transforms and intermediate fp16 rounding.
+        result = torch.empty((self.in_features, n_features), dtype = torch.half, device = self.trellis.device)
+        for offset in range(0, n_features, MAX_WEIGHT_TRANSFORM_SLICE_N):
+            width = min(MAX_WEIGHT_TRANSFORM_SLICE_N, n_features - offset)
+            start = n_start + offset
+            w = torch.empty((self.in_features, width), dtype = torch.half, device = self.trellis.device)
+            ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, start)
+            w = preapply_had_l(w, had_k)
+            w *= suh
+            w = preapply_had_r(w, had_n)
+            w *= svh[:, start:start + width]
+            result[:, offset:offset + width].copy_(w)
+            del w
+        return result
 
 
     def get_bias_tensor(self) -> torch.Tensor | None:

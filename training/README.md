@@ -143,8 +143,12 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   ~12 GB on a 248k-vocab 27B (Qwen3.5), on a card that is also holding the
   served model, its KV cache and a draft model — that surfaced as CUDA
   driver errors (`device not ready`, an allocator INTERNAL ASSERT) under
-  expandable segments rather than a clean OOM. Tiled, the peak is one
-  `[hidden, 32768]` slice, same total dequant work. The demo's
+  expandable segments rather than a clean OOM. Each vocabulary tile retains
+  one fp16 `[hidden, 32768]` slice; EXL3 reconstruction uses internal tiles of
+  at most 2048 columns to bound the additional fp32 Hadamard workspace.
+  The previous weight tile is released before reconstructing the next one.
+  Reduce `head_vocab_chunk` further if the serving GPU has little free VRAM.
+  The demo's
   `--mtp` flag loads the model's MTP head for speculative decoding and wires
   exactly this. The offline trainer loads a component only when asked to
   (`--vision` for the tower, `--mtp-targets` to *train* the head — see the

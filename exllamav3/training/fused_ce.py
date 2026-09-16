@@ -257,6 +257,9 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
                 local = (lbl - v0).clamp_(0, v1 - v0 - 1)
                 got = logits.gather(-1, local.unsqueeze(-1)).squeeze(-1)
                 tgt_logit[t0:t1] = torch.where(in_chunk, got, tgt_logit[t0:t1])
+            # Release before reconstructing the next tile (the RHS of an
+            # assignment otherwise runs while the previous tile is still live).
+            del w_v
 
         lse = run_max + torch.log(run_sum)                              # [N]
         nll = torch.where(valid, lse - tgt_logit, torch.zeros_like(lse))
@@ -329,6 +332,7 @@ class FusedLinearCrossEntropyVocabChunked(torch.autograd.Function):
                 # Grad matmul in the weight's dtype, fp32 accumulation buffer.
                 gh = (p.to(w_v.dtype) @ w_v.t()).to(compute_dtype)
                 grad_hidden[t0:t1] += gh if per_token else gh / denom
+            del w_v
 
         if not per_token:
             grad_hidden *= g_scale
