@@ -193,6 +193,12 @@ def _ref_block_gemma(meta, weights, hidden, positions, feats):
         # AFMoE full-width output gate: sigmoid(g_proj(normed)) on the
         # flattened context, before o_proj.
         ctx = ctx * torch.sigmoid((normed @ weights["g"]).float())
+    if feats.get("headwise_gate"):
+        # Spark-X2.5 headwise output gate: one sigmoid scalar per q head
+        # (g_proj(normed) is [b, t, nq]), broadcast over head_dim, before
+        # o_proj -- the inference mul_sigmoid_broadcast_ kernel.
+        hg = torch.sigmoid((normed @ weights["g"]).float())       # [b,t,nq]
+        ctx = (ctx.view(b, t, nq, hd) * hg.unsqueeze(-1)).reshape(b, t, nq * hd)
     attn_out = ctx @ weights["o"]
     if feats.get("post_norm"):
         hidden = hidden + _ref_rmsnorm_b(attn_out, weights["attn_post"], eps_a, bias)
@@ -216,7 +222,8 @@ def _ref_block_gemma(meta, weights, hidden, positions, feats):
 def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
                  qk_norm=False, v_norm=False, post_norm=False,
                  activation="silu", window=-1, softcap=0.0, norm_bias=0.0,
-                 layer_scalar=None, full_gate=False, nope=False):
+                 layer_scalar=None, full_gate=False, nope=False,
+                 headwise_gate=False):
     """Build a synthetic block + matching reference weights. Flags toggle the
     Gemma/Qwen3 features so one builder covers the plain and extended paths."""
     norm_a = _ns_norm(d, dtype)
@@ -253,8 +260,14 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
     entry.downs = [DiffLinear(lins["down"], r=r, compute_dtype=dtype)]
     # AFMoE full-width attention output gate (its own linear on the block
     # input; the checkpoint keys it self_attn.gate_proj).
+    assert not (full_gate and headwise_gate)
     if full_gate:
         lins["g"] = MockLinear(d, nq * hd, "blk.self_attn.gate_proj", dtype=dtype)
+        entry.g_proj = DiffLinear(lins["g"], r=r, compute_dtype=dtype)
+    elif headwise_gate:
+        # Spark-X2.5 headwise gate: [hidden, nq] (the checkpoint keys it
+        # self_attn.g_proj; fp16, unquantized on the real model).
+        lins["g"] = MockLinear(d, nq, "blk.self_attn.g_proj", dtype=dtype)
         entry.g_proj = DiffLinear(lins["g"], r=r, compute_dtype=dtype)
     else:
         entry.g_proj = None
@@ -267,7 +280,7 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
         "inv_freq": inv_freq, "attn_factor": 1.0,
         "sliding_window": window, "softcap": softcap, "activation": activation,
         "use_k_as_v": False, "layer_scalar": layer_scalar,
-        "full_gate": full_gate,
+        "full_gate": full_gate, "headwise_gate": headwise_gate,
     }
     ref_weights = {
         "attn_norm": norm_a.weight, "mlp_norm": norm_m.weight,
@@ -278,7 +291,7 @@ def _build_block(d, nq, nkv, hd, inter, dtype=torch.float64, r=0, *,
         "q_norm": qn, "k_norm": kn, "attn_post": pa.weight, "mlp_post": pm.weight,
         "norm_bias": norm_bias,
     }
-    if full_gate:
+    if full_gate or headwise_gate:
         ref_weights["g"] = lins["g"].frozen_weight
     return entry, meta, ref_weights, lins
 
@@ -419,6 +432,67 @@ def test_afmoe_block_matches_reference():
     print(f"[block-afmoe] full-width output gate + NoPE/sliding + q/k-norm + "
           f"sandwich matches reference (max|Δ|={max(err, err2):.2e}); gate "
           f"adapter receives grad PASSED")
+
+
+def test_spark_headwise_gate_block_matches_reference():
+    # Spark-X2.5 attention: a HEADWISE sigmoid output gate (self_attn.g_proj,
+    # [hidden, nq] -> one scalar per q head, broadcast over head_dim before
+    # o_proj -- the inference mul_sigmoid_broadcast_ kernel), on plain
+    # pre-norm blocks with GeGLU; 3 of 4 layers sliding-window, the rest
+    # full attention. Both layer kinds here.
+    torch.manual_seed(7)
+    d, nq, nkv, hd, inter = 16, 4, 2, 8, 32
+    feats = {"headwise_gate": True}
+    net = _headless_net()
+    b, t = 2, 9
+    hidden = torch.randn(b, t, d, dtype=torch.float32)
+    positions = torch.arange(t).unsqueeze(0).expand(b, t)
+
+    # Sliding layer (window smaller than t so the band mask is exercised).
+    entry, meta, refw, _ = _build_block(
+        d, nq, nkv, hd, inter, dtype=torch.float32, r=0,
+        activation="gelu", window=4, headwise_gate=True,
+    )
+    bias = net._attn_bias(None, t, hidden.device, torch.float32, window=4)
+    out = net._block_forward(meta, entry, hidden, positions, bias)
+    ref = _ref_block_gemma(meta, refw, hidden, positions, feats)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-4, f"spark sliding block mismatch vs reference: max|Δ|={err}"
+
+    # Full-attention layer.
+    entry2, meta2, refw2, _ = _build_block(
+        d, nq, nkv, hd, inter, dtype=torch.float32, r=0,
+        activation="gelu", headwise_gate=True,
+    )
+    bias2 = net._attn_bias(None, t, hidden.device, torch.float32)
+    out2 = net._block_forward(meta2, entry2, hidden, positions, bias2)
+    ref2 = _ref_block_gemma(meta2, refw2, hidden, positions, feats)
+    err2 = (out2 - ref2).abs().max().item()
+    assert err2 < 1e-4, f"spark full block mismatch vs reference: max|Δ|={err2}"
+
+    # The gate is not a no-op: zeroing its weight (sigmoid(0) = 0.5 per head)
+    # must change the output, so a forgotten multiply can't pass by accident.
+    with torch.no_grad():
+        refw2["g"].zero_()
+    out2z = net._block_forward(meta2, entry2, hidden, positions, bias2)
+    assert (out2z - out2).abs().max().item() > 1e-3, \
+        "headwise gate had no effect on the block output"
+
+    # The gate adapter is trainable when opted in: grads reach g_proj's LoRA.
+    entry3, meta3, _, _ = _build_block(
+        d, nq, nkv, hd, inter, dtype=torch.float32, r=2,
+        activation="gelu", headwise_gate=True,
+    )
+    with torch.no_grad():
+        entry3.g_proj.lora_b.copy_(torch.randn_like(entry3.g_proj.lora_b) * 0.1)
+    h3 = torch.randn(b, t, d, dtype=torch.float32, requires_grad=True)
+    out3 = net._block_forward(meta3, entry3, h3, positions, bias2)
+    out3.square().mean().backward()
+    assert entry3.g_proj.lora_a.grad is not None \
+        and entry3.g_proj.lora_a.grad.abs().sum() > 0, \
+        "no gradient reached the headwise gate adapter"
+    print(f"[block-spark] headwise output gate + sliding/full + GeGLU matches "
+          f"reference (max|Δ|={max(err, err2):.2e}); gate adapter receives grad PASSED")
 
 
 def test_block_backward_reaches_adapters_only():
@@ -676,6 +750,7 @@ def main():
         test_block_matches_reference,
         test_gemma_block_matches_reference,
         test_afmoe_block_matches_reference,
+        test_spark_headwise_gate_block_matches_reference,
         test_block_backward_reaches_adapters_only,
         test_packing_block_isolation,
         test_packing_pad_no_nan,
