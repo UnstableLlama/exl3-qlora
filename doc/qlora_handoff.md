@@ -1,5 +1,23 @@
 # QLoRA-on-EXL3 — Handoff & Next-Step Plan
 
+> **Verification follow-up (2026-09-16):** on
+> `claude/laughing-fermat-bepdmc`, verified the realtime head-chunking change
+> in `2f0860e`. The new coordinator test passed in isolation. Reproduced the
+> `test_model_parker` missing-`infer_params` failure using the parent commit's
+> test; `aux_offload.py` is byte-identical across those commits. Fixed the
+> stub to provide `infer_params.vision_pinned=False`, matching the real Config
+> surface; no production parker change needed. Expanded the coordinator test
+> to cover default 32768, opt-out 0, and a dict-loaded 8192 override reaching
+> the native constructor, with temporary module replacement restored on exit.
+> All 21 realtime tests and all 11 fused-CE tests pass on CPU PyTorch
+> 2.14.0+cpu (Python 3.14) in `/tmp/exl3-verify-venv`:
+> `OMP_NUM_THREADS=1 /tmp/exl3-verify-venv/bin/python tests/test_realtime.py`
+> and the same command with `tests/test_fused_ce.py`.
+> **Still pending:** actual Qwen 9B/27B ingests on the serving GPU; CPU tests
+> establish configuration wiring and loss/gradient parity, not peak VRAM or
+> resolution of the reported CUDA failures. Retry with the default first;
+> if memory remains tight, set realtime `head_vocab_chunk=8192`.
+
 > Working session handoff. Branch: **`claude/magical-mayer-fq6z4i`**.
 > Goal of the original task: prove whether **QLoRA fine-tuning on EXL3-quantized
 > weights** is possible, and get a visible end-to-end demo (fine-tune a small

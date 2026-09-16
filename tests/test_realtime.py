@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import types
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -563,7 +564,10 @@ class StubAuxModel:
     def __init__(self, devices, log=None, defer_idx=()):
         self.log = log if log is not None else []
         self.loaded_tp = False
-        self.config = types.SimpleNamespace(stc=StubSTC(self.log))
+        self.config = types.SimpleNamespace(
+            stc=StubSTC(self.log),
+            infer_params=types.SimpleNamespace(vision_pinned=False),
+        )
         self.modules = [
             StubAuxModule(d, self.log, str(i), defer=(i in defer_idx))
             for i, d in enumerate(devices)
@@ -688,15 +692,14 @@ def test_internal_net_build_passes_head_vocab_chunk():
 
     fake = types.ModuleType("exl3train.native_llama")
     fake.NativeLlamaQLoRA = FakeNative
-    sys.modules["exl3train.native_llama"] = fake
-    try:
+    with patch.dict(sys.modules, {"exl3train.native_llama": fake}):
         RealtimeQLoRA(None, StubTokenizer(), RealtimeConfig())
-        assert captured[-1]["head_vocab_chunk"] == RealtimeConfig().head_vocab_chunk > 0
+        assert captured[-1]["head_vocab_chunk"] == 32768
         RealtimeQLoRA(None, StubTokenizer(), RealtimeConfig(head_vocab_chunk=0))
         assert captured[-1]["head_vocab_chunk"] == 0
-        assert RealtimeConfig.from_dict({"head_vocab_chunk": 8192}).head_vocab_chunk == 8192
-    finally:
-        del sys.modules["exl3train.native_llama"]
+        config = RealtimeConfig.from_dict({"head_vocab_chunk": 8192})
+        RealtimeQLoRA(None, StubTokenizer(), config)
+        assert captured[-1]["head_vocab_chunk"] == 8192
     print("internal net build passes head_vocab_chunk: OK")
 
 
