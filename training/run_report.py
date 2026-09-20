@@ -562,10 +562,15 @@ def decode_example_docs(tokenizer, example):
 
     ``example`` is a trainer example dict (``input_ids`` / ``labels``, plus
     ``seg_ids`` for packed blocks, which are split back into their documents
-    here). Per document: ``prompt`` is the masked (-100) prefix, ``response``
-    the supervised tokens; trailing pads (label -100 after the response) fall
-    in neither, so packed-block padding never shows. Returns
-    ``[{prompt, response, n_prompt, n_sup}, ...]``.
+    here). Each document is returned as the alternating run of masked and
+    supervised spans it actually is -- a multi-turn conversation has several of
+    each, since the follow-up user turns and the assistant headers sit MASKED
+    between the supervised replies. Collapsing to a single prompt + response
+    would drop every interior masked span and render a multi-turn row as its
+    answers concatenated back to back, which reads like corrupted data.
+    Trailing pads (label -100 after the last supervised token) are cut, so
+    packed-block padding never shows. Returns
+    ``[{segments: [{text, sup, n}, ...], n_prompt, n_sup}, ...]``.
     """
     import torch  # deferred: the render/CLI paths stay torch-free
     ids, labels = example["input_ids"], example["labels"]
@@ -591,10 +596,17 @@ def decode_example_docs(tokenizer, example):
         sup = [i for i, l in enumerate(s_labs) if l != -100]
         if not sup:
             continue  # fully-masked span (shouldn't happen; guard anyway)
-        prompt_ids = s_ids[:sup[0]]
-        resp_ids = [t for t, l in zip(s_ids, s_labs) if l != -100]
-        docs.append({"prompt": dec(prompt_ids), "response": dec(resp_ids),
-                     "n_prompt": len(prompt_ids), "n_sup": len(resp_ids)})
+        # Cut trailing pad so packed-block padding stays off the page.
+        s_ids, s_labs = s_ids[:sup[-1] + 1], s_labs[:sup[-1] + 1]
+        segments, run, in_sup = [], [], s_labs[0] != -100
+        for t, l in zip(s_ids, s_labs):
+            if (l != -100) != in_sup:
+                segments.append({"text": dec(run), "sup": in_sup, "n": len(run)})
+                run, in_sup = [], not in_sup
+            run.append(t)
+        segments.append({"text": dec(run), "sup": in_sup, "n": len(run)})
+        docs.append({"segments": segments, "n_sup": len(sup),
+                     "n_prompt": len(s_ids) - len(sup)})
     return docs
 
 
@@ -1292,8 +1304,10 @@ if (LIVE && BASE_RUNS.length) {
                            : "example #" + sq.index)}));
         docs.forEach(doc => {
           const d = el("div", {class: "pv-doc"});
-          d.appendChild(el("span", {class: "pv-prompt", text: doc.prompt}));
-          d.appendChild(el("span", {class: "pv-resp", text: doc.response}));
+          // One span per masked/supervised run: a multi-turn doc alternates
+          // several times, so the interior user turns stay visible.
+          (doc.segments || []).forEach(seg => d.appendChild(
+            el("span", {class: seg.sup ? "pv-resp" : "pv-prompt", text: seg.text})));
           d.appendChild(el("span", {class: "pv-tok",
             text: "  [" + doc.n_prompt + " prompt + " + doc.n_sup + " supervised tok]"}));
           card.appendChild(d);
