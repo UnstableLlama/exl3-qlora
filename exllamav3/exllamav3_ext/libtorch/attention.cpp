@@ -28,7 +28,7 @@ BC_Attention::BC_Attention
     c10::optional<at::Tensor> _kv_ptrs_trellis,
     c10::optional<at::Tensor> _kv_ptrs_suh,
     c10::optional<at::Tensor> _kv_ptrs_svh,
-    int _kv_K,
+    float _kv_K,
     bool _kv_mcg,
     bool _kv_mul1,
     std::shared_ptr<BC_LinearEXL3> _o_proj,
@@ -40,14 +40,14 @@ BC_Attention::BC_Attention
     c10::optional<at::Tensor> _qg_ptrs_trellis,
     c10::optional<at::Tensor> _qg_ptrs_suh,
     c10::optional<at::Tensor> _qg_ptrs_svh,
-    int _qg_K,
+    float _qg_K,
     bool _qg_mcg,
     bool _qg_mul1,
     c10::optional<at::Tensor> _qkv_ptrs_trellis,
     c10::optional<at::Tensor> _qkv_ptrs_suh,
     c10::optional<at::Tensor> _qkv_ptrs_svh,
     c10::optional<at::Tensor> _qkv_meta,
-    int _qkv_K,
+    float _qkv_K,
     bool _qkv_mcg,
     bool _qkv_mul1,
     c10::optional<at::Tensor> _q_norm,
@@ -385,11 +385,12 @@ void BC_Attention::configure_slot_qsa
 
 // Live split configuration from the current block-table bound (same formula as the python
 // dispatch path, so the two produce identical numerics)
+#define SPLIT_MIN_BLOCKS 1   // key blocks per split (was 4): short contexts get more CTAs
 static inline void split_config(int bt_width, int page_size, int q_len, int block_n, int splits_cap,
                                 int* num_splits, int* split_len)
 {
     int bound = bt_width * page_size + q_len;
-    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, 4 * block_n)));
+    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, SPLIT_MIN_BLOCKS * block_n)));
     *split_len = CEIL_DIVIDE(CEIL_DIVIDE(bound, *num_splits), block_n) * block_n;
 }
 
@@ -746,7 +747,7 @@ void BC_Attention::run_gr
                 (void*) (intptr_t) s.qsa_splits,
                 (void*) s.q.data_ptr(),  // sinks: dead arg, HAS_SINKS = false
             };
-            s.k_qsa_combine->launch(s.qsa_programs, 1, 1, args, stream);
+            s.k_qsa_combine->launch(s.qsa_programs, s.k_qsa_combine->grid_y, 1, args, stream);
         }
     }
     else
@@ -802,7 +803,7 @@ void BC_Attention::run_gr
             // HAS_SINKS), dead arg otherwise
             sinks ? (void*) sinks.value().data_ptr() : (void*) s.q.data_ptr(),
         };
-        s.k_combine->launch(s.programs, 1, 1, args, stream);
+        s.k_combine->launch(s.programs, s.k_combine->grid_y, 1, args, stream);
         if (graph)
         {
             graph->record_param(s.k_combine->handle(), GP_attn_num_splits, 4, 4);

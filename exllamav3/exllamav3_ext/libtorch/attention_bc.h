@@ -1,4 +1,5 @@
-py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel").def
+py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel")
+    .def_readwrite("grid_y", &TritonKernel::grid_y).def
 (
     py::init<py::bytes, std::string, int, int>(),
     py::arg("cubin"),
@@ -22,7 +23,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
-        int,
+        float,
         bool,
         bool,
         std::shared_ptr<BC_LinearEXL3>,
@@ -34,14 +35,14 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
-        int,
+        float,
         bool,
         bool,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
-        int,
+        float,
         bool,
         bool,
         c10::optional<at::Tensor>,
