@@ -709,21 +709,26 @@ def to_device(x: torch.Tensor, device) -> torch.Tensor:
     """
     Migrate ``x`` to ``device`` the way exllamav3's own layer-split forward does
     (``Module.prepare_for_device``, ``modules/module.py``): a direct copy, or a
-    bounce through CPU when ``no_p2p_copy`` is set (env ``EXLLAMA_NO_P2P_COPY``),
-    for rigs without GPU peer access. A no-op when already on ``device``.
+    bounce through host memory for device pairs whose peer copies corrupt data.
+    A no-op when already on ``device``.
 
     Unlike the native forward (``@torch.inference_mode``), this runs inside the
-    training graph; ``.to`` / ``.cpu`` are autograd-friendly, so gradients flow
-    back across the boundary.
+    training graph. ``util.device_copy.to_device`` uses only ``.to`` / ``.cpu``,
+    both autograd-friendly, so gradients flow back across the boundary.
+
+    Upstream b4010c2 replaced the old module-level ``no_p2p_copy`` flag with a
+    lazy per-pair probe behind that helper (``EXLLAMA_NO_P2P_COPY`` still forces
+    the bounce). This function read the removed global until the v1.4.9 sync
+    surfaced it as an AttributeError on the first cross-device hidden-state
+    transfer, which broke EVERY parallel: split training run -- SFT, EBFT and
+    preference alike.
     """
     if x.device == device:
         return x
     # Lazy import: only reached at runtime on a real multi-device model, never in
     # the single-device CPU tests (which return above).
-    from ..modules import module as _module
-    if _module.no_p2p_copy:
-        return x.cpu().to(device)
-    return x.to(device)
+    from ..util.device_copy import to_device as _to_device
+    return _to_device(x, device)
 
 
 def attn_projections(block):
