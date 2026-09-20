@@ -14,9 +14,10 @@ mala-data/
 exllamav3_ext.cpython-*.so
 # training run outputs (adapters/checkpoints/logs)
 out/
-# qlora_runs.csv is TRACKED as of 2026-07-14 (history protects against the
-# .bak-rotation clobber); sidecars and rotation backups stay untracked
-qlora_runs.csv.errors.log
+# the run log is local bookkeeping, not source -- it and all its sidecars and
+# rotation backups stay untracked (untracked as of 2026-09-20; the rows that
+# were committed between 2026-07-14 and now remain in git history)
+qlora_runs.csv
 qlora_runs.csv.*
 # unsloth writes its compiled kernel cache into cwd
 unsloth_compiled_cache/
