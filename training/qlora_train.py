@@ -164,6 +164,11 @@ PREF_KEYS = {
     "eval_split", "eval_dataset", "eval_max_samples", "val_frac", "eval_every",
     "save_best", "save_every", "checkpoint_every", "keep_checkpoints",
     "resume", "reset_optimizer", "run_log",
+    # SFT-style held-out CE eval (ordinary messages data, not preference pairs)
+    "sft_eval_dataset", "sft_eval_split", "sft_eval_messages_key",
+    "sft_eval_max_samples",
+    # local report + live monitor
+    "run_name", "no_report", "live_report", "live_report_port",
     # runtime knobs shared with the SFT trainer
     "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
     "head_vocab_chunk", "offload_activations", "offload_mode", "use_liger",

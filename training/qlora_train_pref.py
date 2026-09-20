@@ -83,9 +83,10 @@ from qlora_train_native import (  # noqa: E402
     snapshot_datasets, resolve_resumed_datasets,
     format_prompt_and_eot, turn_end_token,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
-    load_dataset_split,
-    _FAIL_CTX, _log_failure,
+    load_dataset_split, build_sft_examples, collate,
+    _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
+from run_report import RunLogger, start_live_monitor  # noqa: E402
 from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
                         make_segment_builder, encode_segments,
                         encode_completion, AUTO_SINGLE_TURN_HINT)
@@ -628,6 +629,31 @@ def _run_main():
     ap.add_argument("--save-every", type=int, default=0)
     ap.add_argument("--checkpoint-every", type=int, default=0)
     ap.add_argument("--keep-checkpoints", type=int, default=0)
+    # SFT-style held-out eval, alongside (or instead of) the preference eval.
+    # The preference eval scores PAIRS; this one scores completion-only
+    # cross-entropy on an ordinary messages/instruction set, so a preference
+    # run can track "is the target voice getting more likely" on data that has
+    # no chosen/rejected structure at all. Same builder + loss as the SFT
+    # trainer, so the number is directly comparable to an SFT run's held_out.
+    ap.add_argument("--sft-eval-dataset", default=None,
+                    help="Dataset id/path for an SFT-style held-out CE eval "
+                         "(messages or instruction columns -- NOT preference "
+                         "pairs). Evaluated on the --eval-every schedule.")
+    ap.add_argument("--sft-eval-split", default="train",
+                    help="Split of --sft-eval-dataset (local jsonl loads as "
+                         "'train').")
+    ap.add_argument("--sft-eval-messages-key", default="messages",
+                    help="Messages column of --sft-eval-dataset; set empty to "
+                         "use the flat instruction/context/response columns.")
+    ap.add_argument("--sft-eval-max-samples", type=int, default=0)
+    # Local run report + live monitor (mirrors the SFT trainer).
+    ap.add_argument("--run-name", default=None)
+    ap.add_argument("--no-report", action="store_true",
+                    help="Skip the local HTML run report.")
+    ap.add_argument("--live-report", action="store_true",
+                    help="Serve the live run monitor while training. Charts "
+                         "only -- the step dataset browser is SFT-only.")
+    ap.add_argument("--live-report-port", type=int, default=0)
     ap.add_argument("--resume", default=None)
     ap.add_argument("--reset-optimizer", action="store_true")
     ap.add_argument("--run-log", default="qlora_runs.csv")
@@ -816,6 +842,28 @@ def _run_main():
               f"{len(examples)} for training")
         assert examples, "val_frac too large; no training examples left"
 
+    # SFT-style held-out set (--sft-eval-dataset): ordinary completion-masked
+    # rows, built by the SFT trainer's own builder so the CE number means the
+    # same thing it does there. Independent of the preference eval above --
+    # either, both, or neither may be configured.
+    sft_val_examples = []
+    if args.sft_eval_dataset:
+        _FAIL_CTX["phase"] = "build_sft_eval"
+        sft_val_examples = build_sft_examples(
+            model, tokenizer, args.sft_eval_dataset,
+            args.sft_eval_max_samples, args.seq_len,
+            split=args.sft_eval_split,
+            messages_key=args.sft_eval_messages_key or None,
+            prompt_format=args.prompt_format,
+            config_name=args.dataset_config,
+            chat_template_file=args.chat_template_file,
+            template_vars=template_vars)
+        print(f" -- SFT-style held-out eval: {len(sft_val_examples)} examples "
+              f"from {args.sft_eval_dataset} (split '{args.sft_eval_split}')")
+        assert sft_val_examples, (
+            "--sft-eval-dataset produced no usable examples (check "
+            "--sft-eval-split and --sft-eval-messages-key)")
+
     # eva init: stream the preference batches (policy view) through the no-grad
     # pre-pass, exactly like the SFT trainer feeds its training blocks.
     if args.init_lora == "eva" and not args.resume:
@@ -941,6 +989,26 @@ def _run_main():
             return None, {}
         return tot_loss / tot_n, {k: s / n for k, (s, n) in agg.items()}
 
+    def sft_eval_loss():
+        """Mean completion-only CE over --sft-eval-dataset, one example at a
+        time (no padding effects). Deliberately identical to the SFT trainer's
+        eval_loss, so this number is directly comparable to an SFT run's
+        eval/held_out rather than being a preference-specific quantity."""
+        if not sft_val_examples:
+            return None
+        net.eval()
+        total, n = 0.0, 0
+        with torch.no_grad():
+            for ex in sft_val_examples:
+                input_ids, labels, attn, pos_ids, seg_ids = collate([ex], pad_id)
+                total += net.compute_loss(
+                    input_ids, labels, attention_mask=attn,
+                    chunk=args.ce_chunk,
+                    position_ids=pos_ids, seg_ids=seg_ids).item()
+                n += 1
+        net.train()
+        return total / n if n else None
+
     def fmt_eval(vl, em):
         parts = [f"pref-loss {vl:.4f}"]
         if "acc" in em:
@@ -973,6 +1041,9 @@ def _run_main():
     best_val_step = resume_state["best_val_step"] if resume_state else 0
     start_loss = end_loss = None
     start_val = None
+    start_sft_val = last_sft_val = None
+    best_sft_val, best_sft_val_step = float("inf"), 0
+    last_sft_eval_step = -1
     last_eval_step, last_val = -1, None
     tok_seen, tot_seen = 0, 0
     run_started = datetime.datetime.now().isoformat(timespec="seconds")
@@ -983,11 +1054,50 @@ def _run_main():
     # a different number here usually means a data/config problem (or qerr).
     # SimPO has NO reference and therefore no fixed anchor -- its step-0 loss
     # depends on the data's length-normalized logp margins.
+    # Local run report -- same contract as the SFT trainer: metrics stream to
+    # metrics.jsonl as they are logged, _log_failure renders whatever it got if
+    # the run dies, and finish() is idempotent.
+    run_config = dict(_FAIL_CTX["record"])
+    run_config.update(
+        method=method, steps_planned=args.steps, warmup_steps=warmup_steps,
+        targets=" ".join(net.target_modules),
+        trainable_params=net.num_trainable(), n_train=len(examples),
+        n_val=len(val_examples), n_sft_val=len(sft_val_examples))
+    run_name = args.run_name or os.path.basename(os.path.normpath(args.out))
+    report = None
+    if args.out and not args.no_report:
+        report = RunLogger(args.out, run_name, config=run_config)
+        _REPORT["rep"] = report
+
+    # Live monitor (--live-report): charts only. batch_fn is None because the
+    # step dataset browser would need this trainer's pair-shaped examples
+    # decoded and its batch order replayed; start_live_monitor serves /batch
+    # as 404 in that case and the rest of the page works unchanged.
+    if args.live_report and report is None:
+        print(" -- --live-report needs the local report; ignoring (--no-report set)")
+    elif args.live_report:
+        start_live_monitor(
+            args.out, port=args.live_report_port,
+            live_info={"total_steps": args.steps, "first_step": resume_step + 1,
+                       "run_name": run_name})
+
     _FAIL_CTX["phase"] = "baseline_eval"
     if val_examples:
         start_val, em = evaluate()
         if start_val is not None:
             print(f"    [eval] step 0 (baseline): {fmt_eval(start_val, em)}")
+    if sft_val_examples:
+        _FAIL_CTX["phase"] = "baseline_sft_eval"
+        start_sft_val = last_sft_val = sft_eval_loss()
+        if start_sft_val is not None:
+            print(f"    [eval] step 0 (baseline): sft-held-out "
+                  f"{start_sft_val:.4f}")
+    if report is not None:
+        base_row = {k: v for k, v in (("eval/pref_loss", start_val),
+                                      ("eval/sft_held_out", start_sft_val))
+                    if v is not None}
+        if base_row:
+            report.log(base_row, step=0)
 
     t0 = time.time()
     if torch.cuda.is_available():
@@ -999,6 +1109,21 @@ def _run_main():
             return 0.0
         return max((torch.cuda.max_memory_allocated(d) / 1e9 for d in active_devices),
                    default=0.0)
+
+    def _sft_eval_note(base):
+        """Append the SFT-style held-out numbers to the CSV notes cell."""
+        if not sft_val_examples:
+            return base
+        bits = [f"sft_eval={os.path.basename(args.sft_eval_dataset)}",
+                f"n={len(sft_val_examples)}"]
+        if start_sft_val is not None:
+            bits.append(f"start={start_sft_val:.4f}")
+        if best_sft_val != float("inf"):
+            bits.append(f"best={best_sft_val:.4f}@{best_sft_val_step}")
+        if last_sft_val is not None:
+            bits.append(f"final={last_sft_val:.4f}")
+        note = " ".join(bits)
+        return f"{base}; {note}" if base else note
 
     def log_run(status, dt, final_val):
         _FAIL_CTX["logged"] = True
@@ -1034,7 +1159,11 @@ def _run_main():
             "t_fwd_s": rnd(timer.total["fwd"], 1),
             "t_bwd_s": rnd(timer.total["bwd"], 1),
             "t_opt_s": rnd(timer.total["opt"], 1),
-            "phase": "", "error": "", "notes": _hparam_note(args),
+            # The SFT-style eval rides in `notes` rather than as new columns:
+            # qlora_runs.csv has a fixed header shared with the SFT/EBFT
+            # trainers and widening it would desync older rows.
+            "phase": "", "error": "",
+            "notes": _sft_eval_note(_hparam_note(args)),
         })
 
     timer = StepTimer(devices=active_devices if torch.cuda.is_available() else None)
@@ -1102,11 +1231,23 @@ def _run_main():
                 extras = (f"kl {mm.get('kl', 0):.3f} | "
                           f"rD {mm.get('reward_d', float('nan')):+.3f} "
                           f"rU {mm.get('reward_u', float('nan')):+.3f}")
+            b_norm = adapter_b_norm()
+            cur_lr = sched.get_last_lr()[0]
             print(f"  step {step:>5}/{args.steps} | loss {accum_loss:6.4f} | "
                   f"ema {ema:6.4f} | {extras} | grad {gnorm:7.4f} | "
-                  f"lr {sched.get_last_lr()[0]:.2e} | "
-                  f"|dB| {adapter_b_norm():7.3f} | {tot_tps:,.0f} tok/s | "
+                  f"lr {cur_lr:.2e} | "
+                  f"|dB| {b_norm:7.3f} | {tot_tps:,.0f} tok/s | "
                   f"{timer.step_line()}")
+            if report is not None:
+                row = {"train/loss": accum_loss, "train/ema": ema,
+                       "train/grad_norm": gnorm, "train/lr": cur_lr,
+                       "train/adapter_b_norm": b_norm,
+                       "train/tok_per_s": tot_tps,
+                       "train/epoch": step * args.batch * args.grad_accum
+                       / max(len(examples), 1)}
+                for k, v in mm.items():
+                    row[f"train/{k}"] = v
+                report.log(row, step=step)
 
             _FAIL_CTX["record"].update(
                 steps_done=step, end_loss=round(accum_loss, 6),
@@ -1114,16 +1255,41 @@ def _run_main():
             if start_loss is not None and "start_loss" not in _FAIL_CTX["record"]:
                 _FAIL_CTX["record"]["start_loss"] = round(start_loss, 6)
 
-            if args.eval_every and step % args.eval_every == 0 and val_examples:
-                vl, em = evaluate()
-                last_eval_step, last_val = step, vl
-                if vl is not None:
-                    print(f"    [eval] step {step}: {fmt_eval(vl, em)}")
-                    if vl < best_val:
-                        best_val = vl
-                        best_val_step = step
-                        if args.save_best:
-                            save(f"[best step {step}, val {vl:.4f}]")
+            # Eval schedule. The preference eval and the SFT-style eval are
+            # independent: either can be configured alone, so this fires on
+            # --eval-every whenever at least one eval set exists.
+            if args.eval_every and step % args.eval_every == 0 and (
+                    val_examples or sft_val_examples):
+                eval_row = {}
+                if val_examples:
+                    _FAIL_CTX["phase"] = f"eval step {step}"
+                    vl, em = evaluate()
+                    last_eval_step, last_val = step, vl
+                    if vl is not None:
+                        print(f"    [eval] step {step}: {fmt_eval(vl, em)}")
+                        eval_row["eval/pref_loss"] = vl
+                        for k, v in em.items():
+                            eval_row[f"eval/{k}"] = v
+                        if vl < best_val:
+                            best_val = vl
+                            best_val_step = step
+                            if args.save_best:
+                                save(f"[best step {step}, val {vl:.4f}]")
+                if sft_val_examples:
+                    _FAIL_CTX["phase"] = f"sft eval step {step}"
+                    sv = sft_eval_loss()
+                    last_sft_val = sv
+                    last_sft_eval_step = step
+                    if sv is not None:
+                        best_tag = ""
+                        if sv < best_sft_val:
+                            best_sft_val, best_sft_val_step = sv, step
+                            best_tag = "  (best)"
+                        print(f"    [eval] step {step}: sft-held-out "
+                              f"{sv:.4f}{best_tag}")
+                        eval_row["eval/sft_held_out"] = sv
+                if report is not None and eval_row:
+                    report.log(eval_row, step=step)
 
             if args.save_every and step % args.save_every == 0:
                 save(f"[checkpoint step {step}]")
@@ -1150,6 +1316,14 @@ def _run_main():
             if step > 0:
                 save("[interrupted]")
         log_run("interrupted", time.time() - t0, None)
+        if report is not None:
+            report.update_summary({
+                "steps_done": step,
+                "best_sft_held_out": (best_sft_val
+                                      if best_sft_val != float("inf") else None),
+                "best_sft_held_out_step": best_sft_val_step or None,
+                "last_sft_held_out": last_sft_val})
+        _finish_report(exit_code=0, status="interrupted")
         raise SystemExit(0)
 
     dt = time.time() - t0
@@ -1163,6 +1337,18 @@ def _run_main():
             print(f"    [eval] final: {fmt_eval(val_loss, em)}")
     else:
         val_loss = None
+    # Final SFT-style eval, unless this step already ran one.
+    if sft_val_examples and last_sft_eval_step != step:
+        print(" -- computing final SFT-style held-out eval "
+              "(GPU busy, not hung) ...")
+        sv = sft_eval_loss()
+        if sv is not None:
+            last_sft_val = sv
+            if sv < best_sft_val:
+                best_sft_val, best_sft_val_step = sv, step
+            print(f"    [eval] final: sft-held-out {sv:.4f}")
+            if report is not None:
+                report.log({"eval/sft_held_out": sv}, step=step)
     if not (args.save_best and val_examples):
         save("Done.")
     if torch.cuda.is_available():
@@ -1176,6 +1362,20 @@ def _run_main():
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
           f"step time: {timer.summary()}")
     log_run("completed", dt, val_loss)
+    if report is not None:
+        report.update_summary({
+            "steps_done": step, "start_loss": start_loss, "end_loss": end_loss,
+            "best_pref_val": best_val if best_val != float("inf") else None,
+            "best_pref_val_step": best_val_step or None,
+            "final_pref_val": val_loss,
+            "start_sft_held_out": start_sft_val,
+            "best_sft_held_out": (best_sft_val
+                                  if best_sft_val != float("inf") else None),
+            "best_sft_held_out_step": best_sft_val_step or None,
+            "final_sft_held_out": last_sft_val,
+            "peak_vram_gb": round(peak_vram_gb(), 3),
+            "total_s": round(dt, 1)})
+    _finish_report(exit_code=0)
     print("Verify with: python training/qlora_infer_native.py "
           f"--model {args.model} --adapter {args.out}")
 
