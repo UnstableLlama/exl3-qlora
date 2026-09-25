@@ -573,10 +573,11 @@ def build_bc_mla(module, layer):
     dev = torch.device(m.device)
     if not (
         bc_attn_enable and
-        # NoPE models (D_r 0) compile the rope stages out; otherwise a rope instance with a
-        # supported style is required
+        # NoPE models (D_r 0) compile the rope stages out, as do models whose pe slices are
+        # never rotated (Kimi Linear: D_r > 0 without a rope instance); otherwise a rope instance
+        # with a supported style is required
         (D_r == 0 or (
-            m.rope is not None and m.rope.rope_settings.rope_style != RopeStyle.NONE and
+            (m.rope is None or m.rope.rope_settings.rope_style != RopeStyle.NONE) and
             _is_pow2(D_r)
         )) and
         # The staging/attention kernels index with tl.arange over these widths
@@ -616,7 +617,8 @@ def build_bc_mla(module, layer):
                 layer.get_idx() is not None
             ))
         )) and
-        not m.has_split_cache and
+        # A TP rank holds the whole layer and its whole cache layer (MLA is never head-split),
+        # so the graph captures the local cache layer exactly as in single-process mode
         isinstance(layer, (CacheLayer_MLA_fp16, CacheLayer_MLA_quant)) and
         (not isinstance(layer, CacheLayer_MLA_quant) or (
             layer.qk is not None and layer.qk.device == dev
