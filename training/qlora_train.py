@@ -94,6 +94,9 @@ SINGLE_ONLY_KEYS = {
     "wandb_project", "wandb_run_name", "wandb_entity",  # not mirrored to DDP yet
     # Image+text SFT (the frozen vision tower + image splice); single/split only.
     "vision", "images_key", "image_max_pixels", "vision_cache_gb", "vision_device",
+    # MTP draft-head training (Session 53); native single/split backend only.
+    # `mtp_targets: []` forwards a bare --mtp-targets (default attn+mlp list + fc).
+    "mtp_targets", "mtp_loss_weight", "freeze_trunk", "mtp_device",
 }
 DDP_ONLY_KEYS = set()
 
@@ -233,6 +236,10 @@ SINGLE_ONLY_DEFAULTS = {
     "wandb_project": "",
     "wandb_run_name": "",
     "wandb_entity": "",
+    "mtp_targets": None,
+    "mtp_loss_weight": 1.0,
+    "freeze_trunk": False,
+    "mtp_device": None,
 }
 
 
