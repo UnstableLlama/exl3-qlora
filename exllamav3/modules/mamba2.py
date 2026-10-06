@@ -4,6 +4,7 @@ import torch
 from ..model.config import Config
 from ..util.tensor import get_for_device, buffered_arange, to2, g_tensor_cache
 from . import Module, Linear
+from .linear import has_runtime_lora
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
@@ -394,12 +395,16 @@ class Mamba2(Module):
         # Fused C++ path for decode, generalized over (bsz, seqlen) up to (_BC_MAX_BSZ,
         # _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs the entire
         # layer in one call, replayed through an internal CUDA graph per (bsz, seqlen, history)
-        # shape from the third invocation of that shape on
+        # shape from the third invocation of that shape on. The graph reads the in/out
+        # projection trellis weights directly and never sees a runtime LoRA, so fall back to
+        # the python path while one is loaded (guard per call: the graph is cached and a LoRA
+        # can be attached/detached after build)
         if (
             self.bc is not None and save_state and
             recurrent_slots is not None and
             x.dtype == torch.float16 and x.is_contiguous() and
-            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
+            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
+            not has_runtime_lora(self.in_proj, self.o_proj)
         ):
             if self.bc.needs_configure(bsz, seqlen, save_history):
                 self._bc_configure_slot(bsz, seqlen, save_history)

@@ -5,6 +5,7 @@ from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
+from .linear import has_runtime_lora
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
@@ -694,7 +695,18 @@ class SlidingAttention(Module):
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
 
-        if self.multi_qkv is not None and bsz * q_len <= 32:
+        # The fused mgemm paths bypass Linear.forward, which is what applies a
+        # runtime LoRA. Rather than fall back to the (much slower) per-linear
+        # path, the low-rank delta is added onto the mgemm output below.
+        # MultiLinear is only built for bias/softcap/scale-free pairs, so the
+        # LoRA delta is the only epilogue Linear.forward would have applied.
+        # The sliced Q/K/V(/G) bundle (project_qkv_sliced) carries no such
+        # delta, so while a runtime LoRA is loaded decode takes the pairwise
+        # bundles below instead (same fused speed as before the bundle existed).
+        if (
+            self.multi_qkv is not None and bsz * q_len <= 32 and
+            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj, self.g_proj)
+        ):
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
@@ -735,6 +747,12 @@ class SlidingAttention(Module):
                 1, None, None)
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
+            if has_runtime_lora(self.q_proj, self.g_proj):
+                xf = x.view(bsz * q_len, -1)
+                if xf.shape[-1] != dim:
+                    xf = xf[:, :dim].contiguous()
+                self.q_proj.apply_lora(xf, q.view(bsz * q_len, -1))
+                self.g_proj.apply_lora(xf, g.view(bsz * q_len, -1))
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
@@ -769,6 +787,12 @@ class SlidingAttention(Module):
                 1, None, None)
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+            if has_runtime_lora(self.k_proj, self.v_proj):
+                xf = x.view(bsz * q_len, -1)
+                if xf.shape[-1] != dim:
+                    xf = xf[:, :dim].contiguous()
+                self.k_proj.apply_lora(xf, k.view(bsz * q_len, -1))
+                self.v_proj.apply_lora(xf, v.view(bsz * q_len, -1))
 
         return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
@@ -969,10 +993,15 @@ class SlidingAttention(Module):
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
 
-        # Graph-captured C++ path for the whole decode step
+        # Graph-captured C++ path for the whole decode step. The graph reads the
+        # projection trellis directly and never sees a runtime LoRA, so fall back to
+        # the python path while one is loaded (guard must sit here, per call: the
+        # graph is cached and a LoRA can be attached/detached after build).
         if (
             _bc_attn_enable and causal and non_causal_spans is None and
-            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
+            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
+            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
+                                 self.o_proj, self.g_proj)
         ):
             rsg = params.get("recurrent_states")
             if rsg is not None:

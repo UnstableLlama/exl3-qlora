@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
+from .linear import has_runtime_lora
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
@@ -1060,11 +1061,15 @@ class GatedDeltaNet(Module):
         # Fused C++ path for decode with split projections, generalized over (bsz, seqlen) up to
         # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
         # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
-        # history) shape from the third invocation of that shape on
+        # history) shape from the third invocation of that shape on. The graph reads projection
+        # weights directly (qkv/z/o trellis, b/a via the merged ba_weight_t buffer, base weights
+        # only) and never sees a runtime LoRA, so fall back to the torch path while one is loaded.
         if (
             self.bc_split and save_state and
             recurrent_slots is not None and
-            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
+            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
+            not has_runtime_lora(self.qkv_proj, self.z_proj, self.b_proj,
+                                 self.a_proj, self.o_proj)
         ):
             if self.bc.needs_configure(bsz, seqlen, save_history):
                 if self.kda:
@@ -1136,7 +1141,13 @@ class GatedDeltaNet(Module):
                 g = F.softplus(gf, threshold = 20.0).mul_(-decay)
             del gf
         else:
-            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+            # The sliced qkv/z bundle (project_qkvz_sliced) reads trellis storage
+            # directly and never applies a runtime LoRA; take the per-linear
+            # path while one is loaded so the adapter is not silently dropped.
+            if (
+                getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32 and
+                not has_runtime_lora(self.qkv_proj, self.z_proj)
+            ):
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
                 qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)

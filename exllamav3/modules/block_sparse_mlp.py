@@ -10,6 +10,7 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
+from .linear import has_runtime_lora
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
@@ -1083,15 +1084,46 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if check:
                 _routing_check_compare(self.key, local_sel, local_w, selected_experts, routing_weights)
 
+        # Runtime-LoRA guards: every fused expert path (exl3_moe, the batched reconstruct
+        # tier, the BC single-expert kernels and the bszN decode kernels) reads the expert
+        # trellis weights directly and never sees a runtime LoRA. When one is loaded on any
+        # routed expert projection, force the branch below that can take the per-expert
+        # torch path. The bszN kernels may also embed the shared experts (bc_sh_exp) and the
+        # shared gate, so they are additionally skipped when those carry a LoRA -- the
+        # torch/fused branch then runs the routed experts as usual and the shared experts
+        # through their own (guarded) forwards afterwards.
+        # NOTE: routing reads routing_gate.inner.weight directly on all paths; a LoRA
+        # on the router is not supported.
+        experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)
+        sh_fused_lora = self.bc_sh_exp and (
+            has_runtime_lora(*self.shared_experts.gates, *self.shared_experts.ups,
+                             *self.shared_experts.downs) or
+            has_runtime_lora(self.shared_gate)
+        )
+
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
-        # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum
+        # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum.
+        # The worker computes from its own CPU copy of the base expert weights (the offloaded
+        # GPU expert modules are never loaded), so a runtime LoRA on routed experts cannot be
+        # applied there and has no fallback -- reject loudly rather than silently bypass.
         cpu_partial = None
         cpu_pending = None
-        if self.cpu_split_first is not None and not params.get("autosplit_measure"):
-            cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
+        if self.cpu_split_first is not None:
+            if experts_lora:
+                raise RuntimeError(
+                    f"{self.key}: runtime LoRA on routed expert projections is not supported "
+                    f"with CPU expert split (tail expert weights are not resident on GPU)"
+                )
+            if not params.get("autosplit_measure"):
+                cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
         if self.cpu_offload:
+            if experts_lora:
+                raise RuntimeError(
+                    f"{self.key}: runtime LoRA on routed expert projections is not supported "
+                    f"with CPU expert offload (expert weights are not resident on GPU)"
+                )
             final_hidden_states, cpu_pending = self.cpu_offload_issue(
                 eshape, y, selected_experts, routing_weights, params)
 
@@ -1100,9 +1132,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
         # Torch/C++/fused path
+        # (experts_lora / sh_fused_lora: this is the only branch with a per-expert torch path,
+        # and the bszN kernels below would embed the fused shared experts, so both LoRA cases
+        # land here regardless of bsz)
         elif (
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
-            self.config.infer_params.no_reconstruct or
+            self.config.infer_params.no_reconstruct or experts_lora or sh_fused_lora or
             not (self.support_quant_paths or bszn_eligible)
         ):
             # One spare row: the batched reconstruct tier's padding sink (never read back)
@@ -1148,8 +1183,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Count how many assignments per expert. With few enough total assignments no
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
                 # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
+                # (experts_lora: the fused kernel and the batched reconstruct tier read the base
+                # trellis only; take the per-expert loop so the torch path can apply the adapter)
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                if (
+                    self.fused_mode_buffers is not None and not experts_lora and
+                    num_tokens * top_k <= self.fused_rows
+                ):
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
@@ -1163,10 +1203,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     fused_total = num_tokens * top_k
                 else:
                     fused_total = 0
-                    if self.fused_mode_buffers is not None:
+                    if self.fused_mode_buffers is not None and not experts_lora:
                         min_rows = self.fused_rows
                         fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
-                    recon = self._batch_recon_layer(y)
+                    if not experts_lora:
+                        recon = self._batch_recon_layer(y)
                     if recon is not None:
                         lim = max(min_rows, TEMP_ROWS_GRAPH)
                         heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
@@ -1255,7 +1296,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     )
 
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency
-                if self.fused_mode_buffers is not None:
+                if self.fused_mode_buffers is not None and not experts_lora:
                     if expert_count_list is None:
                         run_fused(-1)
                     else:
@@ -1305,7 +1346,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                     current_state = y.index_select(0, top_x)
 
-                    if self.bc is not None and self.support_quant_paths:
+                    if self.bc is not None and self.support_quant_paths and not experts_lora:
                         # Graph path
                         if count <= TEMP_ROWS_GRAPH:
                             self.bc.run_single_expert(current_state, expert_idx)
@@ -1375,9 +1416,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # inside the kernel. Expert-range shards (CPU split, TP) produce a partial sum here:
         # out-of-range picks are masked inside the kernel and contribute exact zeros. Every
         # quantized configuration that reaches this point has self.bc (it is built whenever the
-        # quantized paths apply), so this is the last tier
+        # quantized paths apply), so this is the last tier. Never reached with a runtime LoRA on
+        # the routed experts or on the fused shared experts/gate (see the branch above)
         else:
-            assert bszn_eligible
+            assert bszn_eligible and not experts_lora and not sh_fused_lora
             self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
@@ -1428,7 +1470,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
-                if bsz > 32:
+                # add_sigmoid_gate_proj projects against the raw gate weight, skipping
+                # any runtime LoRA on the shared gate -- take the forward path then
+                if bsz > 32 or has_runtime_lora(self.shared_gate):
                     z = self.shared_gate.forward(x, params)
                     ext.add_sigmoid_gate(y, z, final_hidden_states)
                 else:

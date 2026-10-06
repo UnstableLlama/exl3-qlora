@@ -30,6 +30,19 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+def has_runtime_lora(*linears) -> bool:
+    """
+    True when any of the given Linear modules currently carries a runtime LoRA
+    (tensors registered by ``model.lora.LoRA``). The fused multi-linear decode
+    kernels (``exl3_mgemm`` / BC graphs) read the trellis storage directly and
+    never see these tensors, so any fused branch over modules for which this
+    returns True must fall back to the per-linear ``Linear.forward`` path or
+    the adapter is silently dropped. ``None`` entries are allowed (optional
+    projections like g_proj).
+    """
+    return any(l is not None and l.lora_a_tensors for l in linears)
+
+
 class Linear(Module):
 
     def __init__(
@@ -666,14 +679,21 @@ class Linear(Module):
 
 
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
-        orig_shape = lora_input.shape
-        flat = lora_input.view(-1, orig_shape[-1])
+        flat = lora_input.view(-1, lora_input.shape[-1])
+        xf = x.view(-1, x.shape[-1])
         for lora, a in self.lora_a_tensors.items():
             b = self.lora_b_tensors.get(lora)
             if b is not None:
-                lora_in = flat if flat.dtype == a.dtype else flat.to(a.dtype)
-                delta = lora_in @ a @ b
-                x += delta.view(*orig_shape[:-1], -1).to(x.dtype)
+                if flat.dtype == a.dtype and xf.dtype == b.dtype:
+                    # Fused in-place accumulate: x += (x @ a) @ b, no
+                    # materialized delta or dtype-cast kernels. This runs per
+                    # adapted Linear on every decode step, so launch count
+                    # matters more than anything else here.
+                    xf.addmm_(flat @ a, b)
+                else:
+                    lora_in = flat.to(a.dtype)
+                    delta = lora_in @ a @ b
+                    xf += delta.to(xf.dtype)
 
 
     def quant_format_id(self):

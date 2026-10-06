@@ -6,6 +6,7 @@ from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
+from .linear import has_runtime_lora
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
@@ -392,11 +393,14 @@ class MLP(Module):
     ) -> torch.Tensor:
 
         # Fused C++ path for single-token decode, replayed through an internal CUDA graph from
-        # the third invocation on
+        # the third invocation on. The graph reads the up/down trellis weights directly and
+        # never sees a runtime LoRA, so fall back to the per-linear path while one is loaded
+        # (guard per call: the graph is cached and a LoRA can be attached/detached after build)
         bsz, q_len, _ = x.shape
         if (
             self.bc is not None and bsz == 1 and q_len == 1 and
-            x.dtype == torch.float16 and x.is_contiguous()
+            x.dtype == torch.float16 and x.is_contiguous() and
+            not has_runtime_lora(*self.ups, *self.downs)
         ):
             d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
             self.bc.run_bsz1(x, d)
@@ -863,9 +867,23 @@ class GatedMLP(Module):
             r = [qs] if qs is not None else range(0, self.num_slices)
             d = None
 
+            # The fused paths below bypass Linear.forward, which is what applies
+            # a runtime LoRA. The BC graph fuses the whole MLP (gate/up/act/down)
+            # and cannot take a LoRA delta (gate/up inject before the activation
+            # inside the graph), so any adapter on the three forces the branches
+            # below. The mgemm branch stays LoRA-correct on its own: gate/up
+            # deltas are added onto the mgemm output pre-activation, and down
+            # goes through Linear.forward (which applies its LoRA). Checked
+            # across ALL slices so the BC decision is uniform.
+            gu_lora = has_runtime_lora(*self.gates, *self.ups)
+            down_lora = has_runtime_lora(*self.downs)
+
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                # Fused/graph path reads base trellis weights only and never sees a runtime
+                # LoRA — fall back to the torch path while one is loaded.
+                if self.bc is not None and bsz * q_len <= MAX_BSZN \
+                        and not (gu_lora or down_lora):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))
@@ -911,6 +929,10 @@ class GatedMLP(Module):
                         1, None, None)
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
+                    if gu_lora:
+                        xf = x.view(bsz * q_len, dim)
+                        self.gates[s].apply_lora(xf, g.view(bsz * q_len, -1))
+                        self.ups[s].apply_lora(xf, u.view(bsz * q_len, -1))
 
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     if self.interm_div != 1.0:
