@@ -8,6 +8,7 @@
 #include "../quant/exl3_gemm.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
+#include "../lora.cuh"
 
 using namespace torch::indexing;
 
@@ -75,6 +76,23 @@ void BC_GatedMLP::run_bszN_gr
         if (up->bias) add_gr(u2, up->bias.value(), u2, graph);
     }
 
+    if (lora_gu_a)
+    {
+        lora_a_gr(x, lora_gu_a.value(), lora_gu_t, graph);
+        int offset = 0;
+        if (lora_gate_b)
+        {
+            at::Tensor g2 = gu_n.select(0, 0);
+            lora_b_gr(lora_gu_t, 0, lora_gate_b.value(), g2, graph);
+            offset = (int) lora_gate_b.value().size(0);
+        }
+        if (lora_up_b)
+        {
+            at::Tensor u2 = gu_n.select(0, 1);
+            lora_b_gr(lora_gu_t, offset, lora_up_b.value(), u2, graph);
+        }
+    }
+
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
     at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
@@ -86,8 +104,39 @@ void BC_GatedMLP::run_bszN_gr
         relu2_mul_gr(g, u, a_n, act_limit, graph);
 
     exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
+    if (lora_down_a)
+    {
+        lora_a_gr(a_n, lora_down_a.value(), lora_down_t, graph);
+        lora_b_gr(lora_down_t, 0, lora_down_b.value(), d, graph);
+    }
     if (down->bias)
         add_gr(d, down->bias.value(), d, graph);
+}
+
+void BC_GatedMLP::set_lora
+(
+    c10::optional<at::Tensor> gu_a,
+    c10::optional<at::Tensor> gate_b,
+    c10::optional<at::Tensor> up_b,
+    c10::optional<at::Tensor> down_a,
+    c10::optional<at::Tensor> down_b
+)
+{
+    TORCH_CHECK(gu_a.has_value() == (gate_b.has_value() || up_b.has_value()), "set_lora: gate/up A and B must come together");
+    TORCH_CHECK(down_a.has_value() == down_b.has_value(), "set_lora: down A and B must come together");
+
+    lora_gu_a   = std::move(gu_a);
+    lora_gate_b = std::move(gate_b);
+    lora_up_b   = std::move(up_b);
+    lora_down_a = std::move(down_a);
+    lora_down_b = std::move(down_b);
+
+    if (lora_gu_a)
+        lora_gu_t = at::empty({MAX_BSZN, lora_gu_a.value().size(0)}, lora_gu_a.value().options().dtype(at::kFloat));
+    if (lora_down_a)
+        lora_down_t = at::empty({MAX_BSZN, lora_down_a.value().size(0)}, lora_down_a.value().options().dtype(at::kFloat));
+
+    for (auto& g : graph_bszN) g.reset();
 }
 
 void BC_GatedMLP::run_bszN
@@ -135,7 +184,11 @@ void BC_GatedMLP::run_bszN
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
             args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
         }
+        if (lora_gu_a)
+            args.emplace_back(GP_lora_x, (void*) x.data_ptr());
         args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
+        if (lora_down_a)
+            args.emplace_back(GP_lora_y, (void*) d.data_ptr());
         if (down->bias)
         {
             args.emplace_back(GP_add_x, (void*) d.data_ptr());

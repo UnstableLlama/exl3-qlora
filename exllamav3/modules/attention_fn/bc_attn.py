@@ -110,6 +110,76 @@ def _get_sm_count(device: torch.device | int) -> int:
     return _sm_count[idx]
 
 
+class BCLoraState:
+    """Runtime LoRA handed to a module's BC_Attention graphs (see bc_lora_sync)."""
+    def __init__(self):
+        self.src = ()                 # the attached Linear tensors the stacked args were built from
+        self.args = (None,) * 6       # set_lora arguments
+        self.ok = True                # False: the graph can't take this adapter, use the python path
+        self.ver = 0                  # bumped on every change; BCAttn instances re-apply when behind
+
+
+def bc_lora_sync(m) -> bool:
+    """
+    Keep the module's BC_Attention graphs in step with the runtime LoRA attached to its q/k/v/o
+    projections, so the graphs add the deltas themselves. Returns True when the graph path may
+    run. Without an adapter this is a cheap no-op; work is only done when the attached tensors
+    changed (adapter loaded or unloaded), after which the graphs re-record. Several adapters on
+    one projection are stacked along the rank dim. Adapters the graph has no stage for (gate
+    projections, shared K/V, mismatched widths or dtypes) return False: python path.
+    """
+    st = getattr(m, "bc_lora", None)
+    linears = (m.q_proj, m.k_proj, m.v_proj, m.o_proj)
+    other = (m.g_proj, getattr(m, "kv_proj", None))
+    lora = any(l is not None and l.lora_a_tensors for l in linears + other)
+    if st is None:
+        if not lora:
+            return True
+        st = m.bc_lora = BCLoraState()
+
+    def pairs(l):
+        if l is None: return []
+        return [(a, l.lora_b_tensors[k]) for k, a in l.lora_a_tensors.items() if k in l.lora_b_tensors]
+
+    src = tuple(t for l in linears + other for ab in pairs(l) for t in ab)
+    if len(src) == len(st.src) and all(p is q for p, q in zip(src, st.src)):
+        return st.ok
+
+    def stack(l):
+        pp = pairs(l)
+        if not pp: return None, None
+        return (
+            torch.cat([a.T for a, _ in pp], dim = 0).contiguous(),   # (R, in)
+            torch.cat([b for _, b in pp], dim = 0).contiguous(),     # (R, out)
+        )
+
+    (qa, qb), (ka, kb), (va, vb), (oa, ob) = (stack(l) for l in linears)
+    qh = m.num_q_heads * m.head_dim
+    kvh = m.num_kv_heads * m.head_dim
+    hp = m.q_proj.in_features
+    ok = (
+        all(t.dtype == torch.half for t in src) and
+        not any(pairs(l) for l in other) and
+        (qa is None or (qb.shape[1] == qh and qa.shape[1] == hp)) and
+        (ka is None or (kb.shape[1] == kvh and ka.shape[1] == hp)) and
+        (va is None or (vb.shape[1] == kvh and va.shape[1] == hp)) and
+        (oa is None or (ob.shape[1] == hp and oa.shape[1] >= m.num_q_heads * getattr(m, "v_head_dim", m.head_dim))) and
+        ((qa is None and ka is None and va is None) or (
+            m.g_proj is None and not getattr(m, "interleaved_gate", False) and
+            not getattr(m, "use_k_as_v", False)
+        ))
+    )
+    st.src = src
+    st.ok = ok
+    st.ver += 1
+    if ok:
+        qkv_a = [t for t in (qa, ka, va) if t is not None]
+        st.args = (torch.cat(qkv_a, dim = 0) if qkv_a else None, qb, kb, vb, oa, ob)
+    else:
+        st.args = (None,) * 6
+    return ok
+
+
 class BCAttn:
     """Python-side owner of one ext.BC_Attention (per attention module and cache layer):
     collects the projection/norm/rope/cache handles at construction and compiles + registers the
@@ -274,6 +344,7 @@ class BCAttn:
                 pool_plane = qsa_layer.pooled.view(-1, idx.head_dim),
             )
         self.slot_widths = {}
+        self.lora_ver = 0
 
     def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
@@ -617,6 +688,10 @@ class BCAttn:
         # table could break the assumption silently, so fail here instead
         assert block_table.data_ptr() % 16 == 0, \
             "BC_Attention: block_table must be 16-byte aligned (pass a whole tensor, not a sliced view)"
+        st = getattr(self.module, "bc_lora", None)
+        if st is not None and st.ver != self.lora_ver:
+            self.bc.set_lora(*st.args)
+            self.lora_ver = st.ver
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
                     position_ids, inv_freq, regime, t_total)

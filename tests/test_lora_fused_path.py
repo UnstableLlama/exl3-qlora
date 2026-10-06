@@ -12,9 +12,11 @@ How each fused path deals with it:
     stay fused and add the low-rank delta onto the mgemm output (pre-RoPE /
     pre-activation, matching Linear.forward semantics -- MultiLinear pairs are
     bias/softcap/scale-free by construction).
-  - everything else (the BC_* graphs, sliced q/k/v bundle, GDN, Mamba2, MLA,
-    the fused MoE expert kernels): fall back to unfused dispatch while any
-    involved Linear carries LoRA tensors.
+  - BC_Attention / BC_GatedMLP graphs: take the adapter tensors (set_lora) and
+    add the delta in-graph (lora.cu).
+  - everything else (sliced q/k/v bundle, BC_MLP, GDN, Mamba2, MLA, the fused
+    MoE expert kernels): fall back to unfused dispatch while any involved
+    Linear carries LoRA tensors.
 
 Because the failure mode is SILENT, these tests are tripwires on the guard
 conditions in the source itself, dependency-free so they run in any container.
@@ -73,14 +75,15 @@ def test_gated_mlp_fused_branches_guarded():
         "GatedMLP: multi_gu branch lost its gate LoRA delta"
     assert "self.ups[s].apply_lora(xf" in gu_block, \
         "GatedMLP: multi_gu branch lost its up LoRA delta"
-    # the BC bszN graph (v1.2.0: generalized from bsz-1 to bsz*q_len <=
-    # MAX_BSZN) fuses the whole MLP (gate/up/act/down) and cannot take a
-    # post-hoc delta, so it must yield to an unfused branch when ANY of the
-    # three carries a LoRA
+    # the BC bszN graph fuses the whole MLP (gate/up/act/down) and cannot take
+    # a post-hoc delta: it either gets the adapter tensors handed to it
+    # (bc_lora_sync, deltas added in-graph) or must yield to an unfused branch
     assert re.search(
-        r"self\.bc is not None and bsz \* q_len <= MAX_BSZN[^:]*?"
-        r"not \(gu_lora or down_lora\)",
-        src, re.S), "GatedMLP: BC bszN branch lost its runtime-LoRA guard"
+        r"use_bc = self\.bc is not None and bsz \* q_len <= MAX_BSZN\s*"
+        r"if use_bc and \(gu_lora or down_lora or self\.bc_lora_src\):\s*"
+        r"use_bc = self\.bc_lora_sync\(\)",
+        src), "GatedMLP: BC bszN branch lost its runtime-LoRA sync"
+    assert "self.bc.set_lora(" in src
 
 
 @pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
@@ -89,10 +92,11 @@ def test_bc_attn_graph_dispatch_guarded(fname):
     # o_proj as one C++ call; the dispatch (not the cached graph build) must
     # check for a runtime LoRA on every involved projection
     src = _src("exllamav3", "modules", fname)
+    # ... and either hand it to the graph (deltas added in-graph) or decline
     assert re.search(
         r"bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and\s*"
-        r"not has_runtime_lora\(self\.q_proj, self\.k_proj, self\.v_proj,",
-        src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA guard"
+        r"_bc_lora_sync\(self\)",
+        src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA sync"
 
 
 @pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])

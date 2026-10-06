@@ -9,6 +9,7 @@ from .linear import has_runtime_lora
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
+from .attention_fn.bc_attn import bc_lora_sync as _bc_lora_sync
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
@@ -994,14 +995,13 @@ class SlidingAttention(Module):
         non_causal_spans = params.get("non_causal_spans")
 
         # Graph-captured C++ path for the whole decode step. The graph reads the
-        # projection trellis directly and never sees a runtime LoRA, so fall back to
-        # the python path while one is loaded (guard must sit here, per call: the
-        # graph is cached and a LoRA can be attached/detached after build).
+        # projection trellis directly; a runtime LoRA is handed to it by bc_lora_sync
+        # and added in-graph (the check must sit here, per call: the graph is cached
+        # and a LoRA can be attached/detached after build). False: python path.
         if (
             _bc_attn_enable and causal and non_causal_spans is None and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
-            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
-                                 self.o_proj, self.g_proj)
+            _bc_lora_sync(self)
         ):
             rsg = params.get("recurrent_states")
             if rsg is not None:

@@ -729,6 +729,8 @@ class GatedMLP(Module):
         self.multi_gu: list[MultiLinear | None] = [None] * self.num_slices
 
         self.bc = None
+        self.bc_lora_src = ()
+        self.bc_lora_ok = True
         self.bsz1_pa_args = []
 
 
@@ -827,6 +829,43 @@ class GatedMLP(Module):
             #     g_tensor_cache.drop(*arg)
             self.bc = None
             self.bsz1_pa_args = []
+        self.bc_lora_src = ()
+
+
+    def bc_lora_sync(self) -> bool:
+        """
+        Hand the runtime LoRA currently attached to gate/up/down to the BC graph, which then adds
+        the deltas itself. Only does work when the attached tensors changed since the last call
+        (adapter loaded or unloaded); the graph re-records after that. Several adapters on one
+        projection are stacked along the rank dim. Returns False if the graph can't take the
+        adapter, in which case the caller falls back to the unfused paths.
+        """
+        linears = (self.gates[0], self.ups[0], self.downs[0])
+        src = tuple(
+            t for l in linears
+            for k, a in l.lora_a_tensors.items() if k in l.lora_b_tensors
+            for t in (a, l.lora_b_tensors[k])
+        )
+        if len(src) == len(self.bc_lora_src) and all(p is q for p, q in zip(src, self.bc_lora_src)):
+            return self.bc_lora_ok
+
+        def stack(l):
+            pairs = [(a, l.lora_b_tensors[k]) for k, a in l.lora_a_tensors.items() if k in l.lora_b_tensors]
+            if not pairs: return None, None
+            return (
+                torch.cat([a.T for a, _ in pairs], dim = 0).contiguous(),   # (R, in)
+                torch.cat([b for _, b in pairs], dim = 0).contiguous(),     # (R, out)
+            )
+
+        self.bc_lora_src = src
+        self.bc_lora_ok = all(t.dtype == torch.half for t in src)
+        if not self.bc_lora_ok:
+            self.bc.set_lora(None, None, None, None, None)
+            return False
+        (ga, gb), (ua, ub), (da, db) = (stack(l) for l in linears)
+        gu_a = [t for t in (ga, ua) if t is not None]
+        self.bc.set_lora(torch.cat(gu_a, dim = 0) if gu_a else None, gb, ub, da, db)
+        return True
 
         for i in range(self.num_slices):
             if self.multi_gu[i] is not None:
@@ -869,21 +908,21 @@ class GatedMLP(Module):
 
             # The fused paths below bypass Linear.forward, which is what applies
             # a runtime LoRA. The BC graph fuses the whole MLP (gate/up/act/down)
-            # and cannot take a LoRA delta (gate/up inject before the activation
-            # inside the graph), so any adapter on the three forces the branches
-            # below. The mgemm branch stays LoRA-correct on its own: gate/up
+            # and adds the deltas itself once the adapter tensors are handed to
+            # it (bc_lora_sync); if it can't take them, the branches below run
+            # instead. The mgemm branch stays LoRA-correct on its own: gate/up
             # deltas are added onto the mgemm output pre-activation, and down
             # goes through Linear.forward (which applies its LoRA). Checked
             # across ALL slices so the BC decision is uniform.
             gu_lora = has_runtime_lora(*self.gates, *self.ups)
             down_lora = has_runtime_lora(*self.downs)
+            use_bc = self.bc is not None and bsz * q_len <= MAX_BSZN
+            if use_bc and (gu_lora or down_lora or self.bc_lora_src):
+                use_bc = self.bc_lora_sync() and x.dtype == torch.half
 
             for s in r:
 
-                # Fused/graph path reads base trellis weights only and never sees a runtime
-                # LoRA — fall back to the torch path while one is loaded.
-                if self.bc is not None and bsz * q_len <= MAX_BSZN \
-                        and not (gu_lora or down_lora):
+                if use_bc:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))

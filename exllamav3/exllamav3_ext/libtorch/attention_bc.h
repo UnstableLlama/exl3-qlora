@@ -184,4 +184,5 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("qsa_split_len") = 0,
     py::arg("qsa_programs") = 0
 )
-.def("run", &BC_Attention::run);
+.def("run", &BC_Attention::run)
+.def("set_lora", &BC_Attention::set_lora);

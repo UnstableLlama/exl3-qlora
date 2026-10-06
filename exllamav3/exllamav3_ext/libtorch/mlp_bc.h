@@ -37,7 +37,8 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
     py::arg("down"),
     py::arg("act_limit")
 )
-.def("run_bszN", &BC_GatedMLP::run_bszN);
+.def("run_bszN", &BC_GatedMLP::run_bszN)
+.def("set_lora", &BC_GatedMLP::set_lora);
 
 py::class_<BC_MLP, std::shared_ptr<BC_MLP>>(m, "BC_MLP").def
 (

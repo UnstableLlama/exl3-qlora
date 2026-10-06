@@ -319,6 +319,30 @@ struct BC_Attention
         int qsa_programs
     );
 
+    // Optional runtime LoRA (set_lora), added inside the graph: q/k/v deltas on the projection
+    // statics before head norm + RoPE, o delta on the o_proj output. A matrices are stored
+    // transposed (R, K); q, k and v read the same x, so their A rows are stacked (q, k, v order)
+    // and run as one lora_a. Any of the four may be absent. Unset: no extra nodes are recorded
+    c10::optional<at::Tensor> lora_qkv_a;
+    c10::optional<at::Tensor> lora_q_b;
+    c10::optional<at::Tensor> lora_k_b;
+    c10::optional<at::Tensor> lora_v_b;
+    c10::optional<at::Tensor> lora_o_a;
+    c10::optional<at::Tensor> lora_o_b;
+    at::Tensor lora_qkv_t;
+    at::Tensor lora_o_t;
+
+    // Attach/detach the runtime LoRA and drop the captured graphs so they re-record
+    void set_lora
+    (
+        c10::optional<at::Tensor> qkv_a,
+        c10::optional<at::Tensor> q_b,
+        c10::optional<at::Tensor> k_b,
+        c10::optional<at::Tensor> v_b,
+        c10::optional<at::Tensor> o_a,
+        c10::optional<at::Tensor> o_b
+    );
+
     void run
     (
         int bsz,

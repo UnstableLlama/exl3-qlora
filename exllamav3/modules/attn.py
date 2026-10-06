@@ -13,6 +13,7 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
+from .attention_fn.bc_attn import bc_lora_sync as _bc_lora_sync
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
@@ -1146,14 +1147,13 @@ class Attention(Module):
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too).
-        # The graph reads the projection trellis directly and never sees a runtime LoRA,
-        # so fall back to the python path while one is loaded (guard must sit here, per
-        # call: the graph is cached and a LoRA can be attached/detached after build).
+        # The graph reads the projection trellis directly; a runtime LoRA is handed to it by
+        # bc_lora_sync and added in-graph (the check must sit here, per call: the graph is
+        # cached and a LoRA can be attached/detached after build). False: python path.
         if (
             _bc_attn_enable and non_causal_spans is None and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
-            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
-                                 getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
+            _bc_lora_sync(self)
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)

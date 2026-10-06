@@ -27,6 +27,25 @@ Graph::~Graph()
     if (graph_exec) cudaGraphExecDestroy(graph_exec);
 }
 
+void Graph::reset()
+{
+    if (graph_exec) cudaGraphExecDestroy(graph_exec);
+    if (graph) cudaGraphDestroy(graph);
+    graph = NULL;
+    graph_exec = NULL;
+    graph_sites.clear();
+    graph_node_sites.clear();
+    nodes.clear();
+    node_params.clear();
+    node_params_drv.clear();
+    node_is_driver.clear();
+    current_values.clear();
+    node_needs_update.clear();
+    need_cublas = false;
+    ready = false;
+    ready_to_record = false;
+}
+
 cudaStream_t Graph::capture_begin()
 {
     #ifdef GRAPHDEBUG

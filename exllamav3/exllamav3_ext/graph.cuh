@@ -95,7 +95,10 @@ enum GraphedParams
 
     GP_moe_bias_add_sel,
     GP_moe_bias_add_weighted_sel,
-    GP_moe_bias_add_weighted_weights
+    GP_moe_bias_add_weighted_weights,
+
+    GP_lora_x,
+    GP_lora_y
 };
 
 class Graph
@@ -130,6 +133,9 @@ public:
 
     cudaStream_t capture_begin();
     void capture_end();
+
+    // Drop the captured graph so the next runs re-record it (the recorded kernel sequence changed)
+    void reset();
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
     void launch(std::vector<PPTR> params, cudaStream_t stream);

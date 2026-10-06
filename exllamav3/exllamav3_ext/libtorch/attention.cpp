@@ -10,6 +10,7 @@
 #include "../rope.cuh"
 #include "../cache/q_cache.cuh"
 #include "../add.cuh"
+#include "../lora.cuh"
 #include "../activation.cuh"
 #include "../norm.cuh"
 #include "../dsa_topk.cuh"
@@ -545,6 +546,28 @@ void BC_Attention::run_gr
             add_gr(v2, v_proj->bias.value(), v2, graph);
     }
 
+    if (lora_qkv_a)
+    {
+        lora_a_gr(x2, lora_qkv_a.value(), lora_qkv_t, graph);
+        int offset = 0;
+        if (lora_q_b)
+        {
+            lora_b_gr(lora_qkv_t, offset, lora_q_b.value(), s.q2, graph);
+            offset += (int) lora_q_b.value().size(0);
+        }
+        if (lora_k_b)
+        {
+            at::Tensor k2 = kv2.select(0, 0);
+            lora_b_gr(lora_qkv_t, offset, lora_k_b.value(), k2, graph);
+            offset += (int) lora_k_b.value().size(0);
+        }
+        if (lora_v_b)
+        {
+            at::Tensor v2 = kv2.select(0, 1);
+            lora_b_gr(lora_qkv_t, offset, lora_v_b.value(), v2, graph);
+        }
+    }
+
     if (v_norm && !use_k_as_v)
     {
         // Norm is per head: view (R, kvh * hd) as (R * kvh, hd)
@@ -839,10 +862,48 @@ void BC_Attention::run_gr
         c2 = s.yp.narrow(0, 0, R);
     at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * v_head_dim).view({R, num_q_heads * v_head_dim});
     exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
+    if (lora_o_a)
+    {
+        lora_a_gr(s.o2, lora_o_a.value(), lora_o_t, graph);
+        lora_b_gr(lora_o_t, 0, lora_o_b.value(), c2, graph);
+    }
     if (o_proj->bias)
         add_gr(c2, o_proj->bias.value(), c2, graph);
     if (hs != hidden_size)
         copy2d_gr(c2, y2, graph);
+}
+
+void BC_Attention::set_lora
+(
+    c10::optional<at::Tensor> qkv_a,
+    c10::optional<at::Tensor> q_b,
+    c10::optional<at::Tensor> k_b,
+    c10::optional<at::Tensor> v_b,
+    c10::optional<at::Tensor> o_a,
+    c10::optional<at::Tensor> o_b
+)
+{
+    TORCH_CHECK(qkv_a.has_value() == (q_b.has_value() || k_b.has_value() || v_b.has_value()), "set_lora: q/k/v A and B must come together");
+    TORCH_CHECK(o_a.has_value() == o_b.has_value(), "set_lora: o A and B must come together");
+    TORCH_CHECK(!qkv_a.has_value() || (gate_mode == 0 && !use_k_as_v), "set_lora: q/k/v LoRA is not supported with an output gate or shared K/V");
+
+    lora_qkv_a = std::move(qkv_a);
+    lora_q_b   = std::move(q_b);
+    lora_k_b   = std::move(k_b);
+    lora_v_b   = std::move(v_b);
+    lora_o_a   = std::move(o_a);
+    lora_o_b   = std::move(o_b);
+
+    if (lora_qkv_a)
+        lora_qkv_t = at::empty({MAX_BSZ * MAX_QLEN, lora_qkv_a.value().size(0)}, lora_qkv_a.value().options().dtype(at::kFloat));
+    if (lora_o_a)
+        lora_o_t = at::empty({MAX_BSZ * MAX_QLEN, lora_o_a.value().size(0)}, lora_o_a.value().options().dtype(at::kFloat));
+
+    for (auto& s : slots)
+    {
+        if (s.graph) s.graph->reset();
+        s.runs = 0;
+    }
 }
 
 void BC_Attention::run
@@ -935,6 +996,9 @@ void BC_Attention::run
         params.emplace_back(GP_gemm_A, xptr);
     }
 
+    if (lora_qkv_a)
+        params.emplace_back(GP_lora_x, xptr);
+
     // RoPE: which position source is active is a runtime branch in the kernel, so nulls are
     // patched like any other value. NoPE graphs contain no rope node
     if (inv_freq)
@@ -1012,6 +1076,8 @@ void BC_Attention::run
     }
     void* yptr = padded ? s.yp.data_ptr() : (void*) y.data_ptr();
     params.emplace_back(GP_gemm_C, yptr);
+    if (lora_o_a)
+        params.emplace_back(GP_lora_y, yptr);
     if (o_proj->bias)
     {
         params.emplace_back(GP_add_x, yptr);

@@ -50,6 +50,18 @@ struct BC_GatedMLP
     std::vector<at::Tensor> guh_cache;
     std::vector<at::Tensor> gu_cache;
 
+    // Optional runtime LoRA (set_lora), added inside the graph: gate/up deltas on the projection
+    // outputs before the activation, down delta on d. A matrices are stored transposed (R, K);
+    // gate and up read the same x, so their A rows are stacked (gate first) and run as one
+    // lora_a. Any of the three may be absent. Unset: no extra nodes are recorded
+    c10::optional<at::Tensor> lora_gu_a;
+    c10::optional<at::Tensor> lora_gate_b;
+    c10::optional<at::Tensor> lora_up_b;
+    c10::optional<at::Tensor> lora_down_a;
+    c10::optional<at::Tensor> lora_down_b;
+    at::Tensor lora_gu_t;
+    at::Tensor lora_down_t;
+
     BC_GatedMLP
     (
         at::Tensor _guh,
@@ -105,6 +117,16 @@ struct BC_GatedMLP
     (
         const at::Tensor& x,
         at::Tensor& d
+    );
+
+    // Attach/detach the runtime LoRA and drop the captured graphs so they re-record
+    void set_lora
+    (
+        c10::optional<at::Tensor> gu_a,
+        c10::optional<at::Tensor> gate_b,
+        c10::optional<at::Tensor> up_b,
+        c10::optional<at::Tensor> down_a,
+        c10::optional<at::Tensor> down_b
     );
 };
 
