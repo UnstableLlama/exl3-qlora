@@ -1,9 +1,32 @@
 # Plan: Qwen3.8-Flash-Next (qwen4_exp) on the native QLoRA path, down to a 16 GB card
 
-Written 2026-10-09 (Session 57, after the v1.6.0 sync, PR #167). Status: **Phase A built and
-CPU-tested in Session 58 (branch `feat/qwen38-flash-next`); box validation pending. Phases B–D
-not started.** Session 58 closed open question 6: the hc `up` table is recovered from the resident
-`upx_h` repack, so no `keep_source_weights` load is needed.
+Written 2026-10-09 (Session 57, after the v1.6.0 sync, PR #167).
+
+**Status (end of Session 58, 2026-10-09):**
+- **Phase A: built, CPU-tested (12 new tests + the existing suites), committed as `e0201f22`
+  and pushed as branch `feat/qwen38-flash-next` on origin for testing. Not box-verified.** The
+  branch needs a box with >= 48 GB VRAM (two 3090s or more); it does NOT run on 16 GB yet.
+- **Phase B (box run): not started** — waits on someone with the hardware (the user or
+  pineapple) running the validate gate below.
+- **Phase C (expert streaming, the 16 GB tier): not started.** This is the piece a 16 GB card
+  needs; without it the expert load alone (~31 GB) fails. It can be built here without a box,
+  with a CPU value-identity test, the same way Phase A was.
+- **Phase D (recipe): not started.**
+- Corrections to the plan below, found while building: (1) QSA is exact for `t <= threshold`
+  (inference engages the indexer at `seqlen > threshold`), so the guard refuses `t > 2051`,
+  not `>=`; (2) open question "hyper-connection weights after load" is closed — the `up` table
+  is recovered from the always-resident `upx_h` repack by the same permutation the inference
+  `_tiled_tables` uses, so no `keep_source_weights` load and no safetensors re-read is needed.
+
+**Test recipe for the branch (48 GB+ box, 2.05bpw pack; `--ngram-ram` only with >= 64 GB host
+RAM, else the disk-streaming default):**
+```
+git fetch origin && git checkout feat/qwen38-flash-next
+python training/qlora_validate_native.py --model <Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4> --parallel split
+```
+Then `--check-backward`, then the Phase B command in section 3. Full box list in
+`doc/qlora_handoff.md` Session 58.
+
 Goal: a short SFT run (~30 steps) of `Qwen/Qwen3.8-Flash-Next` through `qlora_train_native.py`,
 first on a box that holds the model, then on a single 16 GB GPU with the routed experts streamed
 from host RAM.
@@ -74,6 +97,14 @@ all assume a (b, t, d) residual with pre-norms.
 
 ## 2. Phase A: architecture port (box with >= 48 GB VRAM for validation; code here)
 
+**Done in Session 58** (items 1-8 built as described, with these notes: item 1 reads the
+resident tables instead of re-reading safetensors; item 2 landed as `_site_in` / `_site_out`
+in `native_llama.py` over a new pure-torch `training/hyperconnections.py`; item 5's guard is
+`t > threshold`; item 6 is `training/ple.py` + `backbone.ple_ngram_embed`; item 7's flag is
+`--ngram-ram` on both scripts; item 9 needed no change — the validate gate compares logits
+only, and the EBFT taps now read the stream mean). **Item 9's run (the gate itself) is the
+open piece.**
+
 Deliverable: `qlora_validate_native.py` argmax-agreement gate passes on the 2.05bpw quant
 (`--parallel split` over 2 x 3090: ~33 GB of weights + n-gram table in host RAM via the loader's
 `ngram_ram`/disk streaming default; QSA layers load whole on one device per the model caps).
@@ -134,8 +165,12 @@ Work items, in order:
    `transformer.py:210`). Pass criterion unchanged: 100% argmax agreement on the validation
    prompts, text-only.
 
-CPU-testable here (scratch CPU-torch venv): items 1, 2 (against `_mix_ref` on random weights),
-4, 5, 6(c-e). Box-only: the real-quant forward, items 7-9.
+CPU-tested in Session 58 (`tests/test_hyperconnections_train.py`, `tests/test_ple_train.py`):
+items 2, 4, 5, 6 against transcriptions of `_mix_ref`, `forward_streams_reference` and the
+`ple_gate` kernel, plus block / trunk wiring and gradchecks. Box-only: the layout asserts on
+the real modules, the real-quant forward (item 9), and the dtype boundaries the transcriptions
+can't see (the mix hands the sublayer the compute dtype where inference hands it half; the PLE
+norm rounding points). Those are the first suspects if the gate fails.
 
 ## 3. Phase B: box run on the 2 x 3090 (proves the forward trains)
 
@@ -207,10 +242,9 @@ Requirements: Linux, >= 64 GB RAM (48 GB with the n-gram table on NVMe), the 2.0
 - **Numerics of the stream stack in bf16 compute**: inference keeps the streams fp32 and only
   the sublayer inputs/outputs fp16. The port keeps the stack fp32 and casts `y` to compute
   dtype, matching inference. The argmax gate decides.
-- **Hyper-connection weights after load**: `up_h` is freed when the tiled kernel path is
-  active. Load the trunk with `keep_source_weights=True` for training, or read the four
-  tensors from the safetensors directly (preferred: no dependence on inference's kernel
-  tables).
+- **Hyper-connection weights after load** — CLOSED (S58): `up` is recovered from the resident
+  `upx_h` repack (`backbone.gated_residual_spec`); `down` / `inject` are views of `proj_h`;
+  `norm_w` is always kept. No special load.
 - **PLE fresh-sequence state**: confirm the token-history padding (`ple_eos_token_id`) and
   conv zero-state match what the generator does for a new sequence; a wrong convention would
   be invisible to the gate on single-prompt validation only if the validate prompts start the
@@ -239,7 +273,13 @@ Requirements: Linux, >= 64 GB RAM (48 GB with the n-gram table on NVMe), the 2.0
 
 ## 8. Session plan
 
-1. Session 58: Phase A items 1-6 with CPU tests. Box handoff: validate gate.
-2. Session 59: fix what the gate finds; Phase B run; Session entry with numbers.
-3. Session 60: Phase C build + bit-exact gate on the box; 16 GB run; Phase D recipe into the
-   README.
+1. Session 58: Phase A items 1-8 with CPU tests, branch pushed. **Done.**
+2. Next session (no box needed): build Phase C (`training/expert_stream.py`,
+   `--stream-experts`, host-RAM check, `--parallel split` / `--vram-spillover` rejected with
+   it) with a CPU test that the streamed MoE forward is value-identical to the resident one
+   (mock experts, same `_moe_out`), and the Phase D recipe into the README marked untested.
+   Push to the same branch so a 16 GB tester can try it.
+3. When a box is available: Phase A validate gate -> `--check-backward` -> Phase B run (48 GB
+   box), then the Phase C bit-exact gate and the 16 GB run. Fix what they find; Session
+   entries with numbers.
+   If the gate fails on the branch before Phase C is built, fixing it comes first.
