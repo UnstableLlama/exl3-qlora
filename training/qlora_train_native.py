@@ -1924,6 +1924,21 @@ def _run_main():
                          "VRAM reporting is unavailable in this mode, and --parallel "
                          "split is rejected (its capacity probing is meaningless "
                          "when allocations never fail). See training/uvm_allocator.py.")
+    ap.add_argument("--stream-experts", action="store_true",
+                    help="MoE models: keep the routed experts' packed EXL3 weights in "
+                         "page-locked host RAM and stream them into a small VRAM ring "
+                         "one layer at a time, prefetched one layer ahead, instead of "
+                         "holding them on the GPU (training.expert_stream; the 16 GB "
+                         "tier for Qwen3.8-Flash-Next, whose experts alone are ~31 GB "
+                         "at 2.05 bpw). Value-exact: same loss as the resident run. "
+                         "Host RAM must hold every expert (checked up front). Single "
+                         "device only; rejects --parallel split, --vram-spillover, "
+                         "--sample-every > 0 (the inference forward needs resident "
+                         "experts) and routed-expert adapter targets.")
+    ap.add_argument("--stream-experts-slots", type=int, default=2,
+                    help="VRAM ring slots for --stream-experts (default 2 = current + "
+                         "one prefetched layer; each slot is one layer's experts, "
+                         "~0.65 GB at 2.05 bpw). More slots prefetch further ahead.")
     ap.add_argument("--use-liger", action="store_true",
                     help="Route RMSNorm (2D/3D norms) and SwiGLU (silu only) through "
                          "Liger Triton kernels for lower activation memory + speed. "
@@ -2131,6 +2146,17 @@ def _run_main():
     from chat_jinja import set_strip_sys_prompt_extras
     set_strip_sys_prompt_extras(args.strip_sys_prompt_extras)
 
+    # Expert streaming is single-device by design and cannot serve the
+    # inference forward (live samples); refuse the combinations up front.
+    if args.stream_experts:
+        from exllamav3.training import expert_stream as _es
+        problems = _es.incompatible_flags(
+            args.parallel, args.vram_spillover, args.sample_every, args.targets,
+            args.expert_r)
+        if problems:
+            raise SystemExit("--stream-experts cannot be combined with:\n  - "
+                             + "\n  - ".join(problems))
+
     # UVM spillover must be installed before the first CUDA tensor exists, so
     # this runs before anything touches a device (model load is the first).
     if args.vram_spillover:
@@ -2247,6 +2273,18 @@ def _run_main():
         active_devices = list(model.active_devices)
         print(f" -- layer-autosplit: active devices {active_devices}, "
               f"output device {model.output_device}")
+    elif args.stream_experts:
+        # Single-device load that parks each MoE block's routed experts in
+        # host RAM as the block lands (peak VRAM: dense trunk + one layer's
+        # experts), then streams them per layer during training.
+        from exllamav3.training import expert_stream as _es
+        streamer = _es.load_streaming(model, args.device, slots=args.stream_experts_slots,
+                                      progressbar=True)
+        active_devices = [torch.device(args.device).index]
+        if not streamer.layers:
+            raise SystemExit("--stream-experts: this model has no block-sparse MoE "
+                             "layers to stream; drop the flag.")
+        print(f" -- {streamer.describe()}")
     else:
         model.load(device=args.device, progressbar=True)
         active_devices = [torch.device(args.device).index]
@@ -3331,6 +3369,8 @@ def _run_main():
           f"{tot_seen / dt if dt else 0:,.0f} tot tok/s | "
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
           f"step time: {timer.summary()}")
+    if args.stream_experts:
+        print(f"[STREAM] {streamer.stats_line()}")
     log_run("completed", dt, val_loss, final_eval2)
     final_summary = {k: v for k, v in {
         "end_loss": end_loss, "final_val": val_loss,

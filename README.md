@@ -77,7 +77,7 @@ The differentiable forward reads every norm/activation/scale from the loaded mod
 | Qwen3 dense | Qwen3 4B/8B/14B | **Box-proven** (q/k-norm path) |
 | Qwen3-MoE / Qwen3.5-MoE | Qwen3-30B-A3B, Qwen3.6-35B-A3B | **Box-proven** (std softmax router; shared expert + sigmoid shared gate; routed-expert adapters opt-in via `expert_*` targets) |
 | Qwen3.5/3.6 hybrids | Qwen3.5 0.8B–4B, Qwen3.6-27B | **Box-proven** (differentiable Gated DeltaNet + gated attention; no sample packing on GDN models) |
-| Qwen3.8-Flash-Next (`qwen4_exp`) | Qwen3.8-Flash-Next 125B-A6B | Accepted (4-stream fp32 residual with differentiable gated-residual hyper-connections at every sublayer + the final combine-less mixer, no final norm; sigmoid-gated GDN output norm; QSA attention trained as dense attention, exact up to the indexer threshold of 2051 tokens — longer `--seq-len` is refused; the PLE hashed n-gram layer with the table read through the inference loader, `--ngram-ram` to hold it in RAM; MoE + shared expert as Qwen3.5-MoE) — **not yet box-tested**; run `qlora_validate_native.py` first. No sample packing; the MTP head is not trainable on this model. Routed experts stream-from-host for a 16 GB card is planned (`doc/qwen38_flash_next_plan.md`) |
+| Qwen3.8-Flash-Next (`qwen4_exp`) | Qwen3.8-Flash-Next 125B-A6B | Accepted (4-stream fp32 residual with differentiable gated-residual hyper-connections at every sublayer + the final combine-less mixer, no final norm; sigmoid-gated GDN output norm; QSA attention trained as dense attention, exact up to the indexer threshold of 2051 tokens — longer `--seq-len` is refused; the PLE hashed n-gram layer with the table read through the inference loader, `--ngram-ram` to hold it in RAM; MoE + shared expert as Qwen3.5-MoE) — **not yet box-tested**; run `qlora_validate_native.py` first. No sample packing; the MTP head is not trainable on this model. For a single 16 GB card the routed experts stream from host RAM (`--stream-experts`, see [below](#streaming-routed-experts-from-host-ram-16-gb-cards)) — built, **not yet box-tested** |
 | LFM2 / LFM2-MoE hybrids | LFM2.5-8B-A1B | Accepted (differentiable ShortConv gated-causal-conv layers + q/k-normed attention; dots sigmoid MoE router with expert bias; no sample packing on ShortConv models) — **not yet box-tested**; run `qlora_validate_native.py` first |
 | Gemma 3/4 | Gemma3, Gemma4-12B, Gemma4 MoE (MeroMero-26B) | **Box-proven** (sandwich norms, GeGLU, sliding/full, softcap, big-head, Gemma4 MoE alt-residual layout) |
 | AFMoE | **Trinity-Nano** (Arcee), dots.llm1-style sigmoid routers | **Box-proven** (10-step SFT + fast-vs-legacy A/B + adapter steering generation at inference) — dots sigmoid router (selection bias, normalize-over-selected, route scale), full-width attention output gate, NoPE full-attention layers, muP embedding, ungated shared expert, dense-first-N layers |
@@ -89,6 +89,27 @@ The differentiable forward reads every norm/activation/scale from the loaded mod
 | Rejected loudly | Qwen3-Next (fused-qkvz GDN), grouped ds3-router MoE (DeepSeek-V3), softplus headwise attention gating (Laguna), non-NeoX RoPE | — |
 
 MoE note: the plain `gate_proj`/`up_proj`/`down_proj` targets adapt dense MLPs and the always-active shared expert; routed experts are opt-in (`expert_gate_proj` etc., with `--expert-r` for rank). Routers stay frozen. On AFMoE the *attention* gate is keyed `self_attn.gate_proj` in the checkpoint and rides the `gate_proj` target (or `attn_gate_proj` to adapt it alone). Spark-X2.5's headwise gate (`self_attn.g_proj`, one scalar per head, fp16) is opt-in only: name `g_proj` or `attn_gate_proj` in `targets` to adapt it; the default target list leaves it frozen.
+
+### Streaming routed experts from host RAM (16 GB cards)
+
+`--stream-experts` (YAML `stream_experts: true`) keeps every routed expert's packed EXL3 weights in page-locked host RAM and copies them into a small VRAM ring one MoE layer at a time, one layer ahead of the compute (`exllamav3/training/expert_stream.py`). The dense trunk, routers, shared experts, embedding and head stay on the GPU; the model is loaded block by block so the peak during loading is the trunk plus one layer's experts. It is value-exact: the reconstruct kernel reads the same bytes from the ring slot that it would have read from the resident tensor, so a same-seed streamed run gives the same loss as a resident run. The cost is bandwidth: each MoE layer's experts cross PCIe once per pass, three passes per step under gradient checkpointing (two with `--dequant-cache`) — on Qwen3.8-Flash-Next at 2.05 bpw that is ~31 GB per pass, a few seconds per step on PCIe 4 x16, overlapped with the layer's own compute. `--stream-experts-slots N` (default 2) prefetches further ahead at one layer's experts of VRAM per extra slot.
+
+Requirements: one GPU (`--parallel single`), Linux, EXL3-quantized experts, and host RAM for all of them plus the usual working set — checked before loading (Qwen3.8-Flash-Next 2.05bpw: ~31 GB of experts, so >= 64 GB with `--ngram-ram`, ~48 GB with the n-gram table left on disk). Not combinable with `--parallel split`, `--vram-spillover`, routed-expert adapters (`expert_*` targets, `--expert-r`) or live samples (`--sample-every` must be 0: samples run the inference forward, which needs resident experts; for inference on the same card the inference side has its own CPU expert offload, `EXL3_MOE_CPU_OFFLOAD` in [`doc/env_vars.md`](doc/env_vars.md), untested with an adapter here).
+
+Qwen3.8-Flash-Next on a single 16 GB card — **untested recipe**: nothing on this path has run on a box yet, and the first run is the test (budget per the plan: ~2 GB dense weights, ~1.3 GB for two expert slots, ~1 GB of stream-stack activations offloadable, < 0.5 GB adapters + 8-bit Adam, the 248k-vocab head chunked):
+
+```bash
+python training/qlora_train_native.py --model /models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4 \
+  --stream-experts --sample-every 0 \
+  --targets q_proj k_proj v_proj o_proj z_proj b_proj a_proj gate_proj up_proj down_proj \
+  --r 16 --alpha 32 --optim adamw8bit --offload-activations --attn-impl flash \
+  --seq-len 512 --batch 1 --grad-accum 4 --steps 30 --lr 1e-4 \
+  --head-vocab-chunk 32768 --lora-head \
+  --dataset /data/my-set.jsonl --messages-key messages --out out/qwen38-flash-next-lora
+# add --ngram-ram with >= 64 GB of host RAM (the n-gram table in RAM instead of streamed from disk)
+```
+
+(`q/k/v/o_proj` also select the Gated DeltaNet in/out projections; `z/b/a_proj` its gate/beta/decay projections; `gate/up/down_proj` the always-active shared expert.) The run prints one `expert streaming: ... layers parked ...` line after loading and a `[STREAM]` line at the end with the copy counts; a `!! expert streaming: parking layer ... freed ... MiB` warning during loading means something still holds the device copies and the budget will not hold. Full plan and status: [`doc/qwen38_flash_next_plan.md`](doc/qwen38_flash_next_plan.md).
 
 ### Prompt formats (`--prompt-format` / `prompt_format:`)
 

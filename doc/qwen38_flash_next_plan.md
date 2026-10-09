@@ -8,15 +8,31 @@ Written 2026-10-09 (Session 57, after the v1.6.0 sync, PR #167).
   branch needs a box with >= 48 GB VRAM (two 3090s or more); it does NOT run on 16 GB yet.
 - **Phase B (box run): not started** — waits on someone with the hardware (the user or
   pineapple) running the validate gate below.
-- **Phase C (expert streaming, the 16 GB tier): not started.** This is the piece a 16 GB card
-  needs; without it the expert load alone (~31 GB) fails. It can be built here without a box,
-  with a CPU value-identity test, the same way Phase A was.
-- **Phase D (recipe): not started.**
+- **Phase C (expert streaming, the 16 GB tier): built in Session 59, CPU-tested (6 tests in
+  `tests/test_expert_stream.py`: the streamed `_moe_out` forward + backward is bit-identical to
+  the resident one), on the same branch. Not box-verified.** `--stream-experts` on the trainer,
+  `exllamav3/training/expert_stream.py`. The validate gate cannot run streamed (its reference
+  is the inference forward, which needs resident experts), so on 16 GB the first run IS a
+  training run; the Phase C gate is the same-seed loss comparison against a resident run on
+  the 48 GB box (section 8).
+- **Phase D (recipe): in the README ("Streaming routed experts from host RAM"), marked
+  untested.** The recipe has `--sample-every 0`: live samples are an inference forward.
 - Corrections to the plan below, found while building: (1) QSA is exact for `t <= threshold`
   (inference engages the indexer at `seqlen > threshold`), so the guard refuses `t > 2051`,
   not `>=`; (2) open question "hyper-connection weights after load" is closed — the `up` table
   is recovered from the always-resident `upx_h` repack by the same permutation the inference
-  `_tiled_tables` uses, so no `keep_source_weights` load and no safetensors re-read is needed.
+  `_tiled_tables` uses, so no `keep_source_weights` load and no safetensors re-read is needed;
+  (3) Phase C streams only `trellis` — `suh`/`svh` are pre-cast copies inside the DiffLinear
+  wrappers and stay in VRAM — and hooks `inner.get_inner_weight_tensor` rather than
+  `_moe_out`, so the Functions' backward re-reconstruction (no grad checkpointing) is covered
+  too; no trainer-side phase flag is needed, the traversal direction is inferred from the
+  access order; (4) the inference fast-path objects (`BC_LinearEXL3` holds the trellis as an
+  `at::Tensor` member, `BC_BlockSparseMLP` holds those, `MultiLinear` / `BatchReconLayer`
+  hold raw device addresses) must be dropped or the VRAM never comes back, and MoE blocks must
+  load outside the deferred-load slab arena (each expert's `suh`/`svh` sits between trellis
+  tensors, so no slab block would ever be freed); (5) `--sample-every` must be 0 under
+  streaming, and routed-expert adapters / `--expert-r` are refused (17 GB of fp32 adapter state
+  at r=16 on 512 x 48 experts).
 
 **Test recipe for the branch (48 GB+ box, 2.05bpw pack; `--ngram-ram` only with >= 64 GB host
 RAM, else the disk-streaming default):**
@@ -183,6 +199,17 @@ norm rounding points). Those are the first suspects if the gate fails.
 
 ## 4. Phase C: streamed frozen experts (the 16 GB target)
 
+**Done in Session 59** (`exllamav3/training/expert_stream.py`: `ExpertStreamer` (park / ensure /
+LRU ring / prefetch), `park_block`, `load_streaming`, `incompatible_flags`; trainer flags
+`--stream-experts`, `--stream-experts-slots`). Notes against the items below: item 1 pins ONE
+exactly-sized `PinnedArena` per layer (torch's pinned allocator rounds to powers of two: 31 GB
+would lock ~48 GB) holding only the `trellis` tensors; item 2's `ensure_resident` is a hook on
+each expert `inner.get_inner_weight_tensor`, there is no explicit `release` (LRU eviction, never
+the current layer; the side stream waits on the compute stream before refilling a slot) and no
+phase flag (direction inferred: layer 0 = forward, a descent or the first repeat of the last
+layer = backward; steady state has no synchronous copy); item 6 also requires `--sample-every 0`
+and refuses `--expert-r`; item 7's gate is unchanged and still to run.
+
 The differentiable MoE path (`_moe_out`) reconstructs each touched expert's inner trellis
 weight on the fly via `frozen_trellis_parts` -> `inner.get_inner_weight_tensor()`, a CUDA
 kernel over `inner.trellis` (+ `suh`/`svh`, codebook). The only thing that has to change is
@@ -225,17 +252,21 @@ Design:
 
 ## 5. Phase D: the recipe for the 16 GB user
 
+In the README ("Streaming routed experts from host RAM (16 GB cards)"), marked untested. Same
+command (target names verified against the trainer's alias tables: `q/k/v/o_proj` also select
+the GDN in/out projections, `z/b/a_proj` its gate/beta/decay projections, `gate/up/down_proj`
+the shared expert; live samples are off because they are an inference forward):
+
 ```
 python training/qlora_train_native.py --model <Qwen3.8-Flash-Next-exl3 2.05bpw_h4_ng4> \
-  --stream-experts --ngram-ram \
-  --targets q_proj k_proj v_proj o_proj qkv_proj z_proj b_proj a_proj shared_up shared_gate shared_down \
+  --stream-experts --sample-every 0 [--ngram-ram] \
+  --targets q_proj k_proj v_proj o_proj z_proj b_proj a_proj gate_proj up_proj down_proj \
   --r 16 --alpha 32 --optim adamw8bit --offload-activations --attn-impl flash \
   --seq-len 512 --batch 1 --grad-accum 4 --steps 30 --lr 1e-4 \
-  --head-vocab-chunk 32768 --lora-head --sample-every 10
+  --head-vocab-chunk 32768 --lora-head --dataset <jsonl> --out <dir>
 ```
-(exact target leaf names per `backbone.gdn_projections` / `moe_shared_projections`.)
-Requirements: Linux, >= 64 GB RAM (48 GB with the n-gram table on NVMe), the 2.05bpw pack
-(~60 GB on disk), flash-attn for head_dim 256.
+Requirements: Linux, >= 64 GB RAM with `--ngram-ram` (48 GB with the n-gram table on NVMe), the
+2.05bpw pack (~60 GB on disk), flash-attn for head_dim 256.
 
 ## 6. Risks and open questions
 
@@ -274,12 +305,16 @@ Requirements: Linux, >= 64 GB RAM (48 GB with the n-gram table on NVMe), the 2.0
 ## 8. Session plan
 
 1. Session 58: Phase A items 1-8 with CPU tests, branch pushed. **Done.**
-2. Next session (no box needed): build Phase C (`training/expert_stream.py`,
-   `--stream-experts`, host-RAM check, `--parallel split` / `--vram-spillover` rejected with
-   it) with a CPU test that the streamed MoE forward is value-identical to the resident one
-   (mock experts, same `_moe_out`), and the Phase D recipe into the README marked untested.
-   Push to the same branch so a 16 GB tester can try it.
+2. Session 59: Phase C (`training/expert_stream.py`, `--stream-experts`, host-RAM check,
+   rejections) with the CPU value-identity test, and the Phase D recipe in the README marked
+   untested. **Done**, same branch.
 3. When a box is available: Phase A validate gate -> `--check-backward` -> Phase B run (48 GB
-   box), then the Phase C bit-exact gate and the 16 GB run. Fix what they find; Session
-   entries with numbers.
-   If the gate fails on the branch before Phase C is built, fixing it comes first.
+   box), then the Phase C gate: the SAME command with `--stream-experts --sample-every 0`
+   (resident run also with `--sample-every 0`, same seed) must print bit-identical losses;
+   the load must not print the `!! expert streaming: parking layer ... freed` warning, and the
+   final `[STREAM]` line should show ~1 synchronous copy per pass boundary (first step, after
+   each eval) with everything else prefetched. Then the 16 GB run (README recipe), seconds per
+   step vs the cost model, `--dequant-cache` and `--stream-experts-slots 3` as A/Bs. Fix what
+   they find; Session entries with numbers.
+   If the Phase A gate fails, fixing it comes first; Phase C only moves the experts' bytes
+   and cannot be what fails the gate.

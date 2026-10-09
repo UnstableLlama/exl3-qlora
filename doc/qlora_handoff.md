@@ -5394,6 +5394,104 @@ and the 16 GB recipe are unbuilt; the plan's sections 4–5 stand.
 
 ---
 
+### Session 59 — Qwen3.8-Flash-Next Phase C: streamed frozen experts (`--stream-experts`), CPU-tested, awaiting the box
+
+> Written 2026-10-09 on branch `feat/qwen38-flash-next`, on top of Session 58's Phase A.
+> Plan: `doc/qwen38_flash_next_plan.md` section 4 (status block updated). CPU-tested in the
+> scratch CPU-torch venv: `tests/test_expert_stream.py` (6) plus the existing native_llama /
+> hyperconnections / ple / qlora_grad / dequant_fast / gdn suites (36 pass; the two
+> `model_dir` tiers are box-only as before). **Not box-verified.** Nothing on this branch
+> has run on a GPU yet; the box list below is the whole of the evidence still missing.
+
+**What this is.** The 16 GB tier of the plan: Qwen3.8-Flash-Next's routed experts are ~31 GB
+at 2.05 bpw, so a single 16 GB card cannot even load them. The differentiable MoE forward
+never holds dense expert weights — every touched expert's inner weight is reconstructed on
+the fly by `LinearEXL3.get_inner_weight_tensor`, which reads `inner.trellis` by attribute at
+call time and allocates its output on that tensor's device — so the only thing that has to
+move is where the packed `trellis` lives between uses: a pinned host slab while parked, a
+VRAM ring slot while the layer is being computed. Value-exact by construction (copies don't
+round; the kernel and everything downstream are unchanged).
+
+**Built:**
+
+- `exllamav3/training/expert_stream.py` (new): `ExpertStreamer` — `park(inners)` per MoE
+  layer (one exactly-sized `PinnedArena` per layer, trellis tensors back to back at 256 B
+  alignment, each `inner.trellis` rebound to its host slice, `inner.get_inner_weight_tensor`
+  wrapped by an instance-level hook); `ensure(layer)` — on a miss copies the slab H2D into
+  the LRU of N ring slots on a side stream (which first waits on the compute stream, so a slot
+  is never refilled under a kernel still reading it), rebinds every expert's `trellis` to a
+  slot view, makes the compute stream wait on the copy event once, then prefetches the next
+  `N-1` layers in the traversal direction; evicted layers are rebound to their HOST views so a
+  stale read fails on the kernel's device check instead of reading another layer's bytes.
+  Direction is inferred from the access order (layer 0 = forward; any descent or the first
+  repeat of the last layer = backward), so no trainer-side phase flag exists, and after a
+  backward ends at layer 0 the ring already holds layers 0 and 1 for the next step — steady
+  state has no synchronous copy. `park_block(streamer, mlp)` is the exllamav3 glue: parks a
+  `BlockSparseMLP`'s gates/ups/downs (EXL3 only, else refused) and drops the inference
+  fast-path objects that hold their own references to the device copies — `inner.bc`
+  (`BC_LinearEXL3` keeps the trellis as an `at::Tensor` member), `mlp.bc`
+  (`BC_BlockSparseMLP`, shared_ptrs to those), `multi_gate/up/down` and `batch_recon`
+  (raw device address tables that would read freed memory), `fused_mode_buffers`.
+  `load_streaming(model, device, slots)` mirrors `Model._load_single` (deferred fills,
+  prefer_cpu modules on CPU, shared scratch released) but parks each MoE block as soon as its
+  tensors land, so the loading peak is the dense trunk plus one layer's experts; MoE blocks
+  load with `begin_deferred_load(arena=False)` because in the slab arena every expert's
+  `suh`/`svh` sits between trellis tensors and no 128 MB slab would ever be freed. It checks
+  the total expert bytes against host memory from the safetensors headers BEFORE loading,
+  and after each park measures the VRAM that came back, printing a loud `!!` warning if less
+  than half the layer's bytes were freed (a lingering reference). `incompatible_flags`
+  returns the user-facing reasons for the refused combinations.
+- `training/qlora_train_native.py`: `--stream-experts`, `--stream-experts-slots` (default 2);
+  the combination check runs right after argument parsing (`--parallel split`,
+  `--vram-spillover`, `--sample-every > 0` — live samples are an inference forward whose fused
+  MoE kernels need resident expert tables — `expert_*` targets and `--expert-r`); the load
+  branch calls `load_streaming` and prints the streamer's description; a `[STREAM]` line with
+  copy / prefetch / synchronous-miss / hit counts after `[PERF]`.
+- `training/qlora_train.py` + `training/qlora_train_config.yaml`: `stream_experts`,
+  `stream_experts_slots` as single-backend keys, and `ngram_ram`, which Session 58 added to
+  the CLI but not to the YAML driver's key list (the driver rejects unknown keys).
+- README: the Qwen3.8 row points at a new "Streaming routed experts from host RAM (16 GB
+  cards)" section with the mechanism, requirements, refusals and the untested recipe (target
+  names verified against the alias tables: `q/k/v/o_proj` also select the GDN in/out
+  projections, `z/b/a_proj` its gate/beta/decay, `gate/up/down_proj` the shared expert).
+
+**CPU evidence** (`tests/test_expert_stream.py`): mock EXL3 inners whose weight is DERIVED
+FROM THE TRELLIS BYTES at call time (so a wrong or stale slot would change the weight): three
+real `_moe_out` layers with a LoRA'd shared expert, streamed forward + backward bit-identical
+to resident, every reconstruct saw a slot view, never more than 2 layers resident, exactly 1
+synchronous miss and 3 prefetches for forward + backward; a scripted forward / backward /
+forward sequence gives the expected copies (5 total, 1 synchronous), evicts the right layers,
+rebinds evicted layers to host views and resident ones to slot views holding the right bytes;
+a 3-slot ring prefetches two ahead and evicts the previous layer; `unpark_all` restores
+tensors and removes hooks; `park_block` nulls the six inference references and refuses an
+fp16 expert; `incompatible_flags` names all five refused flags and passes the good combo.
+
+**Not covered on CPU (box list, in order):**
+1. The Phase A validate gate first (Session 58 list) — Phase C only moves the experts'
+   bytes and cannot be what fails that gate.
+2. 48 GB box: Phase B's command with `--sample-every 0`, twice, same seed, once resident and
+   once with `--stream-experts`. Losses must be bit-identical. The load must not print the
+   `!! expert streaming: parking layer ... freed` warning (if it does, something else holds the
+   device trellis — `vram_accounting` / `list_gpu_tensors` will name it); peak VRAM on the
+   streamed run should be the dense trunk + 2 slots (~1.3 GB) + activations; the `[STREAM]`
+   line should show ~1 synchronous copy per pass boundary (first step, after each eval pass)
+   and everything else prefetched.
+3. The 16 GB run per the README recipe (host RAM >= 48 GB without `--ngram-ram`, >= 64 GB
+   with). Record s/step against the cost model (3 x ~31 GB per step over PCIe 4 x16 ≈ 4–8 s),
+   then `--dequant-cache` (2 passes) and `--stream-experts-slots 3` as A/Bs.
+4. Things the CPU tests cannot see: the pinned-arena fallback path (RLIMIT_MEMLOCK too low →
+   pageable + synchronous copies, warned once by `PinnedArena`); `side.wait_stream` /
+   `wait_event` ordering under the real autograd engine's stream use; `torch.inference_mode`
+   tensors (the host slabs are created inside the load's inference mode, the slots outside)
+   feeding the Functions — the existing resident path already does the former.
+
+**Open after this session:** everything above is box work. Known limitation by design: no
+live samples and no validate gate on the streaming tier (both are inference forwards); the
+inference side's own CPU expert offload (`EXL3_MOE_CPU_OFFLOAD`) is the route to generate
+with the adapter on a 16 GB card, untested here.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
