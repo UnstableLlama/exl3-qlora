@@ -5256,6 +5256,45 @@ the dropped Parameter workaround isn't needed there anymore.
 
 ---
 
+### Session 57 — Upstream sync v1.6.0 (ROCm backend lands upstream; nothing on the training path to adopt)
+
+> Written 2026-10-09 on branch `sync/upstream-v1.6.0`: 45 upstream commits
+> (v1.5.4 → v1.6.0, merge commit as usual). CPU-tested (realtime / preference /
+> chat_turns / chat_jinja / qlora_grad / fused_ce: 83 pass in a scratch CPU-torch
+> venv, the one `model_dir` test is box-only as before); **not box-verified** —
+> smoke list below.
+
+**Merge:** one conflict, `.gitignore` — upstream added hipify output patterns
+next to our training-output block; both kept. The runtime-LoRA guards in
+`block_sparse_mlp.py`, `attn.py` and `sliding_attn.py` auto-merged: upstream's
+edits there are a new `util/backend.py` that supplies per-backend defaults for
+the module-level knobs (`QKV_SLICE`, `MOE_FUSED_ROWS`, `MOE_BATCH_RECON`,
+`MOE_MTILE` — the `EXL3_*` env vars still override, now read in one place) and a
+ROCm-safe `host_to_device()` in place of `.to(device, non_blocking=True)`; the
+`has_runtime_lora` branches are untouched. `linear.py` auto-merged too: the
+pinned-weight alias (`pin_alias`) now draws from a `PinnedArena` slab rather
+than torch's power-of-two pinned allocator; that is the inference CPU-offload
+tier, not our training `--cpu-offload`. README parity note bumped in both places.
+
+**What v1.6.0 is:** almost entirely the ROCm port (unified CUDA/ROCm kernel
+map, WMMA wrappers, gfx10/11/12 wheels, ROCm graphs off by default) plus
+`PinnedArena`, a `Generator.close()`, a CPU-MoE host-core reservation (pinning
+off by default on Linux), a dense decode-split row layout in the paged attention
+kernels, and a Qwen3.8 image-MRoPE enable in the generator. The latter is
+inference-side; our vision path builds its own mRoPE positions in
+`exllamav3/training/`. No change to the modules the differentiable forward
+imports via importlib beyond the backend-knob refactor above.
+
+**Box list:** (1) `qlora_validate_native.py` on a small dense quant (attention
+`max_kv_len` host-bound change in `attn.py`, `util/backend.py` import chain);
+(2) a short `qlora_train_native.py` run on a MoE quant for the
+`block_sparse_mlp` merge (`host_to_device` in the batched reconstruct tables);
+(3) if anyone uses the inference CPU-offload tier alongside a loaded adapter,
+one decode with a LoRA attached to confirm `PinnedArena`-backed pinned weights
+still go through `apply_lora`.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
