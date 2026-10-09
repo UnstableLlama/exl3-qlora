@@ -5295,6 +5295,105 @@ still go through `apply_lora`.
 
 ---
 
+### Session 58 — Qwen3.8-Flash-Next (qwen4_exp) Phase A: architecture port, CPU-tested, awaiting the box
+
+> Written 2026-10-09 on branch `feat/qwen38-flash-next` (off master after PR #167).
+> Plan: `doc/qwen38_flash_next_plan.md` (committed with this session; section 2
+> is this phase). CPU-tested in a scratch CPU-torch venv: the two new suites
+> (`test_hyperconnections_train.py` 8, `test_ple_train.py` 4) plus the existing
+> native_llama / gdn / qlora_grad / fused_ce / realtime / preference / chat_turns /
+> chat_jinja / vision_training suites (106 pass; `model_dir` is box-only as before).
+> **Not box-verified** — the validate gate is the next step, list below.
+
+**What the model needs that the trainer didn't have** (plan section 1): the
+residual is a `(b, t, 4, 2560)` fp32 stream stack, every sublayer site is a
+`GatedResidual` hyper-connection (low-rank sigmoid mix of the per-stream-normed
+streams in, per-stream `2*sigmoid` inject out) instead of a pre-norm + residual
+add, there is no final RMSNorm (a combine-less mixer collapses the stack), the GDN
+output norm is sigmoid-gated, the full-attention layers carry a QSA indexer, and a
+`PLELayer` between blocks 0 and 1 adds hashed n-gram features (51B-row table) into
+the streams. `_decoder_layout` rejected it at `ExpandStreams`.
+
+**Built:**
+
+- `training/hyperconnections.py` (new, pure torch): `expand_streams`,
+  `gated_residual_mix` (transcription of `GatedResidual._mix_ref`, the inference
+  parity reference: per-stream RMSNorm with the resident `1 + w` table,
+  `silu(down/H)`, `sigmoid(up)`, mean over streams, `2*sigmoid(inject/H)`),
+  `gated_residual_apply`, `streams_mean`.
+- `training/ple.py` (new, pure torch): `ple_delta` = transcription of
+  `PLELayer.forward_streams_reference` + `_short_conv` (zero state = left pad of
+  `(k-1)*dilation` = 9 zeros) + the `ple_gate` kernel's signed-sqrt sigmoid
+  (`sign(g)*sqrt(max(|g|,1e-6))`, zero-safe). The n-gram rows come from the
+  inference module under `no_grad` (`backbone.ple_ngram_embed`: `_prepare_ids` →
+  `_history` eos-pads `ngram_size-1` ids → `NGramEmbedding.forward`), i.e. the
+  fresh-sequence convention `PLELayerState.clear` restores.
+- `backbone.py`: the layout accepts `ExpandStreams` as the only pre-module,
+  `PLELayer` between blocks (`ple_layout`: `{block index it runs BEFORE: module}`),
+  and a combine-less `GatedResidual` in the final-norm slot (`is_gated_residual`,
+  `output_device`). `block_hc_sites` / `gated_residual_spec` read the sites'
+  RESIDENT tables — `down`/`inject` are views of `proj_h`, and `up` is recovered
+  from the always-kept fused-kernel repack `upx_h` by the same permutation
+  `_tiled_tables` uses — so no `keep_source_weights` load is needed (the plan's
+  open question 6 is closed). `assert_block_supported` accepts hc sites (both
+  GatedResidual, no pre/post norms, no layer scalar, no alt-residual MoE; mHC
+  `HyperConnection` rejected) and a QSA indexer; `block_metadata` carries
+  `qsa_threshold = sparse_threshold()`; `gdn_norm_spec` carries
+  `gate_activation` (asserted silu/sigmoid, not gate-first, not grouped);
+  `norm_spec` views a grouped norm's weight `[groups, dim]` (the PLE norms).
+  `ple_spec` / `ple_projections` / `ple_ngram_embed`.
+- `native_llama.py`: `_site_in` / `_site_out` replace the norm / add pairs in
+  all three block kinds (attn, GDN, ShortConv) — pre-norm blocks take exactly
+  the old path, hc blocks mix → sublayer in compute dtype → inject into the fp32
+  stack. `_forward_trunk`: `expand_streams` after the embedding (+ embed norm /
+  image splice, in module order), `_run_ple` before the recorded block (lookup
+  outside the checkpoint, projections/gate/conv inside it), the final mixer in
+  place of the final norm (`compute_dtype` round, then fp32, like the norm
+  path), EBFT taps read the stream MEAN (the inference block's export),
+  `qsa_threshold = min` over layers with a per-forward refusal of `t >
+  threshold` (inference engages the indexer at `seqlen > threshold`, so `<=` is
+  exact), packing refused on PLE models. PLE key/value projections are frozen
+  DiffLinears (`aliases=()`); hc tables, router, indexer are never targets.
+- `gdn.py`: `gdn_gated_rmsnorm` applies `sigmoid(z)` when the spec says so
+  (default silu, Qwen3.5/3.6 unchanged; unknown activation asserts).
+- Scripts: `--ngram-ram` on both the trainer and the validate gate
+  (`config.infer_params.ngram_stream_from_disk = False`, the inference
+  `--ngram_ram`); the trainer refuses `--seq-len > qsa_threshold` and `--pack`
+  on PLE models up front. README table row.
+
+**CPU evidence:** mix/apply vs `_mix_ref` 1e-6, fp64 gradcheck; hc attention
+block and hc GDN block (sigmoid AND silu gates, and they differ) vs independent
+compositions 1e-4; backward reaches every adapter and all four streams, base and
+hc tables untouched; trunk `expand → 2 hc blocks → final mixer` vs the hand
+chain 1e-4, taps = stream mean, QSA guard accepts `t == threshold` and refuses
+`t == threshold + 1`. PLE: `ple_delta` vs the reference transcription 1e-5,
+conv-off = gated values exactly, gate zero-safe, fp64 gradcheck, conv taps at
+`{p, p+3, p+6, p+9}` only, `_run_ple` builds the eos-padded history once and
+checkpoint parity holds.
+
+**Not covered on CPU (box list, in order):**
+1. `qlora_validate_native.py --model <Qwen3.8-Flash-Next-exl3 2.05bpw_h4_ng4>
+   --parallel split` on the 2×3090 (`--ngram-ram` if RAM allows, else the disk
+   default), ≥3 prompts with different first tokens (PLE fresh-sequence
+   convention), one near 2048 tokens. Expect: the layout assertions in
+   `_decoder_layout` / `assert_block_supported` pass on the real modules
+   (PLE `conv_w` shape `[10240, 1, 4]`, grouped norms, `upx_h` present), then the
+   argmax gate. If the gate fails, the first suspects are (a) the mix's dtype
+   boundary (inference hands the sublayer half; we hand compute dtype), (b) the
+   GDN norm's constant_bias under the sigmoid path (we apply `w + bias`; the
+   kernel does too, the torch fallback does not — bias is 0 on this model so it
+   can't matter here), (c) the PLE norm rounding points (noted in `ple_delta`).
+2. `--check-backward` (cross-device stream stack migration).
+3. Phase B per the plan section 3 (30 steps, `--seq-len 512 --batch 1
+   --grad-accum 4 --head-vocab-chunk 32768 --lora-head --offload-activations`).
+4. `describe_attn` prints the attention layers as plain attention (the indexer
+   is not mentioned); cosmetic.
+
+**Open after this session:** Phase C (streamed frozen experts, `--stream-experts`)
+and the 16 GB recipe are unbuilt; the plan's sections 4–5 stand.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the

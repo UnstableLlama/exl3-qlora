@@ -2066,6 +2066,11 @@ def _run_main():
                          "HF/Unsloth GA fix). mean: the pre-Session-11 mean-of-"
                          "means (over-weights tokens in short micro-batches), "
                          "kept for reproducing old runs. No-op at --grad-accum 1.")
+    ap.add_argument("--ngram-ram", action="store_true",
+                    help="PLE models (Qwen3.8-Flash-Next): hold the hashed n-gram "
+                         "embedding table fully in system RAM instead of streaming "
+                         "rows from disk per forward (tens of GB of RAM; the "
+                         "inference loader's --ngram_ram).")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
                     help="Frozen-weight dequant path (audit A1). fast (default): "
                          "reconstruct only the inner trellis weight and apply the "
@@ -2208,6 +2213,9 @@ def _run_main():
     # 1. Load native model + tokenizer (the forward that's correct on EXL3).
     _FAIL_CTX["phase"] = "load_model"
     config = Config.from_directory(args.model)
+    if args.ngram_ram:
+        # Read by NGramEmbedding.load(); the default streams rows from disk.
+        config.infer_params.ngram_stream_from_disk = False
     model = Model.from_config(config)
 
     # The KV cache must be created BEFORE model.load() so each attention layer
@@ -2312,11 +2320,19 @@ def _run_main():
                  if not net.trunk_trainable() else
                  f"trained jointly (loss = trunk + {args.mtp_loss_weight:g} * mtp)"))
     if args.pack and (getattr(net, "has_gdn", False)
-                      or getattr(net, "has_shortconv", False)):
+                      or getattr(net, "has_shortconv", False)
+                      or getattr(net, "has_ple", False)):
         raise SystemExit(
-            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6) or ShortConv "
-            "(LFM2) models: the recurrence / causal conv would carry state "
-            "across packed document boundaries. Drop --pack and train unpacked.")
+            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6), ShortConv "
+            "(LFM2) or PLE (Qwen3.8-Flash-Next) models: the recurrence / causal "
+            "conv / n-gram history would carry state across packed document "
+            "boundaries. Drop --pack and train unpacked.")
+    if net.qsa_threshold is not None and args.seq_len > net.qsa_threshold:
+        raise SystemExit(
+            f"--seq-len {args.seq_len} exceeds this model's QSA dense-attention "
+            f"threshold ({net.qsa_threshold}): the native forward attends densely "
+            f"and only reproduces inference up to that length. Use --seq-len <= "
+            f"{net.qsa_threshold}.")
     if args.head_vocab_chunk and net._head_slice is None:
         print(" -- note: --head-vocab-chunk set but this head can't slice; using "
               "the single-shot fused head.")
