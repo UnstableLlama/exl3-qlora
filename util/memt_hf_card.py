@@ -164,8 +164,9 @@ tags:
   <div class="content-panel">
     <div class="panel-title">Usage</div>
     <div class="panel-body">
-      Install the fork into TabbyAPI's venv and launch Tabby on a revision. Memory is on by default for this model.
-      <div class="terminal-box">EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./venv/bin/python main.py --model-name ./MemT-1.0-Nano-exl3-{first} --max-seq-len 32768</div>
+      Run TabbyAPI's <code>./start.sh</code> once so it sets up its venv, then install the fork into that venv (the script only installs
+      dependencies on its first run, so it won't overwrite the fork). Launch on a revision. Memory is on by default for this model.
+      <div class="terminal-box">EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./start.sh --model-name ./MemT-1.0-Nano-exl3-{first} --max-seq-len 32768</div>
       <br/>
       Chat normally. Type <code>/commit</code> to memorize the conversation so far (the prompt the model reads shrinks to what came
       after), or <code>/commit every 3</code> to let it memorize on its own. Edits roll memory back, regenerations don't memorize

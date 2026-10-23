@@ -22,7 +22,9 @@ TabbyAPI needs no changes.
 
 - Two 24 GB GPUs (the 6 bpw EXL3 quant is ~27 GB; the memory block is bf16, ~0.9 GB).
 - This fork of exllamav3 (branch with MemT support) installed into TabbyAPI's venv in editable
-  mode, `flash-attn`, and `fla` (flash-linear-attention, for fast long commits; optional, falls
+  mode. Run Tabby's `./start.sh` once first so it creates the venv and installs its own
+  dependencies; it only does that on the first run, so it won't overwrite the fork later.
+- `flash-attn`, and `fla` (flash-linear-attention, for fast long commits; optional, falls
   back to a slow exact scan).
 - The model directory: an EXL3 quant of Qwen3.6-35B-A3B plus the MemT files. See "Model
   directory" below.
@@ -30,7 +32,7 @@ TabbyAPI needs no changes.
 ## Quick start
 
     cd tabbyAPI
-    EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./venv/bin/python main.py --model-name /path/to/MemT-1.0-Nano-exl3-6.00bpw --max-seq-len 32768
+    EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./start.sh --model-name /path/to/MemT-1.0-Nano-exl3-6.00bpw --max-seq-len 32768
 
 Open the Tabby chat UI and talk to it. By default every exchange is memorized as soon as the
 next message arrives, so the model is always running on a short prompt. Send `/commit` at any
