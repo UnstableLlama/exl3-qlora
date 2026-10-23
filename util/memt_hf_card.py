@@ -132,6 +132,16 @@ tags:
   </div>
 
   <div class="content-panel">
+    <div class="panel-title">Demo</div>
+    <div class="panel-body">
+      <video src="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/resolve/main/memt_demo.mp4" controls width="100%"></video>
+      <br/>
+      MemT-1.0-Nano at 6 bpw on two RTX 3090s. Watch the cache and prompt history get wiped after the <code>/commit</code>
+      (the prompt drops from 1858 tokens to 21), yet the model still remembers the story when asked the next question.
+    </div>
+  </div>
+
+  <div class="content-panel">
     <div class="panel-title">Repo Data</div>
     <div class="panel-body repo-data-body repo-data-panel">
 {graphs}      <div class="table-wrapper">
