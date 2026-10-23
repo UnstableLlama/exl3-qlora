@@ -130,7 +130,7 @@ tags:
     <div class="panel-body">
       Run TabbyAPI's <code>./start.sh</code> once so it sets up its venv, then install the fork into that venv (the script only installs
       dependencies on its first run, so it won't overwrite the fork). Launch on a revision. Memory is on by default for this model.
-      <div class="terminal-box">EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./start.sh --model-name ./MemT-1.0-Nano-exl3-3.00bpw --max-seq-len 32768</div>
+      <div class="terminal-box">EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./start.sh --model-name MemT-1.0-Nano-exl3-3.00bpw --max-seq-len 32768</div>
       <br/>
       Chat normally. Type <code>/commit</code> to memorize the conversation so far (the prompt the model reads shrinks to what came
       after), or <code>/commit every 3</code> to let it memorize on its own. Edits roll memory back, regenerations don't memorize
@@ -146,7 +146,8 @@ tags:
   <div class="content-panel">
     <div class="panel-title">CLI Download</div>
     <div class="panel-body">
-      <div class="terminal-box">hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision "3.00bpw" --local-dir ./MemT-1.0-Nano-exl3-3.00bpw</div>
+      Run from the tabbyAPI folder, so the model lands in Tabby's <code>models</code> folder.
+      <div class="terminal-box">hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision "3.00bpw" --local-dir models/MemT-1.0-Nano-exl3-3.00bpw</div>
     </div>
   </div>
 

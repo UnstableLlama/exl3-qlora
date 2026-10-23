@@ -32,7 +32,7 @@ TabbyAPI needs no changes.
 ## Quick start
 
     cd tabbyAPI
-    EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./start.sh --model-name /path/to/MemT-1.0-Nano-exl3-6.00bpw --max-seq-len 32768
+    EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./start.sh --model-name MemT-1.0-Nano-exl3-6.00bpw --max-seq-len 32768
 
 Open the Tabby chat UI and talk to it. By default every exchange is memorized as soon as the
 next message arrives, so the model is always running on a short prompt. Send `/commit` at any
@@ -87,7 +87,7 @@ through fla's chunked KDA kernel for long turns. Reading memory during decode is
 Ready-made directories are on Hugging Face as `UnstableLlama/MemT-1.0-Nano-exl3`, one branch per
 quantization (`3.00bpw`, `5.00bpw`, `6.00bpw`):
 
-    hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision 6.00bpw --local-dir ./MemT-1.0-Nano-exl3-6.00bpw
+    hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision 6.00bpw --local-dir models/MemT-1.0-Nano-exl3-6.00bpw
 
 Each is a stock EXL3 quant of Qwen3.6-35B-A3B (yeasah's, byte for byte) plus the MemT pieces from the
 release: `memt_block.safetensors` (the memory block weights, bf16), the MemT `config.json` /
