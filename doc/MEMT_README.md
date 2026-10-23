@@ -30,10 +30,7 @@ TabbyAPI needs no changes.
 ## Quick start
 
     cd tabbyAPI
-    EXL3_MEMT_SNAPSHOT_DIR=/path/to/memt_snapshots \
-      ./venv/bin/python main.py --model-name /path/to/MemT-1.0-Nano-exl3-6.00bpw \
-      --draft-mode disabled --max-seq-len 32768 --cache-size 32768 --gpu-split 20 23 \
-      --tool-format auto --reasoning-start-token "<think>" --reasoning-end-token "</think>"
+    EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./venv/bin/python main.py --model-name /path/to/MemT-1.0-Nano-exl3-6.00bpw --max-seq-len 32768
 
 Open the Tabby chat UI and talk to it. By default every exchange is memorized as soon as the
 next message arrives, so the model is always running on a short prompt. Send `/commit` at any
