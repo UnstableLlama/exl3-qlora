@@ -85,7 +85,7 @@ through fla's chunked KDA kernel for long turns. Reading memory during decode is
 ## Model directory
 
 Ready-made directories are on Hugging Face as `UnstableLlama/MemT-1.0-Nano-exl3`, one branch per
-quantization (`3.00bpw`, `5.00bpw`, `6.00bpw`):
+quantization (`3.00bpw`, `4.00bpw`, `5.00bpw`, `6.00bpw`):
 
     hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision 6.00bpw --local-dir models/MemT-1.0-Nano-exl3-6.00bpw
 
