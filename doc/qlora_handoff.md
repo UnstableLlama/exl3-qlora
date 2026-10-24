@@ -6188,6 +6188,15 @@ Built (CPU-tested, 5 new tests in `tests/test_realtime.py`, 30 pass):
   tower forward seeds the training cache (`VisionEncoder.register_mme`), so one pass per
   image serves both sides. The tower is attached as an aux model. Not combinable with
   `--mtp` (the generator refuses embeddings while drafting).
+- Hosting in a serving stack that already loads the vision component (TabbyAPI with
+  `vision: true`): `VisionEncoder(config, tokenizer, model=<that loaded Model>)` adopts the
+  host's tower instead of loading a second copy -- one tower in VRAM for both sides; pass
+  the same object to `attach_aux_models`. The feature caches stay separate (the host's
+  MMEmbedding cache and the encoder's fp16 cache both live in system RAM, so that is RAM
+  not VRAM); the host seeds the training cache from its serving forward with
+  `encoder.register_mme(key, mme)`, keyed the way `training/vision_data.py`'s
+  `ImageResolver` keys the content part: `("url", url)`, `("b64", sha1(data-url or b64))`,
+  `("path", abs_path)`.
 
 Not box-tested — like the offline vision path this awaits its first GPU run. Box checklist:
 (1) `qlora_validate_native.py --image` on the base first (training splice == native
