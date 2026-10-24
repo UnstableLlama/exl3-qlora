@@ -209,8 +209,16 @@ class VisionEncoder:
 
     def __init__(self, config, tokenizer, device="cuda:0", max_pixels: int = 0,
                  cache_bytes: int = 8 << 30, store_dtype: torch.dtype = torch.float16,
-                 progressbar: bool = True):
-        from ..model import Model
+                 progressbar: bool = True, model=None):
+        """``model``: an ALREADY LOADED vision component ``Model`` to adopt
+        (a serving stack -- TabbyAPI, ``realtime_chat`` -- that loaded the
+        tower for its own image input hands it over here, so generation and
+        training share one tower in VRAM instead of each loading a copy).
+        ``device``/``progressbar`` are ignored for an adopted tower. The
+        encoder treats it like its own: ``unload()`` frees it, and passing
+        it to ``RealtimeQLoRA.attach_aux_models`` parks it during ingests
+        exactly as before -- the host keeps serving through the same object
+        when the encoder is idle."""
         assert "vision" in getattr(config, "model_classes", {}), \
             f"{getattr(config, 'architecture', '?')} has no vision component; " \
             f"this is a text-only model"
@@ -220,8 +228,17 @@ class VisionEncoder:
         self.max_pixels = int(max_pixels or 0)
         self.cache_bytes = int(cache_bytes)
         self.store_dtype = store_dtype
-        self.model = Model.from_config(config, component="vision")
-        self.model.load(device=device, progressbar=progressbar)
+        if model is not None:
+            assert getattr(model, "component", "vision") == "vision", \
+                f"VisionEncoder(model=...) expects the vision component, got " \
+                f"{getattr(model, 'component', '?')!r}"
+            self.model = model
+            self.adopted = True
+        else:
+            from ..model import Model
+            self.model = Model.from_config(config, component="vision")
+            self.model.load(device=device, progressbar=progressbar)
+            self.adopted = False
         self.loaded = True
         self._cache: dict = {}          # key -> ImageFeatures (embeds may be None)
         self._cached_bytes = 0
