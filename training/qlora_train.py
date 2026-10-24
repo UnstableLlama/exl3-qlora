@@ -103,6 +103,8 @@ SINGLE_ONLY_KEYS = {
     # MTP draft-head training (Session 53); native single/split backend only.
     # `mtp_targets: []` forwards a bare --mtp-targets (default attn+mlp list + fc).
     "mtp_targets", "mtp_loss_weight", "freeze_trunk", "mtp_device",
+    # Multi-turn SFT: loss on the final assistant turn only (native backend).
+    "last_turn_only",
 }
 DDP_ONLY_KEYS = set()
 

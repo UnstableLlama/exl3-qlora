@@ -6204,6 +6204,13 @@ Built (CPU-tested, 5 new tests in `tests/test_realtime.py`, 30 pass):
   fit next to the serving cache -- this is what lets a 27B 3bpw ingest at 4k on a card that
   also holds a large serving cache. Hosts relying on prefix caching across ingests (option 2
   of the KV-staleness note) turn it off. CPU page tier and recurrent checkpoints untouched.
+- Last-turn-only supervision (`--last-turn-only`, offline trainer and realtime_chat;
+  `RealtimeConfig.last_turn_only`, per-sample `"last_turn_only"` key on a messages ingest):
+  only the final assistant turn of a multi-turn row carries loss, earlier replies are masked
+  context. Applied on the rendered `(text, supervised)` segments (one supervised segment per
+  assistant turn from either builder), so it needs nothing from the template. The right mode
+  for a chat loop that re-ingests its growing history every `/train` -- without it reply N
+  has been trained N times by the end of the conversation. Offline default stays every turn.
 
 Not box-tested — like the offline vision path this awaits its first GPU run. Box checklist:
 (1) `qlora_validate_native.py --image` on the base first (training splice == native

@@ -953,7 +953,8 @@ def resolve_resumed_datasets(out_dir, resume_dir, roles, interactive=True,
 
 def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
                               clean_text, min_response_words,
-                              uppercase_response, vision=None, refs=None):
+                              uppercase_response, vision=None, refs=None,
+                              last_turn_only=False):
     """Segment-render one multi-turn conversation into an (input_ids, labels)
     example with only the assistant turns supervised. Returns
     ``(example, None)`` or ``(None, reason)`` where reason is a short skip
@@ -990,6 +991,12 @@ def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
         segments = seg_builder(turns)
     except ValueError:
         return None, "unrenderable"
+    if last_turn_only:
+        # --last-turn-only: earlier assistant turns stay as masked context; only
+        # the final one (both builders emit one supervised segment per
+        # assistant turn) carries loss.
+        last = max(i for i, (_, sup) in enumerate(segments) if sup)
+        segments = [(t, sup and i == last) for i, (t, sup) in enumerate(segments)]
     if refs:
         # Image row (--vision): the segment texts carry image sentinels; the
         # vision-aware encoder splices the arch's image token layout in and
@@ -1010,7 +1017,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        uppercase_response=False, messages_key=None,
                        prompt_format="auto", shuffle=False, shuffle_seed=0,
                        config_name=None, chat_template_file=None,
-                       template_vars=None, vision=None):
+                       template_vars=None, vision=None, last_turn_only=False):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -1136,7 +1143,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
             built, reason = _build_multi_turn_example(
                 tokenizer, row_builder, turns, seq_len, clean_text,
                 min_response_words, uppercase_response,
-                vision=vision, refs=refs)
+                vision=vision, refs=refs, last_turn_only=last_turn_only)
             if built is None:
                 skipped[reason] = skipped.get(reason, 0) + 1
             else:
@@ -1158,7 +1165,7 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                 built, reason = _build_multi_turn_example(
                     tokenizer, seg_builder, turns, seq_len, clean_text,
                     min_response_words, uppercase_response,
-                    vision=vision, refs=refs)
+                    vision=vision, refs=refs, last_turn_only=last_turn_only)
                 if built is None:
                     skipped[reason] = skipped.get(reason, 0) + 1
                 else:
@@ -1802,6 +1809,10 @@ def _run_main():
                     help=argparse.SUPPRESS)  # deprecated: cleaning is now opt-in
     ap.add_argument("--min-response-words", type=int, default=3,
                     help="Drop rows whose cleaned response is shorter than this")
+    ap.add_argument("--last-turn-only", action="store_true",
+                    help="Multi-turn rows: supervise only the final assistant "
+                         "turn; earlier assistant turns stay as masked context. "
+                         "Training set only -- eval sets keep every turn.")
     ap.add_argument("--uppercase-response", action="store_true",
                     help="Smoke test: train the model to RESPOND IN ALL CAPS. A "
                          "maximally dense/consistent transform that must show in "
@@ -2488,6 +2499,7 @@ def _run_main():
         clean_text=clean_text,
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
+        last_turn_only=args.last_turn_only,
         messages_key=args.messages_key,
         prompt_format=args.prompt_format,
         shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,

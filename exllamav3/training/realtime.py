@@ -71,7 +71,13 @@ Sample forms accepted by ``ingest`` (mixable in one call):
     ``render_segments`` callable was provided (sample -> ordered
     ``[(text, supervised)]`` segments; ``training/chat_jinja.py``'s
     template-driven builders produce this contract -- see
-    ``training/realtime_chat.py`` for the wiring).
+    ``training/realtime_chat.py`` for the wiring). Every assistant turn is
+    supervised unless ``config.last_turn_only`` (or the sample's own
+    ``"last_turn_only"`` key) is set: then only the final reply carries
+    loss and earlier replies are masked context -- the offline trainer's
+    ``--last-turn-only``, and the right setting for a chat loop that
+    re-ingests its whole history every turn (each earlier reply was
+    trained when it was the last one).
 
 Image+text samples (VLM bases -- Qwen-VL, Gemma3/4, Mistral3): a
 ``messages`` sample (or a preference sample's conversational ``prompt``)
@@ -348,6 +354,15 @@ class RealtimeConfig:
                                                 # the KV-staleness note).
 
     # -- ingestion --
+    last_turn_only: bool = False                # messages samples: supervise
+                                                # only the final assistant turn
+                                                # (the offline --last-turn-only
+                                                # rule); earlier replies are
+                                                # masked context. Right for a
+                                                # chat loop re-ingesting its
+                                                # whole history every turn. A
+                                                # sample's own "last_turn_only"
+                                                # key overrides.
     add_bos: bool = True                        # ensure exactly one leading BOS
     eot_text: str = ""                          # appended to prompt/response
                                                 # samples' response and to every
@@ -469,6 +484,19 @@ def collate(batch: Sequence[dict], pad_id: int):
 # -- image samples --------------------------------------------------------------
 
 IMAGE_PART_TYPES = ("image", "image_url", "input_image")
+
+
+def supervise_last_turn_only(segments: Sequence[tuple]) -> list:
+    """``(text, supervised)`` segments with only the LAST supervised one kept
+    supervised -- the offline trainer's ``--last-turn-only`` rule (both
+    segment builders emit exactly one supervised segment per assistant turn,
+    so this is "only the final reply"). No supervised segment: unchanged."""
+    segments = list(segments)
+    sup_idx = [i for i, (_, sup) in enumerate(segments) if sup]
+    if not sup_idx:
+        return segments
+    last = sup_idx[-1]
+    return [(t, sup and i == last) for i, (t, sup) in enumerate(segments)]
 
 
 def has_image_parts(messages) -> bool:
@@ -1283,6 +1311,8 @@ class RealtimeQLoRA:
                 "the adapter would learn answers conditioned on nothing")
         flat, refs = self.vision.flatten(messages, base_dir=base_dir)
         segments = render(flat)
+        if self._last_turn_only(sample):
+            segments = supervise_last_turn_only(segments)
         ids, labels, images, feats = self.vision.encode_segments(segments, refs)
         ids, labels = list(ids), list(labels)
         images = [(int(s), feats[k]) for s, k in images]
@@ -1294,6 +1324,10 @@ class RealtimeQLoRA:
         if bos is not None and ids and ids[0] == bos:
             labels[0] = IGNORE_INDEX
         return ids, labels, images
+
+    def _last_turn_only(self, sample: dict) -> bool:
+        v = sample.get("last_turn_only")
+        return bool(self.config.last_turn_only if v is None else coerce_label(v))
 
     def _encode(self, sample: dict, base_dir: Optional[str] = None) -> Optional[dict]:
         """One ingest sample -> a kind-tagged example: ``{"kind": "sft",
@@ -1336,6 +1370,8 @@ class RealtimeQLoRA:
                 return {"kind": "sft", "input_ids": ids, "labels": labels,
                         "images": images}
             segments = self.render_segments(sample)
+            if self._last_turn_only(sample):
+                segments = supervise_last_turn_only(segments)
             ex = encode_sample_segments(self.tokenizer, segments, cfg.seq_len,
                                         cfg.add_bos)
             return {"kind": "sft", **ex}

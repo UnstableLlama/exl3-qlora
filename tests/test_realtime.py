@@ -346,6 +346,29 @@ def test_encode_messages():
     print("encode messages: OK")
 
 
+def test_last_turn_only():
+    f = rt_mod.supervise_last_turn_only
+    segs = [("u1", False), ("a1", True), ("u2", False), ("a2", True), ("\n", False)]
+    assert f(segs) == [("u1", False), ("a1", False), ("u2", False), ("a2", True), ("\n", False)]
+    assert f([("u", False)]) == [("u", False)]          # nothing supervised: unchanged
+    assert f([]) == []
+
+    def render(sample):
+        return [(m["content"], m["role"] == "assistant") for m in sample["messages"]]
+    conv = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"}, {"role": "assistant", "content": "d"}]
+    both = [-100, -100, ord("b"), -100, ord("d")]
+    last = [-100, -100, -100, -100, ord("d")]
+    rt = make_rt(render_segments=render)
+    assert rt._encode({"messages": conv})["labels"] == both
+    assert rt._encode({"messages": conv, "last_turn_only": True})["labels"] == last
+    rt = make_rt(config=RealtimeConfig(last_turn_only=True), render_segments=render)
+    assert rt._encode({"messages": conv})["labels"] == last
+    assert rt._encode({"messages": conv, "last_turn_only": False})["labels"] == both
+    assert rt._encode({"messages": conv, "last_turn_only": "false"})["labels"] == both
+    print("last turn only: OK")
+
+
 # ---------------------------------------------------------------------------
 # Ingest loop
 # ---------------------------------------------------------------------------
@@ -1470,6 +1493,7 @@ if __name__ == "__main__":
     test_encode_text_and_pretokenized()
     test_encode_truncation()
     test_encode_messages()
+    test_last_turn_only()
     test_ingest_batching_and_callbacks()
     test_ingest_token_weighted_loss()
     test_encode_preference()

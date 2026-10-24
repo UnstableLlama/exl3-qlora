@@ -125,6 +125,12 @@ def parse_args():
                         "KTO's KL estimate needs >= 2)")
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--seq-len", type=int, default=2048)
+    p.add_argument("--last-turn-only", action="store_true",
+                   help="/train and messages ingests supervise only the final "
+                        "assistant turn (earlier replies were trained when they "
+                        "were the last one; without this every /train re-trains "
+                        "the whole history). Same rule as the offline trainer's "
+                        "--last-turn-only")
     p.add_argument("--head-vocab-chunk", type=int, default=None,
                    help="LM-head loss in vocab-column tiles of this size "
                         "(default: the coordinator's 32768; 0 = reconstruct "
@@ -260,6 +266,7 @@ def main():
             offload_when_idle=not args.no_idle_offload,
             offload_aux_when_training=not args.no_aux_offload,
             offload_cache_when_training=not args.no_cache_offload,
+            last_turn_only=args.last_turn_only,
             # the template's own turn-close string closes every prompt/
             # response reply and every preference completion
             eot_text=eot or "",
