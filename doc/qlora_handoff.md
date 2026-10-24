@@ -6204,6 +6204,26 @@ Built (CPU-tested, 5 new tests in `tests/test_realtime.py`, 30 pass):
   fit next to the serving cache -- this is what lets a 27B 3bpw ingest at 4k on a card that
   also holds a large serving cache. Hosts relying on prefix caching across ingests (option 2
   of the KV-staleness note) turn it off. CPU page tier and recurrent checkpoints untouched.
+- Last-turn-only supervision (`--last-turn-only`, offline trainer and realtime_chat;
+  `RealtimeConfig.last_turn_only`, per-sample `"last_turn_only"` key on a messages ingest):
+  only the final assistant turn of a multi-turn row carries loss, earlier replies are masked
+  context. Applied on the rendered `(text, supervised)` segments (one supervised segment per
+  assistant turn from either builder), so it needs nothing from the template. The right mode
+  for a chat loop that re-ingests its growing history every `/train` -- without it reply N
+  has been trained N times by the end of the conversation. Offline default stays every turn.
+- Span markers (`--span-markers unmask|mask|both`, offline trainer and realtime_chat;
+  `RealtimeConfig.span_markers`, per-sample `"span_markers"` key): in-text markers move the
+  loss mask INSIDE an assistant turn. `unmask`: a reply containing `<unmask>..</unmask>`
+  trains only on the wrapped spans, the rest of the reply and its turn-end token become
+  context (`my favourite food is <unmask>strawberry</unmask>` teaches the fact, not reply
+  length). `mask`: `<mask>..</mask>` spans are excluded from the loss, the rest trains.
+  `both`: both kinds, `</mask>` returns to the surrounding state. Markers are stripped from
+  every segment (a marker in a user turn is removed, the turn stays masked); a row without
+  markers is tokenized exactly as before. Post-pass on the rendered segments
+  (`chat_turns.apply_span_markers`, mirrored in `realtime.py` with a test that the copies
+  agree), after `last_turn_only`. Single-turn rows with a marker leave the prompt/response
+  shortcut for the segment encoder. Caveat: a handful of supervised tokens per sample is a
+  tiny, noisy gradient -- batch such rows, don't drive lr up to compensate.
 
 Not box-tested — like the offline vision path this awaits its first GPU run. Box checklist:
 (1) `qlora_validate_native.py --image` on the base first (training splice == native

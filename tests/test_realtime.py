@@ -346,6 +346,80 @@ def test_encode_messages():
     print("encode messages: OK")
 
 
+def test_last_turn_only():
+    f = rt_mod.supervise_last_turn_only
+    segs = [("u1", False), ("a1", True), ("u2", False), ("a2", True), ("\n", False)]
+    assert f(segs) == [("u1", False), ("a1", False), ("u2", False), ("a2", True), ("\n", False)]
+    assert f([("u", False)]) == [("u", False)]          # nothing supervised: unchanged
+    assert f([]) == []
+
+    def render(sample):
+        return [(m["content"], m["role"] == "assistant") for m in sample["messages"]]
+    conv = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"}, {"role": "assistant", "content": "d"}]
+    both = [-100, -100, ord("b"), -100, ord("d")]
+    last = [-100, -100, -100, -100, ord("d")]
+    rt = make_rt(render_segments=render)
+    assert rt._encode({"messages": conv})["labels"] == both
+    assert rt._encode({"messages": conv, "last_turn_only": True})["labels"] == last
+    rt = make_rt(config=RealtimeConfig(last_turn_only=True), render_segments=render)
+    assert rt._encode({"messages": conv})["labels"] == last
+    assert rt._encode({"messages": conv, "last_turn_only": False})["labels"] == both
+    assert rt._encode({"messages": conv, "last_turn_only": "false"})["labels"] == both
+    print("last turn only: OK")
+
+
+def test_span_markers():
+    # The coordinator's copy agrees with training/chat_turns' on every mode.
+    spec = importlib.util.spec_from_file_location(
+        "chat_turns_ref", os.path.join(_ROOT, "training", "chat_turns.py"))
+    ct = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ct)
+    cases = [
+        [("u", False), ("my food is <unmask>straw</unmask> ok<e>", True)],
+        [("u <mask>x</mask>", False), ("a <mask>b</mask> c<e>", True)],
+        [("h", False), ("x <unmask>a <mask>b</mask> c</unmask> y<e>", True)],
+        [("plain", False), ("plain<e>", True)],
+        [("a <unmask>b<e>", True)],
+    ]
+    for mode in rt_mod.SPAN_MARKER_MODES:
+        for c in cases:
+            assert rt_mod.apply_span_markers(c, mode) == ct.apply_span_markers(c, mode), (mode, c)
+
+    def render(sample):
+        return [(m["content"], m["role"] == "assistant") for m in sample["messages"]]
+    conv = [{"role": "user", "content": "q"},
+            {"role": "assistant", "content": "x<unmask>a</unmask>y"}]
+    rt = make_rt(render_segments=render)
+    ex = rt._encode({"messages": conv})                       # off: literal markers
+    assert "".join(map(chr, ex["input_ids"][1:])) == "qx<unmask>a</unmask>y"
+    ex = rt._encode({"messages": conv, "span_markers": "unmask"})
+    assert "".join(map(chr, ex["input_ids"][1:])) == "qxay"
+    assert ex["labels"] == [-100, -100, -100, ord("a"), -100]
+    rt = make_rt(config=RealtimeConfig(span_markers="both"), render_segments=render)
+    ex = rt._encode({"messages": conv})
+    assert ex["labels"] == [-100, -100, -100, ord("a"), -100]
+    conv_m = [{"role": "user", "content": "q"},
+              {"role": "assistant", "content": "x<mask>a</mask>y"}]
+    assert rt._encode({"messages": conv_m})["labels"] == [-100, -100, ord("x"), -100, ord("y")]
+    assert rt._encode({"messages": conv_m, "span_markers": "off"})["labels"][2] == ord("x")
+    # last_turn_only runs first: markers in an earlier (now masked) reply are just stripped
+    rt = make_rt(config=RealtimeConfig(span_markers="unmask", last_turn_only=True),
+                 render_segments=render)
+    ex = rt._encode({"messages": [{"role": "user", "content": "q"},
+                                  {"role": "assistant", "content": "<unmask>a</unmask>"},
+                                  {"role": "user", "content": "r"},
+                                  {"role": "assistant", "content": "b<unmask>c</unmask>"}]})
+    assert "".join(map(chr, ex["input_ids"][1:])) == "qarbc"
+    assert ex["labels"] == [-100, -100, -100, -100, -100, ord("c")]
+    try:
+        rt._encode({"messages": conv, "span_markers": "cursed"})
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    print("span markers: OK")
+
+
 # ---------------------------------------------------------------------------
 # Ingest loop
 # ---------------------------------------------------------------------------
@@ -1470,6 +1544,8 @@ if __name__ == "__main__":
     test_encode_text_and_pretokenized()
     test_encode_truncation()
     test_encode_messages()
+    test_last_turn_only()
+    test_span_markers()
     test_ingest_batching_and_callbacks()
     test_ingest_token_weighted_loss()
     test_encode_preference()

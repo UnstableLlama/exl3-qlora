@@ -64,6 +64,7 @@ from run_report import (RunLogger, decode_example_docs,  # noqa: E402
 from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
                         trim_trailing_context, make_segment_builder,
                         encode_segments, encode_completion,
+                        apply_span_markers, SPAN_MARKER_MODES,
                         turn_text, AUTO_SINGLE_TURN_HINT,
                         HY3_BOS, HY3_USER, HY3_ASSISTANT, HY3_EOS,
                         HY3_NOTHINK_HEADER, HY3_EMPTY_THINK)
@@ -953,7 +954,8 @@ def resolve_resumed_datasets(out_dir, resume_dir, roles, interactive=True,
 
 def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
                               clean_text, min_response_words,
-                              uppercase_response, vision=None, refs=None):
+                              uppercase_response, vision=None, refs=None,
+                              last_turn_only=False, span_markers="off"):
     """Segment-render one multi-turn conversation into an (input_ids, labels)
     example with only the assistant turns supervised. Returns
     ``(example, None)`` or ``(None, reason)`` where reason is a short skip
@@ -990,6 +992,15 @@ def _build_multi_turn_example(tokenizer, seg_builder, turns, seq_len,
         segments = seg_builder(turns)
     except ValueError:
         return None, "unrenderable"
+    if last_turn_only:
+        # --last-turn-only: earlier assistant turns stay as masked context; only
+        # the final one (both builders emit one supervised segment per
+        # assistant turn) carries loss.
+        last = max(i for i, (_, sup) in enumerate(segments) if sup)
+        segments = [(t, sup and i == last) for i, (t, sup) in enumerate(segments)]
+    # --span-markers: in-text <unmask>/<mask> spans move the mask inside the
+    # (remaining) supervised turns; markers are stripped.
+    segments = apply_span_markers(segments, span_markers)
     if refs:
         # Image row (--vision): the segment texts carry image sentinels; the
         # vision-aware encoder splices the arch's image token layout in and
@@ -1010,7 +1021,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                        uppercase_response=False, messages_key=None,
                        prompt_format="auto", shuffle=False, shuffle_seed=0,
                        config_name=None, chat_template_file=None,
-                       template_vars=None, vision=None):
+                       template_vars=None, vision=None, last_turn_only=False,
+                       span_markers="off"):
     """
     Load an instruction dataset and tokenize for completion-only SFT using the
     model's native chat template (Llama-3, Mistral, etc. -- whatever
@@ -1136,7 +1148,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
             built, reason = _build_multi_turn_example(
                 tokenizer, row_builder, turns, seq_len, clean_text,
                 min_response_words, uppercase_response,
-                vision=vision, refs=refs)
+                vision=vision, refs=refs, last_turn_only=last_turn_only,
+                span_markers=span_markers)
             if built is None:
                 skipped[reason] = skipped.get(reason, 0) + 1
             else:
@@ -1158,7 +1171,8 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
                 built, reason = _build_multi_turn_example(
                     tokenizer, seg_builder, turns, seq_len, clean_text,
                     min_response_words, uppercase_response,
-                    vision=vision, refs=refs)
+                    vision=vision, refs=refs, last_turn_only=last_turn_only,
+                    span_markers=span_markers)
                 if built is None:
                     skipped[reason] = skipped.get(reason, 0) + 1
                 else:
@@ -1190,12 +1204,24 @@ def build_sft_examples(model, tokenizer, dataset_name, max_samples, seq_len,
         # encode_prompt_response tokenizes the prompt and the response SEPARATELY
         # (exact mask boundary) and normalizes to exactly one leading BOS.
         prompt_text = build_prompt(user, system=sys_text or None)
+        segs = [(prompt_text, False), (resp + eot, True)]
+        if span_markers != "off":
+            # --span-markers on a single-turn row: only rows that actually
+            # carry a marker leave the bit-exact prompt/response path.
+            marked = apply_span_markers(segs, span_markers)
+            if marked != segs and not refs:
+                input_ids, labels = encode_segments(tokenizer, marked)
+                input_ids, labels = input_ids[:seq_len], labels[:seq_len]
+                if all(l == -100 for l in labels):
+                    continue
+                examples.append({"input_ids": input_ids, "labels": labels})
+                continue
+            segs = marked
         if refs:
             # Single-turn image row: the same (prompt, response) split, encoded
             # through the sentinel-aware segment encoder (prompt masked,
             # response + eot supervised, image tokens masked).
-            ids, labels, images, feats = vision.encode_segments(
-                [(prompt_text, False), (resp + eot, True)], refs)
+            ids, labels, images, feats = vision.encode_segments(segs, refs)
             built, reason = vision.finalize(ids, labels, images, feats, refs, seq_len)
             if built is None:
                 skipped[reason] = skipped.get(reason, 0) + 1
@@ -1802,6 +1828,17 @@ def _run_main():
                     help=argparse.SUPPRESS)  # deprecated: cleaning is now opt-in
     ap.add_argument("--min-response-words", type=int, default=3,
                     help="Drop rows whose cleaned response is shorter than this")
+    ap.add_argument("--last-turn-only", action="store_true",
+                    help="Multi-turn rows: supervise only the final assistant "
+                         "turn; earlier assistant turns stay as masked context. "
+                         "Training set only -- eval sets keep every turn.")
+    ap.add_argument("--span-markers", choices=SPAN_MARKER_MODES, default="off",
+                    help="In-text loss-mask markers inside assistant turns: "
+                         "'unmask' trains ONLY the <unmask>..</unmask> spans of "
+                         "a reply that has them (the rest, turn-end included, "
+                         "becomes context); 'mask' excludes <mask>..</mask> "
+                         "spans from the loss; 'both' enables both. Markers "
+                         "are stripped from the text. Training set only.")
     ap.add_argument("--uppercase-response", action="store_true",
                     help="Smoke test: train the model to RESPOND IN ALL CAPS. A "
                          "maximally dense/consistent transform that must show in "
@@ -2488,6 +2525,8 @@ def _run_main():
         clean_text=clean_text,
         min_response_words=args.min_response_words,
         uppercase_response=args.uppercase_response,
+        last_turn_only=args.last_turn_only,
+        span_markers=args.span_markers,
         messages_key=args.messages_key,
         prompt_format=args.prompt_format,
         shuffle=args.shuffle, shuffle_seed=args.shuffle_seed,
