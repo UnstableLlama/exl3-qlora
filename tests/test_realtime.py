@@ -86,6 +86,7 @@ RealtimeQLoRA = rt_mod.RealtimeQLoRA
 RealtimeConfig = rt_mod.RealtimeConfig
 RWLock = rt_mod.RWLock
 ModelParker = aux_mod.ModelParker
+CacheParker = aux_mod.CacheParker
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +737,131 @@ def test_aux_offload_in_ingest():
     print("aux offload in ingest: OK")
 
 
+class StubCacheLayer:
+    """The CacheLayer surface CacheParker drives: device, alloc, free."""
+
+    def __init__(self, device, log, name):
+        self.device = device
+        self._log = log
+        self._name = name
+
+    def free(self):
+        self._log.append(f"free:{self._name}")
+        self.device = None
+
+    def alloc(self, device):
+        self._log.append(f"alloc:{self._name}:{device}")
+        self.device = device
+
+
+class StubCache:
+    def __init__(self, kv_devices, rec_devices=(), log=None, tp=False):
+        self.log = log if log is not None else []
+        self.model = types.SimpleNamespace(loaded_tp=tp)
+        self.layers = {i: StubCacheLayer(d, self.log, f"kv{i}")
+                       for i, d in enumerate(kv_devices)}
+        self.recurrent_layers = {i: StubCacheLayer(d, self.log, f"rec{i}")
+                                 for i, d in enumerate(rec_devices)}
+
+
+def test_cache_parker():
+    c = StubCache(["cuda:0", None, "cuda:1"], rec_devices=["cuda:0", "meta"])
+    p = CacheParker(c)
+    assert not p.parked
+    p.park()
+    assert p.parked
+    # Resident layers are freed; already-freed (None) and meta ones are skipped.
+    assert c.log == ["free:kv0", "free:kv2", "free:rec0"]
+    p.park()                                  # idempotent
+    assert len(c.log) == 3
+    c.log.clear()
+    p.unpark()
+    assert not p.parked
+    assert c.log == ["alloc:kv0:cuda:0", "alloc:kv2:cuda:1", "alloc:rec0:cuda:0"]
+    assert c.layers[0].device == "cuda:0" and c.layers[1].device is None
+    p.unpark()                                # idempotent
+    assert len(c.log) == 3
+    try:
+        CacheParker(StubCache(["cuda:0"], tp=True)).park()
+        assert False, "expected AssertionError"
+    except AssertionError:
+        pass
+    print("CacheParker park/unpark: OK")
+
+
+def test_cache_offload_in_ingest():
+    log = []
+    cache = StubCache(["cuda:0"], log=log)
+    draft = StubCache(["cuda:0"], log=log)
+    gen = StubGenerator()
+    gen.cache, gen.draft_cache = cache, draft
+
+    class Net(OffloadStubNet):
+        def compute_loss(self, *args, **kwargs):
+            assert cache.layers[0].device is None and draft.layers[0].device is None, \
+                "KV cache resident in VRAM during training"
+            return super().compute_loss(*args, **kwargs)
+
+    rt = make_rt(net=Net())
+    rt.attach_generator(gen)
+    assert len(rt._cache_parkers) == 2
+    rt.ingest([{"text": "ab"}])
+    assert cache.layers[0].device == "cuda:0" and draft.layers[0].device == "cuda:0"
+    assert log == ["free:kv0", "free:kv0", "alloc:kv0:cuda:0", "alloc:kv0:cuda:0"]
+    # Page table reset: once by the update callback, once by the unpark.
+    assert gen.pagetable.resets == 2
+
+    # Disabled: caches stay allocated, only the callback resets.
+    log.clear()
+    rt2 = make_rt(config=RealtimeConfig(offload_cache_when_training=False), net=OffloadStubNet())
+    gen2 = StubGenerator(); gen2.cache = StubCache(["cuda:0"], log=log)
+    rt2.attach_generator(gen2)
+    rt2.ingest([{"text": "ab"}])
+    assert log == [] and gen2.pagetable.resets == 1
+
+    # Restored on failure too, and the page table still reset.
+    class BoomNet(StubNet):
+        def compute_loss(self, *a, **k):
+            raise RuntimeError("boom")
+    log.clear()
+    rt3 = make_rt(net=BoomNet())
+    gen3 = StubGenerator(); gen3.cache = StubCache(["cuda:0"], log=log)
+    rt3.attach_generator(gen3)
+    try:
+        rt3.ingest([{"text": "ab"}])
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    assert gen3.cache.layers[0].device == "cuda:0"
+    assert log == ["free:kv0", "alloc:kv0:cuda:0"] and gen3.pagetable.resets == 1
+    print("cache offload in ingest: OK")
+
+
+def test_cache_offload_with_aux_parked_draft():
+    """A draft cache whose model a ModelParker unloads first is already freed
+    when the cache parker runs: skipped on park, and left to the module reload
+    on unpark -- no double alloc."""
+    log = []
+    draft = StubCache(["cuda:0"], log=log)
+    aux = StubAuxModel(["cuda:0"], log=log)
+    # The aux module's unload/load owns the draft cache layer, as a real
+    # module does.
+    mod = aux.modules[0]
+    _unload, _load = mod.unload, mod.load
+    mod.unload = lambda: (_unload(), draft.layers[0].free())
+    mod.load = lambda d: (_load(d), draft.layers[0].alloc(d))
+    gen = StubGenerator(); gen.cache = StubCache(["cuda:0"], log=log); gen.draft_cache = draft
+    rt = make_rt(net=OffloadStubNet())
+    rt.attach_generator(gen)
+    rt.attach_aux_models(aux)
+    rt.ingest([{"text": "ab"}])
+    assert log == ["unload:0", "free:kv0", "free:kv0",        # aux (owning draft), then main
+                   "alloc:kv0:cuda:0",                          # main cache unparked first
+                   "load:0:cuda:0", "alloc:kv0:cuda:0", "stc_close"]  # aux brings draft back
+    assert draft.layers[0].device == "cuda:0" and gen.cache.layers[0].device == "cuda:0"
+    print("cache offload with aux-parked draft: OK")
+
+
 def test_aux_offload_restored_on_error():
     aux = StubAuxModel(["cuda:0"])
 
@@ -1362,6 +1488,9 @@ if __name__ == "__main__":
     test_aux_offload_in_ingest()
     test_aux_offload_restored_on_error()
     test_aux_offload_disabled()
+    test_cache_parker()
+    test_cache_offload_in_ingest()
+    test_cache_offload_with_aux_parked_draft()
     test_internal_net_build_passes_head_vocab_chunk()
     test_unload_reload()
     test_vision_encode_sft()

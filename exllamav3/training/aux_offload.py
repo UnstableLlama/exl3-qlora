@@ -130,3 +130,68 @@ class ModelParker:
             # package); the shared-scratch release is an optimization only.
             pass
         _free_mem()
+
+
+class CacheParker:
+    """
+    Park/unpark the KV cache layers of one ``Cache`` (the serving generator's
+    main cache, or a draft cache) -- the other big static VRAM block a
+    training burst has to share the GPU with. Contents are NOT preserved:
+    every layer is freed with ``free()`` and reallocated empty with
+    ``alloc(device)`` on the device it was parked from, which is the exact
+    cycle a module's ``unload()``/``load()`` runs on the layers it owns. The
+    caller must therefore reset the generator's page table afterwards (the
+    realtime flow does this unconditionally when cache parking is on, so a
+    page referring to zeroed storage can never be served). The CPU page tier
+    and recurrent checkpoints are untouched and still restorable.
+
+    Both transformer KV layers (``cache.layers``) and recurrent layer states
+    (``cache.recurrent_layers``) are handled; a layer already freed (its
+    ``device`` is None -- e.g. a draft cache whose model a ``ModelParker``
+    parked first) is skipped and left to whoever freed it. Idempotent;
+    construction does not park. Tensor-parallel-loaded models are refused.
+    """
+
+    def __init__(self, cache):
+        self.cache = cache
+        self._homes = None      # [(layer, device)] while parked, else None
+
+    @property
+    def parked(self) -> bool:
+        return self._homes is not None
+
+    @staticmethod
+    def _resident(device) -> bool:
+        if device is None:
+            return False
+        try:
+            return torch.device(device).type not in ("cpu", "meta")
+        except (TypeError, RuntimeError):
+            return True
+
+    def park(self) -> None:
+        if self._homes is not None:
+            return
+        model = getattr(self.cache, "model", None)
+        assert not getattr(model, "loaded_tp", False), \
+            "cannot park the cache of a tensor-parallel-loaded model"
+        homes = []
+        groups = (getattr(self.cache, "layers", None) or {},
+                  getattr(self.cache, "recurrent_layers", None) or {})
+        for group in groups:
+            for layer in group.values():
+                device = getattr(layer, "device", None)
+                if not self._resident(device):
+                    continue
+                homes.append((layer, device))
+                layer.free()
+        self._homes = homes
+        if homes:
+            _free_mem()
+
+    def unpark(self) -> None:
+        if self._homes is None:
+            return
+        homes, self._homes = self._homes, None
+        for layer, device in homes:
+            layer.alloc(device)
