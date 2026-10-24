@@ -166,6 +166,11 @@ def parse_args():
                    help="keep aux component models (the --mtp head, the "
                         "--vision tower) in VRAM during ingests instead of "
                         "parking them")
+    p.add_argument("--no-cache-offload", action="store_true",
+                   help="keep the generator's KV cache allocated during "
+                        "ingests instead of freeing it for the training "
+                        "forwards (it is reallocated empty afterwards either way; "
+                        "the page table is reset after every ingest)")
     # vision (image + text) -- same knobs as qlora_train_native.py --vision
     p.add_argument("--vision", action="store_true",
                    help="load the model's vision tower: /image attaches "
@@ -254,6 +259,7 @@ def main():
             keep_checkpoints=args.keep_checkpoints,
             offload_when_idle=not args.no_idle_offload,
             offload_aux_when_training=not args.no_aux_offload,
+            offload_cache_when_training=not args.no_cache_offload,
             # the template's own turn-close string closes every prompt/
             # response reply and every preference completion
             eot_text=eot or "",

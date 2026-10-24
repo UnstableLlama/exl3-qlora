@@ -6197,6 +6197,13 @@ Built (CPU-tested, 5 new tests in `tests/test_realtime.py`, 30 pass):
   `encoder.register_mme(key, mme)`, keyed the way `training/vision_data.py`'s
   `ImageResolver` keys the content part: `("url", url)`, `("b64", sha1(data-url or b64))`,
   `("path", abs_path)`.
+- KV cache parking (`offload_cache_when_training`, default on; `--no-cache-offload` in
+  realtime_chat): every attached generator's KV cache (main and draft) is freed for the
+  duration of an ingest and reallocated empty afterwards (`aux_offload.CacheParker`), with
+  the page table reset unconditionally on the way out. The training batch no longer has to
+  fit next to the serving cache -- this is what lets a 27B 3bpw ingest at 4k on a card that
+  also holds a large serving cache. Hosts relying on prefix caching across ingests (option 2
+  of the KV-staleness note) turn it off. CPU page tier and recurrent checkpoints untouched.
 
 Not box-tested — like the offline vision path this awaits its first GPU run. Box checklist:
 (1) `qlora_validate_native.py --image` on the base first (training splice == native

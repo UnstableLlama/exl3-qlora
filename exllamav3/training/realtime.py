@@ -141,12 +141,19 @@ skipped and counted in the returned stats. Note that a preference step costs
 one extra no-grad reference forward (two more for KTO's KL rows) on top of
 the policy forward, and that a DPO pair is two sequences per forward.
 
-VRAM note: training shares the GPU with the serving cache. The transient
-training footprint (activations under gradient checkpointing + fp32 Adam
-moments for the LoRA only + per-layer trellis dequant scratch) rides on top of
-the allocated ``Cache``; size ``seq_len`` x ``batch_size`` so both fit --
-on a 16 GB card with a small model and a modest cache, seq_len 1-2k at batch 1
-with grad accumulation is the sane starting point.
+VRAM note: the transient training footprint (activations under gradient
+checkpointing + fp32 Adam moments for the LoRA only + per-layer trellis
+dequant scratch) has the GPU to itself apart from the trunk's weights when
+``offload_cache_when_training`` is on (default): every attached generator's
+KV cache (main and draft) is freed for the duration of the ingest and
+reallocated empty afterwards, with the page table reset, so the serving cache
+and the training batch never have to fit together. The price is that
+prefix-cached pages do not survive an ingest -- which the default cache
+invalidation discards anyway; only a host relying on option 2 of the
+KV-staleness note (no invalidation, cache-safe targets) gives something up,
+and should set ``offload_cache_when_training=False`` and size ``seq_len`` x
+``batch_size`` so both fit. The CPU page tier and the recurrent checkpoints
+are untouched either way.
 
 Idle offload (``offload_when_idle``, default on): between ingests the model
 only SERVES, but the persistent training state -- fp32 LoRA masters, fp32 Adam
@@ -194,7 +201,7 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
-from .aux_offload import ModelParker
+from .aux_offload import ModelParker, CacheParker
 from .fused_ce import DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK
 from .vision import build_mm_batch, mrope_position_ids
 from .preference import (dpo_loss, kto_loss, orpo_loss, mismatched_kl_shift,
@@ -328,6 +335,17 @@ class RealtimeConfig:
                                                 # VRAM for the duration of
                                                 # each ingest; restored
                                                 # value-exact afterwards.
+    offload_cache_when_training: bool = True    # free the attached
+                                                # generators' KV caches (main
+                                                # + draft) for the duration of
+                                                # each ingest, reallocated
+                                                # empty afterwards; the page
+                                                # table is reset on the way
+                                                # out regardless of the
+                                                # update callbacks. Turn off
+                                                # to keep prefix-cached pages
+                                                # across ingests (option 2 of
+                                                # the KV-staleness note).
 
     # -- ingestion --
     add_bos: bool = True                        # ensure exactly one leading BOS
@@ -651,6 +669,8 @@ class RealtimeQLoRA:
         self._opt_state_homes: list = []    # (state dict, key, device) to undo
         self._aux_parkers: list = []        # ModelParkers for aux component
                                             # models parked during ingests
+        self._cache_parkers: list = []      # (generator, CacheParker) for the
+                                            # attached generators' KV caches
 
         pad = getattr(tokenizer, "pad_token_id", None)
         if pad is None:
@@ -719,6 +739,10 @@ class RealtimeQLoRA:
             )
         self._generators.append(generator)
         self.add_update_callback(lambda: self.invalidate_generator_cache(generator))
+        for cache in (getattr(generator, "cache", None),
+                      getattr(generator, "draft_cache", None)):
+            if cache is not None:
+                self._cache_parkers.append((generator, CacheParker(cache)))
 
     def attach_aux_models(self, *models) -> None:
         """Register serving-only component models -- a vision tower, an MTP/
@@ -824,6 +848,33 @@ class RealtimeQLoRA:
         for parker in self._aux_parkers:
             parker.unpark()
 
+    def _park_caches(self) -> None:
+        """Free the attached generators' KV caches for the duration of an
+        ingest (``offload_cache_when_training``). Serving has drained under
+        the write lock, so no job references a page. Runs AFTER the aux
+        models are parked: a draft cache whose model just left VRAM is
+        already freed and is skipped here."""
+        if not self.config.offload_cache_when_training:
+            return
+        for _, parker in self._cache_parkers:
+            parker.park()
+
+    def _unpark_caches(self) -> None:
+        """Reallocate parked caches (empty) and reset every affected
+        generator's page table so no page refers to the zeroed storage --
+        unconditionally, whether or not the update callbacks did so already.
+        Runs BEFORE the aux models return, mirroring the park order."""
+        if not any(p.parked for _, p in self._cache_parkers):
+            return
+        gens = []
+        for gen, parker in self._cache_parkers:
+            if parker.parked:
+                parker.unpark()
+                if gen not in gens:
+                    gens.append(gen)
+        for gen in gens:
+            gen.pagetable.reset_page_table()
+
     # -- ingestion ------------------------------------------------------------
 
     def ingest(
@@ -918,6 +969,7 @@ class RealtimeQLoRA:
             # training state frees -- and they come back even when the ingest
             # fails, so serving resumes whole.
             self._park_aux()
+            self._park_caches()
             try:
                 self._restore_idle()
                 self.net.train()
@@ -957,6 +1009,7 @@ class RealtimeQLoRA:
                 self.sync_to_inference()
                 self._offload_idle()
             finally:
+                self._unpark_caches()
                 self._unpark_aux()
 
         d, k = pref["dpo"], pref["kto"]
