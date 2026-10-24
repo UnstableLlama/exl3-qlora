@@ -167,6 +167,16 @@ HtoD/DtoH round-trip of the training state per ingest, noise next to the
 training itself. Disable it (``offload_when_idle=False``) only if ingests are
 so tiny and frequent that the copies ever show up in a profile.
 
+Allocator note: do NOT run with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
+while cache parking or idle offload is on. Both park paths free large blocks
+and flush the caching allocator, and the next ingest reallocates them in one
+burst; under expandable segments that unmap/remap cycle has been seen to
+desync the allocator's segment bookkeeping, and the reallocation then dies
+with ``RuntimeError: !handles_.at(i) INTERNAL ASSERT FAILED ...
+CUDACachingAllocator.cpp`` (PyTorch's bug, not an OOM -- the same run fits
+with expandable segments off). The constructor warns when it sees the
+setting; either drop it or disable both offloads.
+
 Aux component parking (``offload_aux_when_training``, default on): a serving
 stack for a multimodal / MTP-capable checkpoint typically loads extra
 component models next to the text trunk -- a vision tower for image input,
@@ -193,9 +203,11 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional, Sequence
 
@@ -574,6 +586,33 @@ def list_realtime_checkpoints(directory: str) -> list:
                   and os.path.isdir(os.path.join(directory, d)))
 
 
+def _expandable_segments_enabled() -> bool:
+    """True if ``PYTORCH_CUDA_ALLOC_CONF`` turns on expandable segments."""
+    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    return re.search(r"expandable_segments\s*:\s*true", conf, re.I) is not None
+
+
+def _warn_expandable_segments(config) -> None:
+    """Warn once per construction when the allocator setting that breaks
+    the park/unpark paths is active (see the module docstring's allocator
+    note)."""
+    if not (config.offload_cache_when_training or config.offload_when_idle):
+        return
+    if not _expandable_segments_enabled():
+        return
+    on = [name for name, flag in (
+        ("offload_cache_when_training", config.offload_cache_when_training),
+        ("offload_when_idle", config.offload_when_idle)) if flag]
+    warnings.warn(
+        "PYTORCH_CUDA_ALLOC_CONF enables expandable_segments while "
+        + " and ".join(on) + " is on. The free/flush/reallocate cycle of "
+        "those offloads is known to crash PyTorch's expandable-segments "
+        "allocator on the next ingest (RuntimeError: !handles_.at(i) "
+        "INTERNAL ASSERT FAILED ... CUDACachingAllocator.cpp -- not an "
+        "OOM). Unset expandable_segments, or disable both offloads.",
+        RuntimeWarning, stacklevel=3)
+
+
 class RealtimeQLoRA:
     """
     Coordinator for serve-and-train on one loaded exllamav3 model.
@@ -676,6 +715,8 @@ class RealtimeQLoRA:
         if pad is None:
             pad = getattr(tokenizer, "eos_token_id", None)
         self.pad_id = pad if pad is not None else 0
+
+        _warn_expandable_segments(self.config)
 
         if adapter_dir:
             self.load(adapter_dir)

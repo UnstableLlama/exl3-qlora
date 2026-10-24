@@ -173,6 +173,14 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   at most 2048 columns to bound the additional fp32 Hadamard workspace.
   The previous weight tile is released before reconstructing the next one.
   Reduce `head_vocab_chunk` further if the serving GPU has little free VRAM.
+  Related: do not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for
+  a realtime server with cache parking or idle offload on. The park paths
+  free big blocks and flush the allocator, the next ingest reallocates them
+  in one burst, and under expandable segments that has crashed the
+  reallocation with `RuntimeError: !handles_.at(i) INTERNAL ASSERT FAILED
+  ... CUDACachingAllocator.cpp` — a PyTorch allocator bug, not an OOM; the
+  same run fits with the setting off. `RealtimeQLoRA` warns at construction
+  when it sees the setting.
   The demo's
   `--mtp` flag loads the model's MTP head for speculative decoding and wires
   exactly this. The offline trainer loads a component only when asked to

@@ -6204,6 +6204,12 @@ Built (CPU-tested, 5 new tests in `tests/test_realtime.py`, 30 pass):
   fit next to the serving cache -- this is what lets a 27B 3bpw ingest at 4k on a card that
   also holds a large serving cache. Hosts relying on prefix caching across ingests (option 2
   of the KV-staleness note) turn it off. CPU page tier and recurrent checkpoints untouched.
+  Do not combine with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: the free +
+  `empty_cache()` + burst-reallocate cycle (same for idle offload) has crashed PyTorch's
+  expandable-segments allocator on unpark with `RuntimeError: !handles_.at(i) INTERNAL
+  ASSERT FAILED ... CUDACachingAllocator.cpp` (an allocator bookkeeping bug, not an OOM --
+  the identical run fits with the setting off). `RealtimeQLoRA.__init__` warns when it
+  sees the setting with either offload on.
 
 Not box-tested — like the offline vision path this awaits its first GPU run. Box checklist:
 (1) `qlora_validate_native.py --image` on the base first (training splice == native
