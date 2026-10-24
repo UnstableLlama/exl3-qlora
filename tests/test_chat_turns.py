@@ -242,6 +242,54 @@ class FakeTokenizer:
         return [_Ids([self.bos_token_id] + [ord(c) for c in text])]
 
 
+def test_span_markers():
+    f = ct.apply_span_markers
+    E = "<|eot_id|>"
+    hdr = ("<|start_header_id|>assistant<|end_header_id|>\n\n", False)
+    user = ("<|start_header_id|>user<|end_header_id|>\n\nfood?" + E, False)
+    reply = ("my favourite food is <unmask>strawberry</unmask>, honestly" + E, True)
+    segs = [user, hdr, reply]
+    # off: untouched, markers stay literal
+    assert f(segs, "off") == segs
+    # unmask: only the span trains; the rest of the reply AND eot are context
+    out = f(segs, "unmask")
+    assert cat(out) == cat(segs).replace("<unmask>", "").replace("</unmask>", "")
+    assert sup(out) == ["strawberry"]
+    assert out[-1] == (", honestly" + E, False)
+    # adjacent masked pieces merge: user + header + reply head is ONE segment
+    assert out[0] == (user[0] + hdr[0] + "my favourite food is ", False)
+    # mask: the span is excluded, everything else in the reply trains
+    segs_m = [user, hdr, ("Paris is <mask>probably</mask> the capital" + E, True)]
+    out = f(segs_m, "mask")
+    assert sup(out) == ["Paris is ", " the capital" + E]
+    assert cat(out) == cat(segs_m).replace("<mask>", "").replace("</mask>", "")
+    # one kind active: the other kind's tags stay literal text
+    assert f(segs_m, "unmask") == segs_m
+    assert f(segs, "mask") == segs
+    # both: nested mask inside unmask masks; </mask> returns to the base state
+    both = [hdr, ("x <unmask>a <mask>b</mask> c</unmask> y" + E, True)]
+    out = f(both, "both")
+    assert sup(out) == ["a ", " c"]
+    assert cat(out) == hdr[0] + "x a b c y" + E
+    # markers in a masked (user) turn are stripped, turn stays masked
+    out = f([("ask <unmask>this</unmask>" + E, False), ("r" + E, True)], "unmask")
+    assert out == [("ask this" + E, False), ("r" + E, True)]
+    # a supervised segment WITHOUT markers is untouched even in unmask mode
+    assert f([hdr, ("plain" + E, True)], "unmask") == [hdr, ("plain" + E, True)]
+    # unclosed <unmask> runs to the end of the segment (eot included)
+    assert sup(f([("a <unmask>b" + E, True)], "unmask")) == ["b" + E]
+    try:
+        f(segs, "cursed")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    # end to end with the builder: marker inside a rendered llama3 turn
+    build = ct.make_segment_builder("llama3", bos_token=BOS, eos_token=EOS)
+    out = f(build([u("Q"), a("The answer is <unmask>42</unmask>.")]), "unmask")
+    assert sup(out) == ["42"] and "<unmask>" not in cat(out)
+    print("span markers: OK")
+
+
 def test_encode_segments():
     tok = FakeTokenizer()
     segs = [("ab", False), ("cd", True), ("e", False)]
@@ -273,6 +321,7 @@ if __name__ == "__main__":
     test_multi_turn_hy3()
     test_generation_prompt()
     test_unrenderable_shapes()
+    test_span_markers()
     test_encode_segments()
     test_encode_completion()
     print("\nALL OK")

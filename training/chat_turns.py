@@ -32,9 +32,16 @@ renderer -- the per-arch default prompts are single-turn by construction --
 so callers fail fast with AUTO_SINGLE_TURN_HINT rather than silently
 truncating the conversation.
 
-Pure python, no imports -- unit-testable without torch / the compiled
-extension (tests/test_chat_turns.py).
+Span markers (``apply_span_markers``): an opt-in post-pass over the rendered
+segments that lets in-text ``<unmask>...</unmask>`` / ``<mask>...</mask>``
+markers move the loss mask INSIDE an assistant turn (train only on the wrapped
+span, or exclude it), stripping the markers from the text.
+
+Stdlib only (``re``) -- unit-testable without torch / the compiled extension
+(tests/test_chat_turns.py).
 """
+
+import re
 
 SEGMENT_FORMATS = ("mistral", "metharme", "gemma4-nothink", "llama3",
                    "qwen3.5", "qwen3.5-nothink", "chatml", "hy3", "hy3-nothink")
@@ -212,6 +219,99 @@ def make_segment_builder(prompt_format, bos_token="", eos_token=""):
         return segs
 
     return build
+
+
+# --- span markers: in-text loss masking inside an assistant turn -------------
+
+SPAN_MARKER_MODES = ("off", "unmask", "mask", "both")
+_SPAN_TAG_RE = re.compile(r"</?(unmask|mask)>")
+
+
+def apply_span_markers(segments, mode):
+    """Post-pass over rendered ``(text, supervised)`` segments: in-text
+    markers move the loss mask INSIDE an assistant turn.
+
+      * ``unmask`` -- a supervised segment containing ``<unmask>...</unmask>``
+        trains ONLY on the wrapped spans; everything else in that segment
+        (the rest of the reply AND its turn-end token) becomes masked
+        context. "my favourite food is <unmask>strawberry</unmask>" teaches
+        the completion without teaching reply length.
+      * ``mask`` -- ``<mask>...</mask>`` spans inside a supervised segment are
+        excluded from the loss; the rest of the segment trains as usual.
+      * ``both`` -- both kinds; inside an ``<unmask>`` span a nested
+        ``<mask>`` still masks, and ``</mask>`` returns to the surrounding
+        state (supervised inside an ``<unmask>`` span, the segment's base
+        state outside: masked when the segment uses ``<unmask>``, else
+        supervised).
+      * ``off`` -- segments returned as they are (markers stay literal text).
+
+    Markers of an active kind are STRIPPED from every segment, masked ones
+    included (a marker in a user turn is removed, the turn stays masked), so
+    the model never sees them. Adjacent pieces with the same flag are merged
+    so the tokenizer sees as few extra boundaries as possible. Both segment
+    builders emit one supervised segment per assistant turn, so a marker's
+    scope is the turn it sits in. Unknown ``mode`` raises ValueError.
+    """
+    if mode == "off":
+        return list(segments)
+    if mode not in SPAN_MARKER_MODES:
+        raise ValueError(f"span_markers must be one of {SPAN_MARKER_MODES}, got {mode!r}")
+    use_unmask = mode in ("unmask", "both")
+    use_mask = mode in ("mask", "both")
+
+    def active(m):
+        return (m.group(1) == "unmask") if use_unmask and not use_mask else \
+               (m.group(1) == "mask") if use_mask and not use_unmask else True
+
+    out = []
+    changed = False
+    for text, sup in segments:
+        tags = [m for m in _SPAN_TAG_RE.finditer(text) if active(m)]
+        if not tags:
+            out.append((text, sup))
+            continue
+        changed = True
+        if not sup:
+            # masked context keeps its mask; only the markers go
+            pieces = []
+            pos = 0
+            for m in tags:
+                pieces.append(text[pos:m.start()])
+                pos = m.end()
+            pieces.append(text[pos:])
+            stripped = "".join(pieces)
+            if stripped:
+                out.append((stripped, False))
+            continue
+        base = not (use_unmask and any(m.group(1) == "unmask" for m in tags))
+        cur, pos, in_unmask = base, 0, False
+        for m in tags:
+            piece = text[pos:m.start()]
+            if piece:
+                out.append((piece, cur))
+            tag = m.group(0)
+            if tag == "<unmask>":
+                cur, in_unmask = True, True
+            elif tag == "</unmask>":
+                cur, in_unmask = False, False
+            elif tag == "<mask>":
+                cur = False
+            else:                       # </mask>: back to the surrounding state
+                cur = True if in_unmask else base
+            pos = m.end()
+        tail = text[pos:]
+        if tail:
+            out.append((tail, cur))
+    if not changed:
+        return out                  # no marker anywhere: boundaries untouched
+    # merge runs with the same flag (fewer tokenizer boundaries)
+    merged = []
+    for text, sup in out:
+        if merged and merged[-1][1] == sup:
+            merged[-1] = (merged[-1][0] + text, sup)
+        else:
+            merged.append((text, sup))
+    return merged
 
 
 def encode_segments(tokenizer, segments):

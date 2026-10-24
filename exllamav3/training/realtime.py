@@ -77,7 +77,12 @@ Sample forms accepted by ``ingest`` (mixable in one call):
     loss and earlier replies are masked context -- the offline trainer's
     ``--last-turn-only``, and the right setting for a chat loop that
     re-ingests its whole history every turn (each earlier reply was
-    trained when it was the last one).
+    trained when it was the last one). ``config.span_markers`` (or the
+    sample's ``"span_markers"`` key: "unmask" / "mask" / "both" / "off")
+    turns on in-text ``<unmask>..</unmask>`` / ``<mask>..</mask>`` markers
+    that move the mask inside a reply (train only the wrapped span, or
+    exclude it); the markers are stripped before tokenizing. Applied after
+    the last-turn rule.
 
 Image+text samples (VLM bases -- Qwen-VL, Gemma3/4, Mistral3): a
 ``messages`` sample (or a preference sample's conversational ``prompt``)
@@ -199,6 +204,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -363,6 +369,19 @@ class RealtimeConfig:
                                                 # whole history every turn. A
                                                 # sample's own "last_turn_only"
                                                 # key overrides.
+    span_markers: str = "off"                   # in-text loss-mask markers in
+                                                # messages samples: "unmask"
+                                                # (<unmask>..</unmask>: train
+                                                # only the wrapped spans of that
+                                                # reply, its turn-end included
+                                                # in the masked rest), "mask"
+                                                # (<mask>..</mask>: exclude the
+                                                # spans), "both", or "off"
+                                                # (markers are literal text).
+                                                # Markers are stripped. A
+                                                # sample's own "span_markers"
+                                                # key overrides. Applied after
+                                                # last_turn_only.
     add_bos: bool = True                        # ensure exactly one leading BOS
     eot_text: str = ""                          # appended to prompt/response
                                                 # samples' response and to every
@@ -497,6 +516,73 @@ def supervise_last_turn_only(segments: Sequence[tuple]) -> list:
         return segments
     last = sup_idx[-1]
     return [(t, sup and i == last) for i, (t, sup) in enumerate(segments)]
+
+
+# Mirror of training/chat_turns.apply_span_markers (this package has no
+# dependency on the training/ scripts; tests/test_realtime.py checks the two
+# agree). See that docstring for the rules.
+SPAN_MARKER_MODES = ("off", "unmask", "mask", "both")
+_SPAN_TAG_RE = re.compile(r"</?(unmask|mask)>")
+
+
+def apply_span_markers(segments: Sequence[tuple], mode: str) -> list:
+    if mode == "off":
+        return list(segments)
+    if mode not in SPAN_MARKER_MODES:
+        raise ValueError(f"span_markers must be one of {SPAN_MARKER_MODES}, got {mode!r}")
+    use_unmask = mode in ("unmask", "both")
+    use_mask = mode in ("mask", "both")
+
+    def active(m):
+        return (m.group(1) == "unmask") if use_unmask and not use_mask else \
+               (m.group(1) == "mask") if use_mask and not use_unmask else True
+
+    out: list = []
+    changed = False
+    for text, sup in segments:
+        tags = [m for m in _SPAN_TAG_RE.finditer(text) if active(m)]
+        if not tags:
+            out.append((text, sup))
+            continue
+        changed = True
+        if not sup:
+            pieces, pos = [], 0
+            for m in tags:
+                pieces.append(text[pos:m.start()])
+                pos = m.end()
+            pieces.append(text[pos:])
+            stripped = "".join(pieces)
+            if stripped:
+                out.append((stripped, False))
+            continue
+        base = not (use_unmask and any(m.group(1) == "unmask" for m in tags))
+        cur, pos, in_unmask = base, 0, False
+        for m in tags:
+            piece = text[pos:m.start()]
+            if piece:
+                out.append((piece, cur))
+            tag = m.group(0)
+            if tag == "<unmask>":
+                cur, in_unmask = True, True
+            elif tag == "</unmask>":
+                cur, in_unmask = False, False
+            elif tag == "<mask>":
+                cur = False
+            else:                       # </mask>: back to the surrounding state
+                cur = True if in_unmask else base
+            pos = m.end()
+        tail = text[pos:]
+        if tail:
+            out.append((tail, cur))
+    if not changed:
+        return out
+    merged: list = []
+    for text, sup in out:
+        if merged and merged[-1][1] == sup:
+            merged[-1] = (merged[-1][0] + text, sup)
+        else:
+            merged.append((text, sup))
+    return merged
 
 
 def has_image_parts(messages) -> bool:
@@ -1313,6 +1399,7 @@ class RealtimeQLoRA:
         segments = render(flat)
         if self._last_turn_only(sample):
             segments = supervise_last_turn_only(segments)
+        segments = apply_span_markers(segments, self._span_markers(sample))
         ids, labels, images, feats = self.vision.encode_segments(segments, refs)
         ids, labels = list(ids), list(labels)
         images = [(int(s), feats[k]) for s, k in images]
@@ -1328,6 +1415,10 @@ class RealtimeQLoRA:
     def _last_turn_only(self, sample: dict) -> bool:
         v = sample.get("last_turn_only")
         return bool(self.config.last_turn_only if v is None else coerce_label(v))
+
+    def _span_markers(self, sample: dict) -> str:
+        v = sample.get("span_markers")
+        return self.config.span_markers if v is None else str(v)
 
     def _encode(self, sample: dict, base_dir: Optional[str] = None) -> Optional[dict]:
         """One ingest sample -> a kind-tagged example: ``{"kind": "sft",
@@ -1372,6 +1463,7 @@ class RealtimeQLoRA:
             segments = self.render_segments(sample)
             if self._last_turn_only(sample):
                 segments = supervise_last_turn_only(segments)
+            segments = apply_span_markers(segments, self._span_markers(sample))
             ex = encode_sample_segments(self.tokenizer, segments, cfg.seq_len,
                                         cfg.add_bos)
             return {"kind": "sft", **ex}

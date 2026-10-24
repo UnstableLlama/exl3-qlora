@@ -105,6 +105,8 @@ SINGLE_ONLY_KEYS = {
     "mtp_targets", "mtp_loss_weight", "freeze_trunk", "mtp_device",
     # Multi-turn SFT: loss on the final assistant turn only (native backend).
     "last_turn_only",
+    # In-text <unmask>/<mask> loss-mask markers (unmask | mask | both).
+    "span_markers",
 }
 DDP_ONLY_KEYS = set()
 
