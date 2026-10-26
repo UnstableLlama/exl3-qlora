@@ -455,7 +455,10 @@ void BC_Attention::run_gr
         if (gate_mode == 2 && g_weight)
             hgemm_gr(x2, g_weight.value(), s.g2, graph);
         // Runtime LoRA deltas on the bundle's q (and quantized gate) output; k/v below
-        q_proj->lora_gr(x2, gate_mode == 3 ? s.qg2 : s.q2, graph);
+        if (gate_mode == 3)
+            q_proj->lora_gr(x2, s.qg2, graph);
+        else
+            q_proj->lora_gr(x2, s.q2, graph);
         if (gate_mode == 2 && g_proj)
             g_proj->lora_gr(x2, s.g2, graph);
         if (gate_mode == 3)
