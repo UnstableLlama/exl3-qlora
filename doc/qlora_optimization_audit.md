@@ -3,8 +3,7 @@
 > Research pass over the training pipeline (2026-07-01): where we waste compute
 > and VRAM, what modern frameworks (Axolotl / Unsloth / Liger / torchtune /
 > Chronicals) do that we don't, and the implementation plan derived from it.
-> Written BEFORE implementation; the Session 11 section of
-> `doc/qlora_handoff.md` records what was actually built and verified.
+> Written BEFORE implementation.
 
 ## 1. Problems found in our own pipeline
 

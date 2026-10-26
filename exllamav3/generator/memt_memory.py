@@ -1,5 +1,5 @@
 """
-Content-addressed conversation memory for MemT models (doc/memt_serving_plan.md, section 3).
+Content-addressed conversation memory for MemT models.
 
 The server in front of the generator (TabbyAPI, its web UI) is stateless: every request resends the full
 message list as one rendered prompt, with no session id, and may rewrite history (edit, regenerate, a
@@ -104,7 +104,7 @@ class MemTConversationMemory:
     def _warm_chunked_scan(self):
         """Compile fla's chunked scan now (random inputs, no model forward) so the first long commit does
         not pay the ~4 s Triton build in the middle of a chat."""
-        from ..training import memt as m
+        from ..modules.arch_specific import memt_math as m
         if not (m._memt_chunked_enable and torch.cuda.is_available()):
             return
         try:

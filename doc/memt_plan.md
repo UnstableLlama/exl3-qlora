@@ -100,7 +100,7 @@ assumes none).
 
 | File | What |
 |---|---|
-| `exllamav3/training/memt.py` | Plain-torch, differentiable reference math: `MemTSpec`/`MemTWeights`, the in_proj row layout, gates, l2norm, read, the sequential stable-GDN-2 scan (`memt_update_reference`), the gated softcap norm, `memt_block_forward(x, w, spec, read_state, commit, write_state)`, and `parse_memt_block` (the config `memt` object validated the way the release validates it: pinned switches, no unknown keys, heads == backbone heads) |
+| `exllamav3/modules/arch_specific/memt_math.py` | Plain-torch, differentiable reference math: `MemTSpec`/`MemTWeights`, the in_proj row layout, gates, l2norm, read, the sequential stable-GDN-2 scan (`memt_update_reference`), the gated softcap norm, `memt_block_forward(x, w, spec, read_state, commit, write_state)`, and `parse_memt_block` (the config `memt` object validated the way the release validates it: pinned switches, no unknown keys, heads == backbone heads) |
 | `tests/test_memt.py` | 8 CPU tests, all passing: Nano geometry == Table 6; zero state is an exact no-op; scan == explicit matrix form of eq. (22) in fp64; whole block == a port of the release's `QwenMemoryBlock` (its own row bookkeeping) with the Triton scan swapped for the matrix oracle; symmetrized erase non-expansive + long commit bounded; within-turn readout independent of earlier tokens; config parser; fp64 gradcheck through all six tensors and the incoming state |
 | `exllamav3/modules/arch_specific/memt_memory.py` | `MemTMemory(Module)`: loads the six bf16 tensors (unquantized), carried through conversion like norms/A_log; `fuse(x, o, params)` adds the readout to the gated context before `o_proj`; runs the commit scan when asked. State rides in `params["memt_read"]` / `params["memt_commit"]` (dicts `{layer_idx: fp32 [H,D,D] or [bsz,H,D,D]}`) |
 | `exllamav3/architecture/memt_qwen3_5_moe.py` | `MemTQwen3_5MoeConfig` (arch `MemTQwen3_5MoeForCausalLM`; the release's `backbone_configs` wrapper is merged by the base `Config`'s `config_key`, so the stock Qwen3.5-MoE parser reads the backbone unchanged) and `MemTQwen3_5MoeModel` (stock Qwen3.5-MoE model + a memory block attached to every full-attention layer's `Attention`; helpers `memt_zero_state`, `memt_commit(input_ids, states)`, `memt_save_state`, `memt_load_state` in the release's snapshot layout) |
@@ -195,7 +195,7 @@ fp32, projections bf16; forget biases initialized from log-uniform half-lives in
 
 On this fork that becomes:
 1. `native_llama.py`: memory readout in `_block_forward` for `attn` blocks carrying a
-   `memt` entry (after the sigmoid gate, before `o_proj`; `training.memt.memt_block_forward`
+   `memt` entry (after the sigmoid gate, before `o_proj`; `memt_math.memt_block_forward`
    is already differentiable), with the per-layer read state passed in like the vision
    splice. A `commit` forward mode that returns `{layer: next_state}` with grad.
 2. A new trainable surface: `memt_*` targets (full-parameter, fp32 master, the six

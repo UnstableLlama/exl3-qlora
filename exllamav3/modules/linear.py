@@ -6,6 +6,7 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
+from .quant.exl3_lib.hessian_packed import accumulate_, packed_numel
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
@@ -120,6 +121,9 @@ class Linear(Module):
         # an adapter's modules_to_save (e.g. native QLoRA --train-head). When set, it
         # supersedes the quantized base matmul for this Linear. Default None -> no-op.
         self.lora_full_weight = None
+        # Optional frequency-selected column subset for drafting (see modules/sparse_head.py); the
+        # regular forward never consults it
+        self.sparse_head = None
 
         # in_features_unpadded < in_features is handled at runtime: inputs narrower than the
         # (padded) weight are zero-extended in forward(). allow_input_padding marks layers whose
@@ -545,11 +549,21 @@ class Linear(Module):
             self.inner.unload()
         self.device = None
         self.inner = None
+        self.sparse_head = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
 
 
     @override
+    def make_sparse_head(self, capacity: int, vocab_size: int | None = None, **kwargs):
+        """Attach a SparseHead mirroring this layer's columns (requires a loaded inner with column extraction)"""
+        from .sparse_head import SparseHead
+        assert self.inner is not None and hasattr(self.inner, "reconstruct_columns"), \
+            f"{self.key}: sparse head needs a loaded EXL3 or fp16 layer"
+        self.sparse_head = SparseHead(self, capacity, vocab_size or self.out_features_unpadded, **kwargs)
+        return self.sparse_head
+
+
     def get_tensors(self):
         if self.device:
             return self.inner.get_tensors(self.key)
@@ -614,8 +628,13 @@ class Linear(Module):
 
 
     def init_H_data(self, init_tensor: bool):
+        # The capture accumulates into the block-packed upper triangle (hessian_packed); the full matrix is
+        # reconstructed when the tensor is finalized. The uncalibrated placeholder stays a meta (in, in) matrix
         return {
-            "H": torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = self.device if init_tensor else "meta"),
+            "H": torch.zeros(packed_numel(self.in_features), dtype = torch.float32, device = self.device) if init_tensor else
+                 torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = "meta"),
+            "packed": init_tensor,
+            "n": self.in_features,
             "first_key": self.key,
             "count": 0,
             "finalized": False,
@@ -635,7 +654,7 @@ class Linear(Module):
         if params["capture"][self.qmap]["first_key"] == self.key:
             rows = np.prod(x.shape[:-1])
             dim = x.shape[-1]
-            x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
+            x = x.reshape((rows, dim))
 
             # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
@@ -645,7 +664,7 @@ class Linear(Module):
                 x = x[finite]
                 rows = x.shape[0]
 
-            params["capture"][self.qmap]["H"].addmm_(x.T, x)
+            accumulate_(params["capture"][self.qmap]["H"], x)
             params["capture"][self.qmap]["count"] += rows
 
 
@@ -674,7 +693,11 @@ class Linear(Module):
             x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
 
         if self.qmap and "capture" in params:
-            self.capture_H(x, params)
+            # A capture split into passes (convert_model.capture_passes) names the qmaps of the
+            # current pass; everything else runs without accumulating
+            pass_qmaps = params.get("capture_qmaps")
+            if pass_qmaps is None or self.qmap in pass_qmaps:
+                self.capture_H(x, params)
 
         if self.lora_a_tensors:
             lora_input = x

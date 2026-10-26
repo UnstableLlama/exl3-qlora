@@ -36,7 +36,7 @@
 #
 # Effective batch:  split = BATCH*ACCUM   ;   ddp = BATCH*NGPU*ACCUM
 #
-# Why these defaults (doc/qlora_handoff.md Session 3): lr 1e-4 + --save-best
+# Why these defaults: lr 1e-4 + --save-best
 # (lr 2e-4 overfit: train 0.09 / held-out 3.11); r64/alpha64 (ratio 1.0). The
 # validate gate runs first because this is the first Mistral-arch run of the
 # transformers-free forward -- prove it matches native before training all night.

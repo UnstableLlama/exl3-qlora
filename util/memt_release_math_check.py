@@ -1,5 +1,5 @@
 """
-MemT Phase 1 step 4, math isolation: run our memory math (training.memt.memt_block_forward,
+MemT Phase 1 step 4, math isolation: run our memory math (memt_math.memt_block_forward,
 what MemTMemory.fuse calls) on the exact activations the release's MemTMemory saw, captured
 by `util/memt_release_reference.py --capture`. No backbone, no quantization: any difference
 is memory math / rounding. CPU only.
@@ -16,7 +16,7 @@ import sys
 import torch
 from safetensors import safe_open
 from exllamav3 import Config
-from exllamav3.training.memt import MemTWeights, memt_block_forward
+from exllamav3.modules.arch_specific.memt_math import MemTWeights, memt_block_forward
 
 memt_dir, ref_path = sys.argv[1], sys.argv[2]
 spec = Config.from_directory(memt_dir).memt.spec

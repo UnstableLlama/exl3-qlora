@@ -3,7 +3,7 @@ MemT Phase 1 step 4, reference side: run the authors' transformers code (modelin
 trust_remote_code) in bf16 on the HF checkpoint and save what the EXL3 side compares against.
 bf16 Nano is ~66 GB, so it is spread over the GPUs and CPU RAM with accelerate's device_map.
 
-    python util/memt_release_reference.py /mnt/two/weights/MemT-1.0-Nano OUT.pt [--cpu]
+    python util/memt_release_reference.py /path/to/MemT-1.0-Nano OUT.pt [--cpu]
 
 --cpu runs everything on the CPU (bf16, ~66 GB RAM): accelerate's GPU+CPU offload gave NaN
 states and garbage logits on the offloaded layers (2026-10-21), the all-CPU path uses the

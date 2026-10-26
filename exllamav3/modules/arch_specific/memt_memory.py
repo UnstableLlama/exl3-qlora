@@ -6,23 +6,14 @@ import torch
 from ...model.config import Config
 from .. import Module
 from ...model.model_tp_alloc import TPAllocation
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ...training.memt import MemTSpec
+from . import memt_math
+from .memt_math import MemTSpec, MemTWeights, memt_in_proj_slices
 
 
 import os
 _graph_enable = os.environ.get("EXL3_MEMT_GRAPH", "1") != "0"   # CUDA-graph the decode readout
 _GRAPH_MAX_BSZ = 8
 _GRAPH_MAX_QLEN = 4
-
-
-def _math():
-    # The math lives with the training code (plain torch, CPU-tested standalone). Imported lazily:
-    # the training package is heavy and this module is imported while the exllamav3 package is
-    # still loading (through the architecture registry)
-    from ...training import memt
-    return memt
 
 
 class MemTMemory(Module):
@@ -71,7 +62,7 @@ class MemTMemory(Module):
         self.layer_idx = layer_idx
         self.spec = spec
         self.weights = None
-        self._numel = _math().memt_param_count(spec)
+        self._numel = memt_math.memt_param_count(spec)
         self._graphs = {}   # (bsz, seqlen, dtype) -> (CUDAGraph, static x, static state, static out)
         # Tensor parallelism: this shard holds memory heads [tp_head_first, tp_head_first + spec.num_heads) of
         # the full block, and reads/writes states through the rank's registry (key -> {layer_idx: [1, Hl, D, D]})
@@ -80,7 +71,7 @@ class MemTMemory(Module):
         self.tp_registry: OrderedDict | None = None
 
     def tensor_keys(self) -> dict[str, str]:
-        return {name: f"{self.key}.{name}" for name in _math().memt_param_shapes(self.spec)}
+        return {name: f"{self.key}.{name}" for name in memt_math.memt_param_shapes(self.spec)}
 
     @override
     def optimizer_targets(self):
@@ -92,7 +83,7 @@ class MemTMemory(Module):
         t = {}
         for name, key in self.tensor_keys().items():
             t[name] = self.config.stc.get_tensor(key, device, allow_bf16 = True, no_defer = True)
-        w = _math().MemTWeights.from_dict(t)
+        w = memt_math.MemTWeights.from_dict(t)
         w.check(self.spec)
         self.weights = w
 
@@ -166,7 +157,7 @@ class MemTMemory(Module):
         # Projections in bf16 like the release (its block runs bf16 GEMMs and
         # keeps the norm/gate/decay/state math in fp32).
         xb = x.to(torch.bfloat16)
-        out, nxt = _math().memt_block_forward(
+        out, nxt = memt_math.memt_block_forward(
             xb, self.weights, self.spec, rs_d,
             commit = ws is not None,
             write_state = ws_d,
@@ -196,7 +187,7 @@ class MemTMemory(Module):
             with torch.cuda.device(x.device):
                 xs = x.clone()
                 ss = state.contiguous().clone()
-                fwd = lambda: _math().memt_block_forward(xs.to(torch.bfloat16), self.weights, self.spec, ss)[0]
+                fwd = lambda: memt_math.memt_block_forward(xs.to(torch.bfloat16), self.weights, self.spec, ss)[0]
                 side = torch.cuda.Stream(device = x.device)
                 side.wait_stream(torch.cuda.current_stream(x.device))
                 with torch.cuda.stream(side):
@@ -239,7 +230,6 @@ class MemTMemory(Module):
 
     @staticmethod
     def tp_import(local_context, exported, plan, head_first: int, head_last: int):
-        from ...training.memt import MemTSpec, MemTWeights, memt_in_proj_slices
         consumer = local_context["consumer"]
         device = local_context["device"]
         full = MemTSpec(**exported["spec"])

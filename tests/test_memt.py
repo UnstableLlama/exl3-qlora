@@ -1,6 +1,6 @@
 """
 CPU tests for the MemT-1.0 native memory block math in
-``exllamav3/training/memt.py`` (no GPU, no compiled extension, no model; the
+``exllamav3/modules/arch_specific/memt_math.py`` (no GPU, no compiled extension, no model; the
 module is loaded standalone like ``test_gdn.py``).
 
 Checks:
@@ -37,7 +37,7 @@ import torch
 import torch.nn.functional as F
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_TRAIN_DIR = os.path.join(_ROOT, "exllamav3", "training")
+_TRAIN_DIR = os.path.join(_ROOT, "exllamav3", "modules", "arch_specific")
 
 _pkg = types.ModuleType("exl3train_memt")
 _pkg.__path__ = [_TRAIN_DIR]
@@ -53,7 +53,7 @@ def _load(name: str):
     return m
 
 
-_mt = _load("memt")
+_mt = _load("memt_math")
 MemTSpec, MemTWeights = _mt.MemTSpec, _mt.MemTWeights
 
 
@@ -104,7 +104,7 @@ class _SglangPort:
     """Port of memt_sglang/models/qwen/layer.py:QwenMemoryBlock (release
     code), with the Triton scan/read replaced by the matrix-form oracle.
     Keeps the release's own row bookkeeping (qkv_rows / gate_rows /
-    weight[-dim:] / _write_gate_slice) so the slicing in memt.py is checked
+    weight[-dim:] / _write_gate_slice) so the slicing in memt_math.py is checked
     against an independent spelling of it."""
 
     def __init__(self, w: MemTWeights, spec: MemTSpec):

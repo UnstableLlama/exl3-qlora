@@ -84,6 +84,7 @@ class Model_LSMixin(ABC):
         max_batch_size: int,
         cache_weakrefs: dict,
         autosplit_no_forward: bool,
+        export_state_layers: set[int] | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -94,6 +95,10 @@ class Model_LSMixin(ABC):
         # The measuring forwards below exist to observe VRAM allocation; modules with CPU-side
         # compute (CPU-offloaded experts) can skip the host work when they see this flag
         params["autosplit_measure"] = True
+        # Layers a draft model taps: their exported states accumulate in params over the measuring
+        # forwards, so each stays allocated on its device as it does through a real forward
+        if export_state_layers:
+            params["export_state_layers"] = set(export_state_layers)
 
         # Simulate cached/recurrent path while loading with cache
         cl = [m for m in self if m.caps.get("kv_cache")]
@@ -175,6 +180,8 @@ class Model_LSMixin(ABC):
                         else:
                             backup_shape = dummy_state.shape
                             backup_dtype = dummy_state.dtype
+
+                        num_exports = len(params.get("export_states") or [])
 
                         # Load module
                         defer = module.can_defer_load()
@@ -291,6 +298,9 @@ class Model_LSMixin(ABC):
                     if fail:
                         module.unload()
                         dummy_state = None
+                        # States the failed attempt exported belong to the module now retried elsewhere
+                        if params.get("export_states"):
+                            del params["export_states"][num_exports:]
                         if "recurrent_states" in params:
                             for rs in params["recurrent_states"]:
                                 rs.reset()
@@ -352,11 +362,22 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
-        for module, instance, idx in self.fwd_modules:
+        from ..modules.transformer import TransformerBlock
+        mods = self.fwd_modules
+        for i, (module, instance, idx) in enumerate(mods):
             params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
+            # A block may leave its final residual add to the next block's input norm (same device)
+            nxt = mods[i + 1][0] if i + 1 < len(mods) else None
+            params["resid_defer"] = (
+                type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
+            )
             x = module.forward(x, params)
+        params.pop("resid_defer", None)
+        pending = params.pop("resid_pending", None)
+        if pending is not None:
+            x += pending
         return x
 

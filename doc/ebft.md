@@ -170,7 +170,6 @@ and *lowers* validation CE more than SFT does.
 | `tests/test_ebft.py` | **new** (163 L) | CPU test suite, no GPU needed |
 | `exllamav3/training/native_llama.py` | **modified** | `collect_hidden()` + `feature_block_indices()` feature taps in the forward |
 | `training/README.md` | **modified** | file listing entry |
-| `doc/qlora_handoff.md` | **modified** | Session 39 narrative note |
 
 ---
 

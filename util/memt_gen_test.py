@@ -1,5 +1,5 @@
 """
-MemT serving step 1 (doc/memt_serving_plan.md): per-job memory state through the generator.
+MemT serving step 1: per-job memory state through the generator.
 
 Loads the MemT sidecar, commits one turn into a memory state with model.memt_commit, then runs the SAME
 follow-up prompt as three generator jobs -- A reads the committed state, Z reads an all-zero state, P has
@@ -11,7 +11,7 @@ Pass criteria, all greedy: every job's tokens are the same alone, batched, and f
 (zero state is the plain backbone); A recalls the committed fact and P does not; the requeued job
 matches the un-requeued one.
 
-    python util/memt_gen_test.py /mnt/two/weights/MemT-1.0-Nano-exl3-6.00bpw [--split 20,23]
+    python util/memt_gen_test.py /path/to/MemT-1.0-Nano-exl3-6.00bpw [--split GB,GB]
 """
 
 import sys, argparse, time

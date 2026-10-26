@@ -3,7 +3,7 @@ Generate a DENSE, CONSISTENT style-transfer dataset for QLoRA-on-EXL3 demos.
 
 Why this exists
 ---------------
-Our density lesson (doc/qlora_handoff.md S0c): a style demo only shows cleanly
+Our density lesson: a style demo only shows cleanly
 at greedy/low-temp decode when the style transforms COMMON, high-probability
 tokens of *every* response -- that is why ALL-CAPS worked and the off-the-shelf
 pirate / UwU sets did not (their markers are sparse or live in rare tokens).
