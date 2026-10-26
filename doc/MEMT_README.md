@@ -22,7 +22,9 @@ TabbyAPI needs no changes.
 
 - Two 24 GB GPUs (the 6 bpw EXL3 quant is ~27 GB; the memory block is bf16, ~0.9 GB).
 - This fork of exllamav3 (branch with MemT support) installed into TabbyAPI's venv in editable
-  mode, `flash-attn`, and `fla` (flash-linear-attention, for fast long commits; optional, falls
+  mode. Run Tabby's `./start.sh` once first so it creates the venv and installs its own
+  dependencies; it only does that on the first run, so it won't overwrite the fork later.
+- `flash-attn`, and `fla` (flash-linear-attention, for fast long commits; optional, falls
   back to a slow exact scan).
 - The model directory: an EXL3 quant of Qwen3.6-35B-A3B plus the MemT files. See "Model
   directory" below.
@@ -30,10 +32,7 @@ TabbyAPI needs no changes.
 ## Quick start
 
     cd tabbyAPI
-    EXL3_MEMT_SNAPSHOT_DIR=/path/to/memt_snapshots \
-      ./venv/bin/python main.py --model-name /path/to/MemT-1.0-Nano-exl3-6.00bpw \
-      --draft-mode disabled --max-seq-len 32768 --cache-size 32768 --gpu-split 20 23 \
-      --tool-format auto --reasoning-start-token "<think>" --reasoning-end-token "</think>"
+    EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./start.sh --model-name MemT-1.0-Nano-exl3-6.00bpw --max-seq-len 32768
 
 Open the Tabby chat UI and talk to it. By default every exchange is memorized as soon as the
 next message arrives, so the model is always running on a short prompt. Send `/commit` at any
@@ -86,14 +85,14 @@ through fla's chunked KDA kernel for long turns. Reading memory during decode is
 ## Model directory
 
 Ready-made directories are on Hugging Face as `UnstableLlama/MemT-1.0-Nano-exl3`, one branch per
-quantization (`3.00bpw`, `5.00bpw`, `6.00bpw`):
+quantization (`3.00bpw`, `4.00bpw`, `5.00bpw`, `6.00bpw`):
 
-    hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision 6.00bpw --local-dir ./MemT-1.0-Nano-exl3-6.00bpw
+    hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision 6.00bpw --local-dir models/MemT-1.0-Nano-exl3-6.00bpw
 
 Each is a stock EXL3 quant of Qwen3.6-35B-A3B (yeasah's, byte for byte) plus the MemT pieces from the
 release: `memt_block.safetensors` (the memory block weights, bf16), the MemT `config.json` /
 `configuration.json`, and the release `chat_template.jinja` with a small addition that turns
-`template_vars` into a control turn (see `doc/memt_serving_plan.md`, section 5). To build one from any
+`template_vars` into a control turn. To build one from any
 other EXL3 quant of the backbone:
 
     python util/memt_make_sidecar.py /path/to/stock-quant /path/to/out --memt-from /path/to/an-existing-MemT-dir

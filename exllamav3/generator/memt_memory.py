@@ -1,5 +1,5 @@
 """
-Content-addressed conversation memory for MemT models (doc/memt_serving_plan.md, section 3).
+Content-addressed conversation memory for MemT models.
 
 The server in front of the generator (TabbyAPI, its web UI) is stateless: every request resends the full
 message list as one rendered prompt, with no session id, and may rewrite history (edit, regenerate, a

@@ -1,12 +1,12 @@
 """
-MemT serving step 2 (doc/memt_serving_plan.md): content-addressed conversation memory in the generator.
+MemT serving step 2: content-addressed conversation memory in the generator.
 
 A scripted multi-turn chat, resending the full Qwen-format history each turn like a stateless client
 (TabbyAPI / its web UI). The generator keeps the completed turns in memory and runs each request on
 system turn + live turn only. Then the history is edited mid-way and resent: memory must roll back to
 the edited point. Greedy decoding throughout.
 
-    python util/memt_chat_test.py /mnt/two/weights/MemT-1.0-Nano-exl3-6.00bpw [--split 20,23] [--context-turns 0]
+    python util/memt_chat_test.py /path/to/MemT-1.0-Nano-exl3-6.00bpw [--split GB,GB] [--context-turns 0]
 """
 
 import sys, argparse, time

@@ -1,11 +1,11 @@
 """
-MemT commit policy (doc/memt_serving_plan.md, section 5): commit_every, the typed "/commit" and
+MemT commit policy: commit_every, the typed "/commit" and
 "/commit every N" commands, and the template_vars route (a "memt" control turn emitted by the chat template).
 
 Same stateless-client setup as memt_chat_test.py, generator started with commit_every = 0 (never commit on
 its own) so every commit here has to come from a command. Greedy decoding.
 
-    python util/memt_commit_test.py /mnt/two/weights/MemT-1.0-Nano-exl3-6.00bpw [--split 20,23]
+    python util/memt_commit_test.py /path/to/MemT-1.0-Nano-exl3-6.00bpw [--split GB,GB]
 """
 
 import sys, argparse, time
