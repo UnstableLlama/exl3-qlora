@@ -104,7 +104,7 @@ class MemTConversationMemory:
     def _warm_chunked_scan(self):
         """Compile fla's chunked scan now (random inputs, no model forward) so the first long commit does
         not pay the ~4 s Triton build in the middle of a chat."""
-        from ..training import memt as m
+        from ..modules.arch_specific import memt_math as m
         if not (m._memt_chunked_enable and torch.cuda.is_available()):
             return
         try:

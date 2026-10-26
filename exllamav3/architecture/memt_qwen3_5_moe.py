@@ -27,6 +27,7 @@ import torch
 from ..model.config import no_default
 from ..modules import TransformerBlock, Attention
 from ..modules.arch_specific.memt_memory import MemTMemory
+from ..modules.arch_specific.memt_math import parse_memt_block
 from .qwen3_5 import Qwen3_5VLMoeBaseConfig, Qwen3_5BaseModel
 
 
@@ -54,7 +55,6 @@ class MemTQwen3_5MoeConfig(Qwen3_5VLMoeBaseConfig):
         bb_type = self.read_cfg(str, "backbone_configs->model_type", None)
         if bb_type is not None and bb_type != "qwen3_5_moe":
             raise ValueError(f"MemT: unsupported backbone model_type {bb_type!r} (expected qwen3_5_moe)")
-        from ..training.memt import parse_memt_block   # lazy: heavy package, see memt_memory.py
         self.memt = parse_memt_block(
             self.read_cfg(dict, "memt", no_default),
             hidden_size = self.hidden_size,
