@@ -115,6 +115,13 @@ struct BC_GatedDeltaNetSplit
     std::shared_ptr<BC_LinearEXL3> o_proj;
     at::Tensor ba_weight_t;       // (2*Nv, hidden) half
     c10::optional<at::Tensor> ba_bias;
+    // The unquantized b/a projections behind ba_weight_t, bound (set_ba_proj) for their runtime
+    // LoRA only: the merged GEMV reads the buffer, the deltas land on the b / a halves of the ba
+    // static. Not in KDA mode (that graph takes no adapter)
+    std::shared_ptr<BC_LinearFP16> b_proj;
+    std::shared_ptr<BC_LinearFP16> a_proj;
+    void set_ba_proj(std::shared_ptr<BC_LinearFP16> b, std::shared_ptr<BC_LinearFP16> a)
+        { b_proj = std::move(b); a_proj = std::move(a); }
     at::Tensor dt_bias;
     at::Tensor a_log;
     int num_k_heads;

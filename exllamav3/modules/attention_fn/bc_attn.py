@@ -270,6 +270,10 @@ class BCAttn:
             sinks = self.sinks,
         )
 
+        # The fp16 gate's linear, bound for its runtime LoRA (the gemm reads g_weight directly)
+        if self.g_weight is not None:
+            self.bc.set_g_proj_fp16(module.g_proj.inner.bc)
+
         # QSA indexer (Qwen3.8-Flash-Next): arm the sparse-selection stages. The armed instance
         # maintains the raw/pooled key planes in-graph on every step (both regimes), so the
         # caller must not also run the eager plane upkeep

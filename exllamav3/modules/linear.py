@@ -780,9 +780,10 @@ class Linear(Module):
         epoch) so they re-record with or without the LoRA nodes.
 
         Returns True when the graphed paths may run: nothing attached, or everything attached
-        is in the C++ object. False (fp16 layer, a ``lora_full_weight`` override, a shape or
-        dtype the kernels don't take, ``EXL3_LORA_GRAPH=0``) means the module must take the
-        unfused path, where ``Linear.forward`` applies the adapter.
+        is in the C++ object (``BC_LinearEXL3`` or, for unquantized layers such as the GDN b/a
+        and headwise-gate projections, ``BC_LinearFP16``). False (a ``lora_full_weight``
+        override, a shape or dtype the kernels don't take, ``EXL3_LORA_GRAPH=0``) means the
+        module must take the unfused path, where ``Linear.forward`` applies the adapter.
         """
         if not self.lora_a_tensors and self.lora_full_weight is None and not self._lora_graph_src:
             return True   # nothing attached, nothing handed off (the common case)
@@ -793,13 +794,19 @@ class Linear(Module):
         if len(src) == len(self._lora_graph_src) and all(p is q for p, q in zip(src, self._lora_graph_src)):
             return self._lora_graphed
 
-        bc = self.inner.bc if (self.quant_type == "exl3" and self.inner is not None) else None
+        bc = getattr(self.inner, "bc", None) if self.quant_type in ("exl3", "fp16") else None
+        # The C++ object checks the adapter against the stored weight's own geometry; decline
+        # here (unfused path) rather than fail there if the two ever differ
+        if self.quant_type == "fp16" and bc is not None:
+            k_w, n_w = self.inner.weight.shape
+        else:
+            k_w, n_w = self.in_features, self.out_features
         ok = (
             bool(pairs) and bc is not None and _lora_graph_enable and self.lora_full_weight is None and
             all(
                 a.dtype == torch.half and b.dtype == torch.half and
                 a.dim() == 2 and b.dim() == 2 and
-                a.shape[0] == self.in_features and a.shape[1] == b.shape[0] and b.shape[1] == self.out_features
+                a.shape[0] == k_w and a.shape[1] == b.shape[0] and b.shape[1] == n_w
                 for a, b in pairs
             )
         )

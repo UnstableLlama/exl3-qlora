@@ -245,12 +245,17 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         exl3_mgemm_gr(x3, qkvz_ptrs_trellis.value(), carrier, qkvz_ptrs_suh.value(), s.qkvz_xh, qkvz_ptrs_svh.value(),
                       c10::nullopt, c10::nullopt, qkvz_K, -1, qkvz_mcg, qkvz_mul1, -1, -1, 0, graph,
                       1, qkvz_size_n, s.qkvz_c_ptrs, qkvz_n_stride, qkvz_had_src, 2);
+        // Runtime LoRA deltas on the bundle's two outputs (no-ops without an adapter)
+        qkv_proj->lora_gr(x, s.qkv, graph);
+        z_proj->lora_gr(x, s.z_flat, graph);
     }
     else
     {
         exl3_gemm_gr(x, qkv_proj->trellis, s.qkv, qkv_proj->suh, s.qkv_xh, qkv_proj->svh, -1, qkv_proj->mcg, qkv_proj->mul1, 0, graph);
         if (qkv_proj->bias)
             add_gr(s.qkv, qkv_proj->bias.value(), s.qkv, graph);
+        if (!kda)
+            qkv_proj->lora_gr(x, s.qkv, graph);
     }
 
     if (kda)
@@ -278,9 +283,19 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
             exl3_gemm_gr(x, z_proj->trellis, s.z_flat, z_proj->suh, s.z_xh, z_proj->svh, -1, z_proj->mcg, z_proj->mul1, 0, graph);
             if (z_proj->bias)
                 add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
+            z_proj->lora_gr(x, s.z_flat, graph);
         }
 
         gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+        // b / a runtime LoRA deltas onto their halves of the merged output (column slices of
+        // the ba static; lora_b takes the row stride)
+        if (b_proj || a_proj)
+        {
+            at::Tensor ba_b = s.ba.narrow(-1, 0, num_v_heads);
+            at::Tensor ba_a = s.ba.narrow(-1, num_v_heads, num_v_heads);
+            if (b_proj) b_proj->lora_gr(x, ba_b, graph);
+            if (a_proj) a_proj->lora_gr(x, ba_a, graph);
+        }
 
         gated_delta_net_fused_op_3_gr
         (
@@ -327,6 +342,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     exl3_gemm_gr(s.core_attn_out_f, o_proj->trellis, y, o_proj->suh, s.o_xh, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(y, o_proj->bias.value(), y, graph);
+    if (!kda)
+        o_proj->lora_gr(s.core_attn_out_f, y, graph);
 }
 
 void BC_GatedDeltaNetSplit::run_bszN
@@ -351,6 +368,8 @@ void BC_GatedDeltaNetSplit::run_bszN
                 "BC_GatedDeltaNetSplit::run_bszN: shape out of range");
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
+    // A runtime LoRA attached or detached since capture changes the node list: re-record
+    s.graph->refresh();
 
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
@@ -380,53 +399,54 @@ void BC_GatedDeltaNetSplit::run_bszN
         capture.finish();
     }
 
+    // Runtime LoRA sites follow their projections in run_bszN_gr and are patched in the same
+    // order (static outputs with their own addresses); no entries without an adapter
+    void* xptr = (void*) x.data_ptr();
     std::vector<PPTR> args;
+    args.reserve(24);
     if (kda)
-        args = std::vector<PPTR>
-        {
-            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // b_proj input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // f_a input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // g_a input
-            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
-            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-        };
+    {
+        args.emplace_back(GP_gemm_A, xptr);                           // qkv_proj input
+        args.emplace_back(GP_gdn_ba_x, xptr);                         // b_proj input
+        args.emplace_back(GP_gdn_ba_x, xptr);                         // f_a input
+        args.emplace_back(GP_gdn_ba_x, xptr);                         // g_a input
+    }
     else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
-        args = std::vector<PPTR>
-        {
-            PPTR(GP_mgemm_A,        (void*) x.data_ptr()),          // sliced qkv+z bundle input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
-            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
-            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-        };
+    {
+        args.emplace_back(GP_mgemm_A, xptr);                          // sliced qkv+z bundle input
+        qkv_proj->lora_args(args, xptr, s.qkv.data_ptr());
+        z_proj->lora_args(args, xptr, s.z_flat.data_ptr());
+        args.emplace_back(GP_gdn_ba_x, xptr);
+        if (b_proj) b_proj->lora_args(args, xptr, s.ba.data_ptr());
+        if (a_proj) a_proj->lora_args(args, xptr, s.ba.narrow(-1, num_v_heads, num_v_heads).data_ptr());
+    }
     else
-        args = std::vector<PPTR>
-        {
-            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
-            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // z_proj input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
-            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
-            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-        };
+    {
+        args.emplace_back(GP_gemm_A, xptr);                           // qkv_proj input
+        qkv_proj->lora_args(args, xptr, s.qkv.data_ptr());
+        args.emplace_back(GP_gemm_A, xptr);                           // z_proj input
+        z_proj->lora_args(args, xptr, s.z_flat.data_ptr());
+        args.emplace_back(GP_gdn_ba_x, xptr);
+        if (b_proj) b_proj->lora_args(args, xptr, s.ba.data_ptr());
+        if (a_proj) a_proj->lora_args(args, xptr, s.ba.narrow(-1, num_v_heads, num_v_heads).data_ptr());
+    }
+    args.emplace_back(GP_conv1d_state, (void*) conv_state.data_ptr());
+    args.emplace_back(GP_conv1d_slots, (void*) slots.data_ptr());
+    args.emplace_back(GP_gdn_rule_state, (void*) recurrent_state.data_ptr());
+    args.emplace_back(GP_gdn_rule_slots, (void*) slots_scan.data_ptr());
     // The speculative-pass scan reads its first token's state from slots_in (recorded after the
     // slots param, so it patches in that order)
     if (history)
-        args.insert(args.end() - 1, PPTR(GP_gdn_rule_slots_in, (void*) slots_in.value().data_ptr()));
+        args.emplace_back(GP_gdn_rule_slots_in, (void*) slots_in.value().data_ptr());
+    args.emplace_back(GP_gemm_C, (void*) y.data_ptr());               // o_proj output
     // The o_proj bias add runs in place on y, which is a different tensor every call
     if (o_proj->bias)
     {
         args.emplace_back(GP_add_x, (void*) y.data_ptr());
         args.emplace_back(GP_add_z, (void*) y.data_ptr());
     }
+    if (!kda)
+        o_proj->lora_args(args, s.core_attn_out_f.data_ptr(), (void*) y.data_ptr());
     s.graph->launch(args, stream);
 }
 

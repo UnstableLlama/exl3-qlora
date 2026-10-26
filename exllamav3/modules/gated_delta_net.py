@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_graphed
 from ..ext import exllamav3_ext as ext
 from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
@@ -935,6 +935,8 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
+            # The b/a linears behind the merged GEMV, for their runtime LoRA deltas
+            self.bc.set_ba_proj(self.b_proj.inner.bc, self.a_proj.inner.bc)
             self.bc_split = True
 
             # Sliced qkv+z bundle: both projections read x and are cut into equal-width column
@@ -1302,19 +1304,23 @@ class GatedDeltaNet(Module):
         # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
         # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
         # history) shape from the third invocation of that shape on. The graph reads projection
-        # weights directly (qkv/z/o trellis, b/a via the merged ba_weight_t buffer, base weights
-        # only) and never sees a runtime LoRA, so fall back to the torch path while one is loaded.
+        # weights directly (qkv/z/o trellis, b/a via the merged ba_weight_t buffer). A runtime
+        # LoRA on qkv/z/b/a/o is handed to the projections' C++ linears and added inside the
+        # graph (lora_graphed syncs it per call: the graph is cached and a LoRA can be attached
+        # or detached after build). The KDA graph (forget/output gate projections embedded as
+        # base weights) takes no adapter and falls back to the torch path while one is loaded.
         if (
             self.bc_split and save_state and
             recurrent_slots is not None and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
             not spec_step and
-            not has_runtime_lora(self.qkv_proj, self.z_proj, self.b_proj,
-                                 self.a_proj, self.o_proj,
-                                 # KDA: the graph also embeds the forget/output gate
-                                 # projections (kda_fa_t .. kda_gb_t, base weights only)
-                                 self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj,
-                                 self.f_proj, self.g_proj)
+            (
+                lora_graphed(self.qkv_proj, self.z_proj, self.b_proj, self.a_proj, self.o_proj)
+                if not self.kda else
+                not has_runtime_lora(self.qkv_proj, self.z_proj, self.b_proj, self.a_proj, self.o_proj,
+                                     self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj,
+                                     self.f_proj, self.g_proj)
+            )
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):

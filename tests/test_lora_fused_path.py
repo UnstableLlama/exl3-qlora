@@ -159,13 +159,13 @@ def test_graph_owners_record_and_patch_lora_sites():
     # same order (lora_args), or the site walk misaligns and the graph replays
     # against stale pointers (or fails with "Graph update failed"). Owners also
     # refresh their graphs so an attach/detach after capture re-records
-    for fname, owners in (("attention.cpp", 1), ("mlp.cpp", 2)):
+    for fname, owners in (("attention.cpp", 1), ("mlp.cpp", 2), ("gated_delta_net.cpp", 1)):
         src = _src("exllamav3", "exllamav3_ext", "libtorch", fname)
         n_gr = len(re.findall(r"->lora_gr\(", src))
         n_args = len(re.findall(r"->lora_args\(", src))
-        # (attention.cpp records one site more than it patches: the interleaved-gate q branch of
-        # run_gr shares the plain branch's patch entry in run())
-        assert n_gr and n_args and n_gr - n_args <= 1, \
+        # (attention.cpp records more sites than it patches: the interleaved-gate q branch and
+        # the three fp16-gate branches of run_gr share patch entries in run())
+        assert n_gr and n_args and n_gr - n_args <= 3, \
             f"{fname}: {n_gr} lora_gr sites but {n_args} lora_args patches"
         assert src.count(".refresh();") >= owners or src.count("->refresh();") >= owners, \
             f"{fname}: graph owners lost their structure-epoch refresh"
@@ -186,14 +186,19 @@ def test_mamba2_bsz1_graph_guarded():
 
 def test_gdn_split_bsz1_graph_guarded():
     # BC_GatedDeltaNetSplit runs the whole layer in one call, reading qkv/z/o
-    # trellis and the merged (base-weights-only) ba_weight_t buffer directly
-    # (v1.2.0: generalized from bsz-1 to bsz/seqlen up to the BC limits)
+    # trellis and the merged ba_weight_t buffer directly. The split (Qwen3.5)
+    # graph takes a runtime LoRA on qkv/z/b/a/o through lora_graphed; the KDA
+    # graph (forget/output gates embedded as base weights) must still decline
     src = _src("exllamav3", "modules", "gated_delta_net.py")
     assert re.search(
         r"self\.bc_split and save_state and[^:]*?"
-        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj,.*?"
+        r"lora_graphed\(self\.qkv_proj, self\.z_proj, self\.b_proj, self\.a_proj, self\.o_proj\)\s*"
+        r"if not self\.kda else\s*"
+        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj, self\.a_proj, self\.o_proj,.*?"
         r"self\.f_a_proj, self\.f_b_proj, self\.g_a_proj, self\.g_b_proj",
-        src, re.S), "GatedDeltaNet: split fused decode lost its runtime-LoRA guard (incl. KDA gates)"
+        src, re.S), "GatedDeltaNet: split fused decode lost its runtime-LoRA hand-off / KDA guard"
+    assert "self.bc.set_ba_proj(self.b_proj.inner.bc, self.a_proj.inner.bc)" in src, \
+        "GatedDeltaNet: the b/a linears must be bound to the graph for their LoRA deltas"
 
 
 def test_moe_expert_dispatch_guarded():

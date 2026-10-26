@@ -24,27 +24,32 @@ Where an adapter on a target `Linear` is applied, by execution path:
 | **Attention decode, graph** (bsz ≤ 8, q_len ≤ 16) | `Attention.forward` → `bc_attn_step` → `BC_Attention::run` (also `SlidingAttention` via `build_bc_swa`) | **in-graph**: `BC_LinearEXL3::lora_gr` after each of q/k/v/(g)/o |
 | **GatedMLP, graph** (≤ 8 rows) | `GatedMLP.forward` → `BC_GatedMLP::run_bszN` | **in-graph**: `lora_gr` on gate/up before the activation, on down after |
 | **MLP (non-gated), graph** (1 row) | `MLP.forward` → `BC_MLP::run_bsz1` | **in-graph**: `lora_gr` on up and down |
-| MLA, DSA, GDN split graph, Mamba2, shared-KV attention graphs | their `bc` objects | **not graphed**: `has_runtime_lora` guards decline, python path applies it |
+| **GatedDeltaNet split, graph** (Qwen 3.5 / 3.8 / Next; bsz ≤ 8, seqlen ≤ 16) | `GatedDeltaNet.forward` → `BC_GatedDeltaNetSplit::run_bszN` | **in-graph**: `lora_gr` on qkv/z (bundle or separate), b/a onto their halves of the merged `ba` static, o |
+| MLA, DSA, GDN in KDA mode (GLM 5.3), Mamba2, shared-KV attention graphs | their `bc` objects | **not graphed**: `has_runtime_lora` guards decline, python path applies it |
 | Routed MoE experts (`BlockSparseMLP`) | `exl3_moe` / BC graphs / mgemm | **not graphed**: per-expert torch path while an expert projection carries an adapter |
 | `lm_head`, embeddings | `Linear.forward` / folded into the embedding weight | python (never in a graph) |
 
 ## Design
 
-### `BC_LinearEXL3` owns the adapter (`libtorch/linear.h`, `linear.cpp`)
+### The C++ linear owns the adapter (`libtorch/linear.h`, `linear.cpp`)
 
-Each quantized `Linear` already owns one `BC_LinearEXL3` (`inner.bc`), the handle every graph owner
-projects through. It now carries the adapter too:
+Each `Linear` already owns one C++ handle (`inner.bc`: `BC_LinearEXL3` for quantized layers,
+`BC_LinearFP16` for the few unquantized ones such as the GDN b/a projections and headwise gates),
+the object every graph owner projects through. Both now embed a `BC_LoRA` component and forward
+to it:
 
-- `lora_a` (R, K) fp16, A transposed; `lora_b` (R, N) fp16 with the alpha/r scale folded in (as
-  `LoRA` already stores B); `lora_t` (128, R) fp32 rank intermediate, sized to the largest graphed
-  row count (`BC_Attention::MAX_BSZ * MAX_QLEN`). Several adapters on one linear are stacked along R.
+- `a` (R, K) fp16, A transposed; `b` (R, N) fp16 with the alpha/r scale folded in (as `LoRA`
+  already stores B); `t` (128, R) fp32 rank intermediate, sized to the largest graphed row count
+  (`BC_Attention::MAX_BSZ * MAX_QLEN`). Several adapters on one linear are stacked along R.
 - `set_lora(a, b)` / `set_lora(None, None)` attach or detach, validate shapes against the trellis
   geometry, and bump the graph structure epoch (below).
 - `lora_gr(x, y, graph)` emits `y += (x @ A) @ B` as two kernels (`lora.cu`): `lora_a` (one block
   per rank row and token, fp32 dot over K) and `lora_b` (one thread per output column, fp32 dot
   over R, accumulated in place on fp16 or fp32 `y`). Both record patchable sites, `GP_lora_x` on
   `lora_a`'s input and `GP_lora_y` on `lora_b`'s output, so the nodes work on the graph owner's
-  patched I/O pointers exactly like the GEMM nodes. Without an adapter it emits nothing.
+  patched I/O pointers exactly like the GEMM nodes. `lora_b` accepts any row stride on `y`, so a
+  delta can land on a column slice of a wider static (the GDN's merged b/a output). Without an
+  adapter it emits nothing.
 - `lora_args(params, x, y)` appends the two replay patches in recording order, or nothing.
 - `run_gr` (the python `Linear.forward` entry) stays adapter-free, so the python path keeps
   applying the adapter itself and nothing is applied twice.
@@ -54,12 +59,15 @@ projection, not the arithmetic, and the graph replays them as nodes.
 
 ### Graph owners call it per projection (`attention.cpp`, `mlp.cpp`)
 
-Every projection site in `BC_Attention::run_gr`, `BC_GatedMLP::run_bszN_gr` and
-`BC_MLP::run_bsz1_gr` is followed by `proj->lora_gr(input, output, graph)`, including the mgemm
-bundles (the fused Q/K/V(/G), Q/G, K/V and gate/up tables bypass the handles for the GEMM, but the
-handles are still bound, so each bundled projection adds its own delta onto its slice of the
-static output). The order matches `Linear.forward` plus the module: delta after the GEMM and bias,
-before V-norm, head norms, RoPE and the activation.
+Every projection site in `BC_Attention::run_gr`, `BC_GatedMLP::run_bszN_gr`, `BC_MLP::run_bsz1_gr`
+and `BC_GatedDeltaNetSplit::run_bszN_gr` is followed by `proj->lora_gr(input, output, graph)`,
+including the mgemm bundles (the fused Q/K/V(/G), Q/G, K/V, gate/up and qkv/z tables bypass the
+handles for the GEMM, but the handles are still bound, so each bundled projection adds its own
+delta onto its slice of the static output). Projections the graphs run as plain fp16 GEMMs (the
+attention's fp16 gate, the GDN's merged b/a GEMV) get their `BC_LinearFP16` handle bound through a
+setter (`set_g_proj_fp16`, `set_ba_proj`) for the delta only. The order matches `Linear.forward`
+plus the module: delta after the GEMM and bias, before V-norm, head norms, RoPE, the activation,
+and the GDN's gate op.
 
 `run()` mirrors every `lora_gr` with `lora_args` in the same position of its patch list, patching
 the static intermediates with their own addresses. This matters: `Graph::launch` walks the recorded
@@ -100,16 +108,17 @@ the handle.
 
 ## Unsupported, by choice (unfused fallback, still correct)
 
-- MLA / DSA attention (`mla_attn.py`), the GDN split graph (`gated_delta_net.py`), Mamba2, shared-KV
-  attention: their graphs have no LoRA stage yet. The same two calls per projection site
-  (`lora_gr` in `run_gr`, `lora_args` in `run`) plus a `refresh()` would extend them; they were
-  left out to keep the first contribution reviewable.
+- MLA / DSA attention (`mla_attn.py`), GDN in KDA mode (GLM 5.3: the forget/output gate
+  projections are embedded as base weights), Mamba2, shared-KV attention: their graphs have no
+  LoRA stage yet. The same two calls per projection site (`lora_gr` in `run_gr`, `lora_args` in
+  `run`) plus a `refresh()` would extend them; they were left out to keep the contribution
+  reviewable.
 - Routed MoE experts: the fused expert kernels read the expert tables directly; an adapter on
   `experts.N.*` keeps the per-expert torch path. Shared experts inside a `BC_BlockSparseMLP` graph
   are read from the `BC_GatedMLP`'s tables, not through `run_bszN_gr`, so they also stay unfused
   under an adapter (the existing `sh_fused_lora` guard).
-- Fused `kv_proj` attention variants, fp16 projections (headwise gates), tensor-parallel sliced
-  linears: declined by `lora_sync` / the guards.
+- Fused `kv_proj` attention variants, tensor-parallel sliced linears: declined by `lora_sync` /
+  the guards.
 - Per-request adapter selection or scales: not implemented. B carries the scale, so a scale change
   is a re-sync plus re-record; a patchable per-node scale would be the natural next step, and
   per-request selection additionally needs the batching and cache semantics worked out (two
@@ -127,7 +136,9 @@ torch). Everything below is the plan a machine with a CUDA build should execute,
    `run_lora` against `y + x @ A @ B` for fp16/fp32 outputs and 1..128 rows, the 129-row limit,
    a padded adapter over a narrow activation, stacked adapters through `lora_sync`, and the
    decline cases.
-4. Graphs, real model, random adapters: `pytest tests/graph/test_lora_graph.py -m dense`.
+4. Graphs, real model, random adapters: `pytest tests/graph/test_lora_graph.py` (the `dense`
+   registry models, and the `gdn` hybrids for the GatedDeltaNet graph with adapters on
+   in_proj_qkv/z/b/a and out_proj as well).
    - `test_lora_graph_matches_eager`: graph replay vs the same C++ sequence eager (`EXL3_GRAPHS=0`)
      with adapters attached; lifecycle in one process (attach, detach, second adapter, zero scale,
      back to base, first adapter again); zero scale bit-exact with base; base-again and
@@ -156,7 +167,7 @@ extra nodes per step, a few percent at most). Numbers belong in this section onc
 - `exllamav3/exllamav3_ext/lora.cu`, `lora.cuh`: the kernels.
 - `exllamav3/exllamav3_ext/graph.cuh`, `graph.cu`: `GP_lora_x` / `GP_lora_y`, structure epoch, `refresh`.
 - `exllamav3/exllamav3_ext/libtorch/linear.h`, `linear.cpp`, `linear_bc.h`: adapter state on `BC_LinearEXL3`, bindings `set_lora`, `has_lora`, `run_lora`.
-- `exllamav3/exllamav3_ext/libtorch/attention.cpp`, `mlp.cpp`: LoRA nodes and patches in `BC_Attention`, `BC_GatedMLP`, `BC_MLP`.
+- `exllamav3/exllamav3_ext/libtorch/attention.cpp`, `mlp.cpp`, `gated_delta_net.cpp`: LoRA nodes and patches in `BC_Attention`, `BC_GatedMLP`, `BC_MLP`, `BC_GatedDeltaNetSplit`.
 - `exllamav3/modules/linear.py`: `Linear.lora_sync`, `lora_graphed`, `EXL3_LORA_GRAPH`.
-- `exllamav3/modules/attn.py`, `sliding_attn.py`, `mlp.py`: dispatch guards, gate/up handles.
+- `exllamav3/modules/attn.py`, `sliding_attn.py`, `mlp.py`, `gated_delta_net.py`, `attention_fn/bc_attn.py`: dispatch guards, bound handles.
 - `tests/testlib/lora.py`, `tests/modules/linear/test_linear_lora_graph.py`, `tests/graph/test_lora_graph.py`, `tests/test_lora_fused_path.py`, `tests/tools/bench_lora_decode.py`.

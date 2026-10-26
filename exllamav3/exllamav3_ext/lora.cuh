@@ -10,7 +10,8 @@
 // lora_a: t[m, :R]  = x[m, :K] . a[:R, :K]      x half (.., K) contiguous, a half (R, >= K)
 //                                               contiguous, t fp32 (>= m, R) contiguous
 // lora_b: y[m, :N] += t[m, :R] @ b[:R, :N]      b half (R, >= N) contiguous, y half or fp32
-//                                               (.., N) contiguous
+//                                               (.., N), unit column stride, any row stride
+//                                               (a column slice of a wider static is fine)
 //
 // The rows of x beyond a's width, or of b beyond y's, are never read: a padded adapter over an
 // unpadded activation (and vice versa) needs no staging. Graph sites: GP_lora_x on lora_a's x,
