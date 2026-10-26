@@ -6,8 +6,7 @@ weights. The supported path is transformers-free: a self-contained,
 autograd-friendly Llama/Mistral decoder forward built directly on exllamav3's
 own loaded modules (:class:`NativeLlamaQLoRA`), with a memory-efficient
 differentiable EXL3 linear (:class:`EXL3LoRAFunction`) and a streaming fused
-cross-entropy head. See ``doc/qlora_handoff.md`` for status and
-``doc/qlora_feasibility.md`` for the design rationale.
+cross-entropy head. See ``doc/qlora_feasibility.md`` for the design rationale.
 
 All reach-through into exllamav3's internal module layout (the ``..modules``
 types, the loaded RoPE table, the trellis weight reconstruction) is funnelled

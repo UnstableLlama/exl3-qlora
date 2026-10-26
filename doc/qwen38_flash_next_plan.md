@@ -40,8 +40,7 @@ RAM, else the disk-streaming default):**
 git fetch origin && git checkout feat/qwen38-flash-next
 python training/qlora_validate_native.py --model <Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4> --parallel split
 ```
-Then `--check-backward`, then the Phase B command in section 3. Full box list in
-`doc/qlora_handoff.md` Session 58.
+Then `--check-backward`, then the Phase B command in section 3.
 
 Goal: a short SFT run (~30 steps) of `Qwen/Qwen3.8-Flash-Next` through `qlora_train_native.py`,
 first on a box that holds the model, then on a single 16 GB GPU with the routed experts streamed
@@ -300,7 +299,7 @@ Requirements: Linux, >= 64 GB RAM with `--ngram-ram` (48 GB with the n-gram tabl
 - `exllamav3/training/expert_stream.py` (new, Phase C)
 - `training/qlora_train_native.py`, `training/qlora_validate_native.py`: flags, taps
 - `tests/test_hyperconnections_train.py`, `tests/test_ple_train.py` (new, CPU)
-- `README.md` supported-architectures table; `doc/qlora_handoff.md` Session entries
+- `README.md` supported-architectures table
 
 ## 8. Session plan
 

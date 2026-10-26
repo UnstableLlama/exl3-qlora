@@ -29,8 +29,7 @@ results transfer directly:
 Credit: the formulations here are adapted from HuggingFace TRL
 (https://github.com/huggingface/trl, Copyright The HuggingFace Team,
 Apache License 2.0). This is an independent reimplementation against the
-exllamav3 native training path, not a copy of TRL code; see
-``doc/qlora_handoff.md`` (Session 16) for the design notes.
+exllamav3 native training path, not a copy of TRL code.
 
 Convention (matching TRL): a sequence's "logps" is the SUM of per-token
 log-probabilities over its completion tokens only (prompt masked); rewards are

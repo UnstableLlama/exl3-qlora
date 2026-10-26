@@ -1,7 +1,7 @@
 # QLoRA experiment tooling (not part of the training product)
 
 Files here are one-off or experiment-specific tooling from the QLoRA-on-EXL3
-sessions (see `doc/qlora_handoff.md`). They are kept for reproducibility of
+sessions. They are kept for reproducibility of
 past results but are NOT part of the reusable training path, and would not be
 included in any upstream PR of the training work.
 

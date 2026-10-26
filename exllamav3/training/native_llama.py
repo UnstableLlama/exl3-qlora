@@ -9,7 +9,7 @@ layers and letting stock Transformers supply norms/attention/RoPE. That works
 in principle but couples training to a single Transformers version: the EXL3
 Llama-3.2 weights were calibrated against transformers 4.45, and 5.x changed
 ``llama3`` RoPE handling, producing a correct-per-layer but garbage-overall
-forward (see ``doc/qlora_handoff.md``).
+forward.
 
 This module sidesteps that entirely. It reconstructs the Llama decoder forward
 in plain, autograd-friendly PyTorch directly on top of exllamav3's *own* loaded

@@ -217,8 +217,7 @@ routed-expert adapters DO apply in native generation (fixed in Session 26,
 box-verified end-to-end in Session 28 — `expert_demo.py` shows the trained
 style at runtime on both Qwen3.5-MoE-family and Gemma4-MoE), but MoE decode is
 significantly slower while such an adapter is loaded — for serving speed,
-deploy by merge-and-requantize. See the Session 20/21/26/28 notes in
-`doc/qlora_handoff.md`.
+deploy by merge-and-requantize.
 
 ## MTP (multi-token prediction) head training
 
@@ -305,8 +304,6 @@ recipient header.) The vision tower is not built or trained; text only.
 
 ## Docs
 
-- `doc/qlora_handoff.md` — the full engineering log (per-session results,
-  decision records, backlog).
 - `doc/ebft.md` — Energy-Based Fine-Tuning: design decisions, what's verified,
   how to run, and open work. Standalone context-refresh doc for the EBFT path.
 - `doc/qlora_feasibility.md`, `doc/qlora_multigpu_plan.md`,

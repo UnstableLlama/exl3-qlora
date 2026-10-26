@@ -31,3 +31,9 @@ exllamav3/exllamav3_ext/**/hip_*
 
 # per-machine test model registry overrides (tests/testlib/models.py)
 tests/models.local.yaml
+
+# internal engineering logs and session notes: kept on the machine, not published
+doc/qlora_handoff.md
+doc/session*.md
+doc/upstream_sync_*.md
+doc/memt_upstream_notes_*.md
