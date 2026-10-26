@@ -6,7 +6,7 @@ from ..util.device_copy import host_to_device
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_graphed
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
@@ -1076,14 +1076,14 @@ class SlidingAttention(Module):
         # Graph-captured C++ path for the whole decode step
         # The graph kernels have no right-window mask: a non-causal block qualifies when its right
         # window covers the whole block (the only keys past a row are the block's own)
-        # The graph reads the projection trellis directly and never sees a runtime LoRA, so
-        # fall back to the python path while one is loaded (guard must sit here, per call:
-        # the graph is cached and a LoRA can be attached/detached after build).
+        # A runtime LoRA on the projections is handed to their BC_LinearEXL3 and added inside
+        # the graph (lora_graphed syncs it; the guard must sit here, per call: the graph is
+        # cached and a LoRA can be attached/detached after build). Adapters the graph can't
+        # take fall back to the python path.
         if (
             _bc_attn_enable and non_causal_spans is None and (causal or self.window_right >= seqlen - 1) and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
-            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
-                                 self.o_proj, self.g_proj)
+            lora_graphed(self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.g_proj)
         ):
             rsg = params.get("recurrent_states")
             if rsg is not None:
