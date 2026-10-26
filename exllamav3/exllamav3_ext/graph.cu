@@ -31,6 +31,8 @@ static bool graphs_disabled()
     return v;
 }
 
+uint64_t Graph::structure_epoch = 0;
+
 Graph::Graph()
 {
     ready = false;
@@ -41,6 +43,14 @@ Graph::Graph()
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;
+    captured_epoch = structure_epoch;
+}
+
+bool Graph::refresh()
+{
+    if (!ready || captured_epoch == structure_epoch) return false;
+    capture_abort();
+    return true;
 }
 
 Graph::~Graph()
@@ -62,6 +72,7 @@ cudaStream_t Graph::capture_begin()
         AT_CUDA_CHECK(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking));
         AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeThreadLocal));
         capture_active = true;
+        captured_epoch = structure_epoch;
         return capture_stream;
     }
     catch (...)

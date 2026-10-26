@@ -69,6 +69,15 @@ void BC_GatedMLP::run_bszN_gr
         if (up->bias) add_gr(u2, up->bias.value(), u2, graph);
     }
 
+    // Runtime LoRA deltas on the gate/up outputs, before the activation (the handles are bound
+    // in both configurations; without an adapter these are no-ops)
+    {
+        at::Tensor g2 = gu_n.select(0, 0);
+        at::Tensor u2 = gu_n.select(0, 1);
+        if (gate) gate->lora_gr(x, g2, graph);
+        if (up) up->lora_gr(x, u2, graph);
+    }
+
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
     at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
@@ -82,6 +91,7 @@ void BC_GatedMLP::run_bszN_gr
     exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
     if (down->bias)
         add_gr(d, down->bias.value(), d, graph);
+    down->lora_gr(a_n, d, graph);
 }
 
 void BC_GatedMLP::run_bszN
@@ -98,6 +108,8 @@ void BC_GatedMLP::run_bszN
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     Graph& g = graph_bszN[graphidx];
+    // A runtime LoRA attached or detached since capture changes the node list: re-record
+    g.refresh();
 
     if (g.disabled || (!g.ready && !g.ready_to_record))
     {
@@ -113,6 +125,7 @@ void BC_GatedMLP::run_bszN
             capture.finish();
         }
 
+        at::Tensor gu_n = slot_pair_view(gu, num_tokens);
         std::vector<PPTR> args;
         if (gu_ptrs_trellis)
         {
@@ -120,7 +133,6 @@ void BC_GatedMLP::run_bszN
         }
         else
         {
-            at::Tensor gu_n = slot_pair_view(gu, num_tokens);
             // The gate/up GEMMs record their own GP_gemm_C sites ahead of the down projection's;
             // patch them with their (static) values so the site walk stays aligned and the final
             // GP_gemm_C entry binds to the down projection
@@ -129,12 +141,16 @@ void BC_GatedMLP::run_bszN
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
             args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
         }
+        // Runtime LoRA sites, in run_bszN_gr's order (static outputs patched with their own values)
+        if (gate) gate->lora_args(args, (void*) x.data_ptr(), (void*) gu_n.select(0, 0).data_ptr());
+        if (up) up->lora_args(args, (void*) x.data_ptr(), (void*) gu_n.select(0, 1).data_ptr());
         args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
         if (down->bias)
         {
             args.emplace_back(GP_add_x, (void*) d.data_ptr());
             args.emplace_back(GP_add_z, (void*) d.data_ptr());
         }
+        down->lora_args(args, (void*) a.data_ptr(), (void*) d.data_ptr());
 
         g.launch(args, stream);
     }
@@ -158,6 +174,7 @@ void BC_MLP::run_bsz1_gr
     }
 
     up->run_gr(x_in, u, graph);
+    up->lora_gr(x_in, u, graph);
 
     if (act_silu)
         silu_mul_gr(u, ones, u, act_limit, graph);
@@ -171,12 +188,16 @@ void BC_MLP::run_bsz1_gr
     {
         at::Tensor yp3 = yp.value().view({1, 1, -1});
         down->run_gr(u, yp3, graph);
+        down->lora_gr(u, yp3, graph);
         at::Tensor d2 = d.view({1, out_size});
         at::Tensor yp2 = yp.value();
         copy2d_gr(yp2, d2, graph);
     }
     else
+    {
         down->run_gr(u, d, graph);
+        down->lora_gr(u, d, graph);
+    }
 }
 
 void BC_MLP::run_bsz1
@@ -187,6 +208,7 @@ void BC_MLP::run_bsz1
 {
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    graph_bsz1.refresh();
 
     if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
     {
@@ -203,18 +225,22 @@ void BC_MLP::run_bsz1
         }
 
         std::vector<PPTR> args;
-        // Intermediate same-type sites (the head staging copy's dst, the up projection's C) are
-        // patched with their static values to keep the site walk aligned
+        // Intermediate same-type sites (the head staging copy's dst, the up projection's C, the
+        // runtime LoRA nodes' static operands) are patched with their static values to keep the
+        // site walk aligned
+        void* x_in = xp ? xp.value().data_ptr() : (void*) x.data_ptr();
         if (xp)
         {
             args.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
-            args.emplace_back(GP_copy2d_dst, (void*) xp.value().data_ptr());
+            args.emplace_back(GP_copy2d_dst, x_in);
         }
         else
-            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+            args.emplace_back(GP_gemm_A, x_in);
         args.emplace_back(GP_gemm_C, (void*) u.data_ptr());
+        up->lora_args(args, x_in, (void*) u.data_ptr());
         if (yp)
         {
+            down->lora_args(args, (void*) u.data_ptr(), (void*) yp.value().data_ptr());
             args.emplace_back(GP_copy2d_src, (void*) yp.value().data_ptr());
             args.emplace_back(GP_copy2d_dst, (void*) d.data_ptr());
         }
@@ -226,6 +252,7 @@ void BC_MLP::run_bsz1
                 args.emplace_back(GP_add_x, (void*) d.data_ptr());
                 args.emplace_back(GP_add_z, (void*) d.data_ptr());
             }
+            down->lora_args(args, (void*) u.data_ptr(), (void*) d.data_ptr());
         }
 
         graph_bsz1.launch(args, stream);

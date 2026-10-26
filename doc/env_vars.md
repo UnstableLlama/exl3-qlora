@@ -55,6 +55,15 @@ Print one line per attention module/cache-layer pair when the graph-captured dec
 built or declined (module key, device). Activation check for A/B tests: a benchmark comparing
 `EXL3_BC_ATTN` settings is only meaningful if the enabled run actually built the path.
 
+### `EXL3_LORA_GRAPH` (default: `1`)
+
+Runtime LoRA adapters (`exllamav3.LoRA`) on the attention and MLP projections are handed to the
+projections' `BC_LinearEXL3` and applied inside the captured decode graphs (BC_Attention,
+BC_GatedMLP, BC_MLP) as two small kernels per adapted projection. `EXL3_LORA_GRAPH=0` keeps the
+adapters out of the graphs: while one is attached those modules decline the graph path and run the
+unfused per-linear path, where `Linear.forward` applies the adapter. That is the reference for the
+in-graph application and the A/B for its decode benchmarks; it changes nothing without an adapter.
+
 ### `EXL3_BC_DSA` (default: `1`)
 
 DeepSeek-V4 counterpart of `EXL3_BC_ATTN`: for decode steps (bsz 1, q_len ≤ 16) the whole DSA

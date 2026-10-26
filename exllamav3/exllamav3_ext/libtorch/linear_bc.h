@@ -32,4 +32,7 @@ py::class_<BC_LinearEXL3, std::shared_ptr<BC_LinearEXL3>>(m, "BC_LinearEXL3").de
     py::arg("xh")
 )
 .def("run", &BC_LinearEXL3::run)
-.def("run_alloc", &BC_LinearEXL3::run_alloc);
+.def("run_alloc", &BC_LinearEXL3::run_alloc)
+.def("set_lora", &BC_LinearEXL3::set_lora, py::arg("a"), py::arg("b"))
+.def("has_lora", &BC_LinearEXL3::has_lora)
+.def("run_lora", &BC_LinearEXL3::run_lora);

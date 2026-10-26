@@ -5,7 +5,7 @@ from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_graphed
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
@@ -1173,17 +1173,18 @@ class Attention(Module):
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too).
-        # The graph reads the projection trellis directly and never sees a runtime LoRA,
-        # so fall back to the python path while one is loaded (guard must sit here, per
-        # call: the graph is cached and a LoRA can be attached/detached after build).
+        # A runtime LoRA on the q/k/v/o/g projections is handed to their BC_LinearEXL3 and
+        # added inside the graph (lora_graphed syncs it; the guard must sit here, per call:
+        # the graph is cached and a LoRA can be attached/detached after build). Adapters the
+        # graph can't take (fp16 gate, kv_proj) fall back to the python path.
         # A MemT memory read is additive before o_proj, so it rides on top of the graph
         # output as o_proj(readout); a commit (its token scan) stays on the python path.
         if (
             _bc_attn_enable and non_causal_spans is None and
             (self.memt is None or params.get("memt_commit") is None) and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
-            not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
-                                 getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
+            lora_graphed(self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.g_proj) and
+            not has_runtime_lora(getattr(self, "kv_proj", None))
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)

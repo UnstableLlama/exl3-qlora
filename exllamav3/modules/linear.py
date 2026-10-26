@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import cached_property
 from typing_extensions import override
+import os
 import torch
 import numpy as np
 from ..model.config import Config
@@ -32,17 +33,39 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+# EXL3_LORA_GRAPH=0 keeps runtime LoRA adapters out of the captured decode graphs: the BC paths then
+# decline while an adapter is attached and the modules take the unfused per-linear path (the
+# reference for the in-graph application, and the A/B for its benchmarks)
+_lora_graph_enable = os.environ.get("EXL3_LORA_GRAPH", "1") != "0"
+
+
 def has_runtime_lora(*linears) -> bool:
     """
     True when any of the given Linear modules currently carries a runtime LoRA
     (tensors registered by ``model.lora.LoRA``). The fused multi-linear decode
-    kernels (``exl3_mgemm`` / BC graphs) read the trellis storage directly and
-    never see these tensors, so any fused branch over modules for which this
-    returns True must fall back to the per-linear ``Linear.forward`` path or
-    the adapter is silently dropped. ``None`` entries are allowed (optional
-    projections like g_proj).
+    kernels (``exl3_mgemm``) read the trellis storage directly and never see
+    these tensors, so a fused branch over modules for which this returns True
+    must add the low-rank delta itself or fall back to the per-linear
+    ``Linear.forward`` path, or the adapter is silently dropped. ``None``
+    entries are allowed (optional projections like g_proj).
     """
     return any(l is not None and l.lora_a_tensors for l in linears)
+
+
+def lora_graphed(*linears) -> bool:
+    """
+    True when every given Linear (``None`` allowed) either carries no runtime LoRA
+    or has handed it to its ``BC_LinearEXL3`` (:meth:`Linear.lora_sync`), so a
+    graph-captured decode block that runs ``lora_gr`` after each of these
+    projections applies the adapters itself. False sends the caller to the
+    unfused path. The hand-off is lazy: the adapter dicts are written directly
+    by ``LoRA`` / the trainer, so the first call after a change does the sync
+    (and the captured graphs re-record through the graph structure epoch).
+    """
+    for l in linears:
+        if l is not None and not l.lora_sync():
+            return False
+    return True
 
 
 class Linear(Module):
@@ -121,6 +144,10 @@ class Linear(Module):
         # an adapter's modules_to_save (e.g. native QLoRA --train-head). When set, it
         # supersedes the quantized base matmul for this Linear. Default None -> no-op.
         self.lora_full_weight = None
+        # The adapter tensors last handed to the C++ BC_LinearEXL3 (lora_sync), and whether that
+        # hand-off covers everything attached (so graphed decode paths may run)
+        self._lora_graph_src = ()
+        self._lora_graphed = True
         # Optional frequency-selected column subset for drafting (see modules/sparse_head.py); the
         # regular forward never consults it
         self.sparse_head = None
@@ -542,6 +569,8 @@ class Linear(Module):
             inner.bc = ext.BC_LinearEXL3(
                 inner.trellis, inner.suh, inner.svh, inner.K, inner.bias,
                 inner.mcg, inner.mul1, g_tensor_cache.get(*inner.bsz1_xh_args))
+            # A fresh C++ handle carries no runtime LoRA; let lora_sync hand it over again
+            self._lora_graph_src = ()
 
     @override
     def unload(self):
@@ -552,6 +581,8 @@ class Linear(Module):
         self.sparse_head = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
+        self._lora_graph_src = ()
+        self._lora_graphed = True
 
 
     @override
@@ -736,6 +767,53 @@ class Linear(Module):
         if self.post_scale != 1.0:
             x *= self.post_scale
         return x
+
+
+    def lora_sync(self) -> bool:
+        """
+        Hand the runtime LoRA currently attached (``lora_a_tensors`` / ``lora_b_tensors``) to
+        the C++ ``BC_LinearEXL3``, which the graph-captured decode blocks (BC_Attention,
+        BC_GatedMLP, BC_MLP) run ``lora_gr`` on after this projection's GEMM, or detach it
+        when the dicts were emptied. Several adapters are stacked along the rank dim (B carries
+        the scale, so ``x @ [A1 | A2] @ [B1; B2]`` is their sum). Only does work when the
+        attached tensors changed; a change also drops every captured graph (graph structure
+        epoch) so they re-record with or without the LoRA nodes.
+
+        Returns True when the graphed paths may run: nothing attached, or everything attached
+        is in the C++ object. False (fp16 layer, a ``lora_full_weight`` override, a shape or
+        dtype the kernels don't take, ``EXL3_LORA_GRAPH=0``) means the module must take the
+        unfused path, where ``Linear.forward`` applies the adapter.
+        """
+        if not self.lora_a_tensors and self.lora_full_weight is None and not self._lora_graph_src:
+            return True   # nothing attached, nothing handed off (the common case)
+        pairs = [(a, self.lora_b_tensors[k]) for k, a in self.lora_a_tensors.items() if k in self.lora_b_tensors]
+        src = tuple(t for ab in pairs for t in ab)
+        if self.lora_full_weight is not None:
+            src += (self.lora_full_weight,)
+        if len(src) == len(self._lora_graph_src) and all(p is q for p, q in zip(src, self._lora_graph_src)):
+            return self._lora_graphed
+
+        bc = self.inner.bc if (self.quant_type == "exl3" and self.inner is not None) else None
+        ok = (
+            bool(pairs) and bc is not None and _lora_graph_enable and self.lora_full_weight is None and
+            all(
+                a.dtype == torch.half and b.dtype == torch.half and
+                a.dim() == 2 and b.dim() == 2 and
+                a.shape[0] == self.in_features and a.shape[1] == b.shape[0] and b.shape[1] == self.out_features
+                for a, b in pairs
+            )
+        )
+        if ok:
+            # A is kept [in, r] for the python path; the kernels read it transposed, (r, in)
+            a = torch.cat([a.T for a, _ in pairs], dim = 0).contiguous()
+            b = pairs[0][1].contiguous() if len(pairs) == 1 else torch.cat([b for _, b in pairs], dim = 0)
+            bc.set_lora(a, b)
+        elif bc is not None and bc.has_lora():
+            bc.set_lora(None, None)
+
+        self._lora_graph_src = src
+        self._lora_graphed = ok or (not pairs and self.lora_full_weight is None)
+        return self._lora_graphed
 
 
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):

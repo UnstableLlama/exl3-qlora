@@ -16,6 +16,16 @@ Usage::
 Compatible with adapters trained via PEFT/Unsloth on the full-precision
 base model. LoRA weights are applied on top of the dequantized output
 of each target linear layer.
+
+Execution: ``Linear.forward`` adds ``x @ A @ B`` after the quantized GEMM
+(prefill, batched decode, any unfused path). The graph-captured decode blocks
+(BC_Attention, BC_GatedMLP, BC_MLP) take the adapter through each target
+``Linear``'s C++ ``BC_LinearEXL3`` (``Linear.lora_sync``, done lazily by the
+modules' dispatch guards) and add it as nodes of their CUDA graphs; the
+fused multi-linear GEMM branches add it onto their output. Modules whose
+graphs have no LoRA stage (MLA, DSA, GDN, Mamba2, routed MoE experts) fall
+back to the unfused path while an adapter is attached. See
+``doc/lora_fused_decode.md``.
 """
 
 from __future__ import annotations
