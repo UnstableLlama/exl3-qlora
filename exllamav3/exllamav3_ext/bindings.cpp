@@ -14,6 +14,7 @@
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
+#include "sparse_head.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
@@ -36,6 +37,7 @@
 #include "quant/exl3_moe_coop.cuh"
 
 #include "generator/strings.h"
+#include "generator/staging.h"
 #include "generator/sampling_basic.cuh"
 #include "generator/sampling_extra.cuh"
 #include "generator/gumbel.cuh"
@@ -57,6 +59,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "libtorch/shared_kv_attention.h"
 #include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
@@ -113,6 +116,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
+    m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_group", &routing_ds3_group, "routing_ds3_group");
@@ -223,6 +227,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
+    m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
@@ -294,6 +299,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
+    m.def("generator_stage_decode", &generator_stage_decode, "generator_stage_decode");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
 
     m.def("quant_cache_cont", &quant_cache_cont, "quant_cache_cont");
@@ -318,6 +324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    #include "libtorch/shared_kv_attention_bc.h"
     #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
