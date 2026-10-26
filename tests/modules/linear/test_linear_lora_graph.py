@@ -7,8 +7,9 @@ a padded adapter over a narrower activation (the python path's zero-extension is
 
 Linear.lora_sync is the hand-off the module dispatch guards (lora_graphed) rely on: it mirrors the attached dicts
 into the C++ object, declines what the kernels can't take (odd dtypes, mismatched shapes, a modules_to_save
-full-weight override) so the module falls back to the unfused path, and detaches once the dicts empty. Modules are
-built from random trellis tensors through the real loader.
+full-weight override) so the module falls back to the unfused path, and detaches once the dicts empty. Unquantized
+linears (BC_LinearFP16: the GDN b/a projections, headwise gates) carry the same component. Modules are built from
+random tensors through the real loader.
 """
 
 import pytest
@@ -180,3 +181,44 @@ def test_lora_sync_declines_what_the_kernels_cannot_take(tmp_path, device):
     assert lora_graphed(module)
     module.unload()
     assert not module.lora_a_tensors and module._lora_graph_src == ()
+
+
+@torch.inference_mode()
+def test_strided_output_slice(tmp_path, device):
+    # The GDN graph lands the b / a deltas on column slices of its merged (R, 2*Nv) static: lora_b
+    # takes the row stride and leaves the other half untouched
+    k, n, r = 512, 128, 8
+    module = build(tmp_path, device, k, n)
+    gen = generator(23)
+    a, b = adapter(k, n, r, gen, device)
+    module.inner.bc.set_lora(a.T.contiguous(), b)
+    x = (torch.randn((2, 3, k), generator = gen) * 0.5).half().to(device)
+    wide = torch.zeros((2, 3, 2 * n), device = device, dtype = torch.float)
+    right = wide.narrow(-1, n, n)
+    module.inner.bc.run_lora(x, right)
+    assert torch.count_nonzero(wide[..., :n]) == 0, "the untouched half was written"
+    assert rel_max_err(wide[..., n:].reshape(-1, n), delta_ref(x, a, b)) <= 1e-4
+    bad = wide.transpose(0, 1).narrow(-1, 0, n)   # rows no longer uniformly strided
+    with pytest.raises(RuntimeError):
+        module.inner.bc.run_lora(x.transpose(0, 1).contiguous(), bad)
+
+
+@torch.inference_mode()
+def test_fp16_linear_hand_off(tmp_path, device):
+    # An unquantized Linear (weight (in, out) fp16): same hand-off and kernels through BC_LinearFP16
+    k, n, r = 512, 128, 8
+    gen = generator(29)
+    w = (torch.randn(n, k, generator = gen) * 0.05).half()                      # checkpoint orientation (out, in)
+    module = Linear(module_config({f"{KEY}.weight": w}, tmp_path), KEY, k, n)
+    module.load(device)
+    assert module.quant_type == "fp16" and module.inner.bc is not None
+    a, b = adapter(k, n, r, gen, device)
+    owner = object()
+    module.lora_a_tensors[owner], module.lora_b_tensors[owner] = a, b
+    assert lora_graphed(module) and module.inner.bc.has_lora()
+    x = (torch.randn((1, 5, k), generator = gen) * 0.5).half().to(device)
+    y = torch.zeros((1, 5, n), device = device, dtype = torch.float)
+    module.inner.bc.run_lora(x, y)
+    assert rel_max_err(y.view(-1, n), delta_ref(x, a, b)) <= 1e-4
+    module.lora_a_tensors.clear(); module.lora_b_tensors.clear()
+    assert lora_graphed(module) and not module.inner.bc.has_lora()

@@ -177,7 +177,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("K"),
     py::arg("mcg"),
     py::arg("mul1")
-);
+)
+.def("set_ba_proj", &BC_GatedDeltaNetSplit::set_ba_proj, py::arg("b_proj"), py::arg("a_proj"));
 
 py::class_<BC_Mamba2, std::shared_ptr<BC_Mamba2>>(m, "BC_Mamba2").def
 (

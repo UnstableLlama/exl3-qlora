@@ -7,7 +7,10 @@ py::class_<BC_LinearFP16, std::shared_ptr<BC_LinearFP16>>(m, "BC_LinearFP16").de
     py::arg("weight"),
     py::arg("bias") = py::none()
 )
-.def("run", &BC_LinearFP16::run);
+.def("run", &BC_LinearFP16::run)
+.def("set_lora", &BC_LinearFP16::set_lora, py::arg("a"), py::arg("b"))
+.def("has_lora", &BC_LinearFP16::has_lora)
+.def("run_lora", &BC_LinearFP16::run_lora);
 //.def("run_cublas", &BC_LinearFP16::run_cublas);
 
 py::class_<BC_LinearEXL3, std::shared_ptr<BC_LinearEXL3>>(m, "BC_LinearEXL3").def

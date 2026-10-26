@@ -1,6 +1,8 @@
 """
-Runtime LoRA inside the captured decode graphs (BC_Attention / BC_GatedMLP / BC_MLP), over every registry model
-tagged "dense", with random PEFT adapters on q/k/v/o/gate/up/down (testlib.lora).
+Runtime LoRA inside the captured decode graphs (BC_Attention / BC_GatedMLP / BC_MLP / BC_GatedDeltaNetSplit), over
+every registry model tagged "dense" and every hybrid tagged "gdn", with random PEFT adapters on the attention, MLP
+and GDN projections (testlib.lora). MoE hybrids keep their routed experts unadapted here (the fused expert kernels
+have no LoRA stage; an adapter there takes the per-expert path, which is a different test).
 
 test_lora_graph_matches_eager: the graphed decode with an adapter attached reproduces the same C++ launch sequence
 run eagerly (EXL3_GRAPHS=0), like every other BC path test. The scenario also exercises the adapter lifecycle in one
@@ -33,10 +35,13 @@ def scenario(model_dir: str, work_dir: str) -> list:
     """Greedy generations through the adapter lifecycle (child process): [(label, tokens, step logits)]"""
     from exllamav3 import LoRA
     from exllamav3.modules import Attention, GatedMLP, MLP
-    from testlib.lora import write_random_adapter
+    from exllamav3.modules.gated_delta_net import GatedDeltaNet
+    from testlib.lora import DEFAULT_TARGETS, write_random_adapter
 
     _, model, (cache,), tok = load_with_caches(model_dir, get_test_device())
-    dirs = [write_random_adapter(model, os.path.join(work_dir, f"adapter{i}"), rank = 16, seed = i) for i in range(2)]
+    targets = DEFAULT_TARGETS + ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+    dirs = [write_random_adapter(model, os.path.join(work_dir, f"adapter{i}"), rank = 16, seed = i, targets = targets)
+            for i in range(2)]
     expect_graphed = os.environ.get("EXL3_LORA_GRAPH", "1") != "0"
 
     def gen():
@@ -53,6 +58,9 @@ def scenario(model_dir: str, work_dir: str) -> list:
             elif isinstance(m, (GatedMLP, MLP)):
                 n += sum(1 for p in (*getattr(m, "gates", []), *m.ups, *m.downs)
                          if p.quant_type == "exl3" and p.inner.bc.has_lora())
+            elif isinstance(m, GatedDeltaNet):
+                n += sum(1 for p in (m.qkv_proj, m.z_proj, m.b_proj, m.a_proj, m.o_proj)
+                         if p is not None and p.quant_type in ("exl3", "fp16") and p.inner.bc.has_lora())
         return n
 
     out = []
@@ -63,6 +71,7 @@ def scenario(model_dir: str, work_dir: str) -> list:
     n_graphed = graphed_projections()
     bc_attn_built = any(v for m in model if isinstance(m, Attention) for v in getattr(m, "bc_attn", {}).values())
     bc_mlp_built = any(getattr(m, "bc", None) is not None for m in model if isinstance(m, (GatedMLP, MLP)))
+    bc_gdn_built = any(getattr(m, "bc_split", False) for m in model if isinstance(m, GatedDeltaNet))
     lora0.unload()
 
     lora0_zero = LoRA.from_directory(model, dirs[0], lora_scaling = 0.0)
@@ -83,7 +92,7 @@ def scenario(model_dir: str, work_dir: str) -> list:
     unload_model(model)
 
     # Vacuity checks: the adapter really went through the graphs (or really stayed out of them)
-    assert bc_attn_built or bc_mlp_built, "model built no BC decode path; test is vacuous"
+    assert bc_attn_built or bc_mlp_built or bc_gdn_built, "model built no BC decode path; test is vacuous"
     if expect_graphed:
         assert n_graphed > 0, "no projection handed its adapter to the graph path"
     else:
@@ -110,8 +119,7 @@ def _assert_identical(d, label_a, label_b):
         assert torch.equal(x, y), f"{label_a} vs {label_b}: step {i} logits differ (max abs {(x - y).abs().max():.3e})"
 
 
-@pytest.mark.models("dense")
-def test_lora_graph_matches_eager(model_id, model_dir, device, tmp_path):
+def _check_eager(model_id, model_dir, device, tmp_path):
     graphed, eager = run_with_and_without_graphs(scenario, model_dir, str(tmp_path), device = device)
     assert_matches_eager([(f"{model_id} [{l}]", t, g) for l, t, g in graphed],
                          [(f"{model_id} [{l}]", t, g) for l, t, g in eager], min_steps = 4)
@@ -127,8 +135,7 @@ def test_lora_graph_matches_eager(model_id, model_dir, device, tmp_path):
     assert _rfn(d["lora1"][1][0], d["lora0"][1][0]) > 1e-3, "adapters 0 and 1 are indistinguishable"
 
 
-@pytest.mark.models("dense")
-def test_lora_graph_matches_unfused(model_id, model_dir, device, tmp_path):
+def _check_unfused(model_id, model_dir, device, tmp_path):
     env = {**device_env(device), "EXL3_GRAPHS": "1"}
     graphed = _by_label(run_isolated(scenario, model_dir, str(tmp_path / "graph"), env = {**env, "EXL3_LORA_GRAPH": "1"}))
     unfused = _by_label(run_isolated(scenario, model_dir, str(tmp_path / "unfused"), env = {**env, "EXL3_LORA_GRAPH": "0"}))
@@ -151,3 +158,23 @@ def test_lora_graph_matches_unfused(model_id, model_dir, device, tmp_path):
                 f"{model_id} [{label}] step {i}: in-graph vs unfused LoRA rfn {diff:.4f} (adapter effect {effect:.4f})"
             agree += 1
         assert agree >= 3, f"{model_id} [{label}]: decode tokens diverged too early ({tok_g} vs {tok_u})"
+
+
+@pytest.mark.models("dense")
+def test_lora_graph_matches_eager(model_id, model_dir, device, tmp_path):
+    _check_eager(model_id, model_dir, device, tmp_path)
+
+
+@pytest.mark.models("dense")
+def test_lora_graph_matches_unfused(model_id, model_dir, device, tmp_path):
+    _check_unfused(model_id, model_dir, device, tmp_path)
+
+
+@pytest.mark.models("gdn")
+def test_lora_graph_matches_eager_gdn(model_id, model_dir, device, tmp_path):
+    _check_eager(model_id, model_dir, device, tmp_path)
+
+
+@pytest.mark.models("gdn")
+def test_lora_graph_matches_unfused_gdn(model_id, model_dir, device, tmp_path):
+    _check_unfused(model_id, model_dir, device, tmp_path)

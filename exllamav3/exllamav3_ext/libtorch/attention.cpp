@@ -453,7 +453,10 @@ void BC_Attention::run_gr
                       c10::nullopt, c10::nullopt, qkv_K, -1, qkv_mcg, qkv_mul1, -1, -1, 0, graph,
                       1, qkv_size_n, s.qkv_c_ptrs, qkv_n_stride, qkv_had_src, qkv_num_src);
         if (gate_mode == 2 && g_weight)
+        {
             hgemm_gr(x2, g_weight.value(), s.g2, graph);
+            if (g_proj_fp16) g_proj_fp16->lora_gr(x2, s.g2, graph);
+        }
         // Runtime LoRA deltas on the bundle's q (and quantized gate) output; k/v below
         if (gate_mode == 3)
             q_proj->lora_gr(x2, s.qg2, graph);
@@ -492,14 +495,17 @@ void BC_Attention::run_gr
         {
             TORCH_CHECK(g_weight, "BC_Attention: headwise gate requires the fp16 gate weight");
             hgemm_gr(x2, g_weight.value(), s.g2, graph);
+            if (g_proj_fp16) g_proj_fp16->lora_gr(x2, s.g2, graph);
         }
         else if (gate_mode == 2)
         {
             if (g_weight)
             {
                 // Unquantized gate: cublas gemm over the staged (static) input, output static,
-                // weight static -- nothing to patch at replay
+                // weight static -- nothing to patch at replay (the LoRA nodes patch their
+                // static operands)
                 hgemm_gr(x2, g_weight.value(), s.g2, graph);
+                if (g_proj_fp16) g_proj_fp16->lora_gr(x2, s.g2, graph);
             }
             else
             {
@@ -947,7 +953,7 @@ void BC_Attention::run
     // order (static intermediates included, to keep the site walk aligned)
     at::Tensor kv2 = s.kv.view({2, R, num_kv_heads * head_dim});
     void* q_out = gate_mode == 3 ? s.qg2.data_ptr() : s.q2.data_ptr();
-    void* g_out = (gate_mode == 2 || gate_mode == 3) ? s.g2.data_ptr() : nullptr;
+    void* g_out = gate_mode != 0 ? s.g2.data_ptr() : nullptr;
     void* k_out = kv2.select(0, 0).data_ptr();
     void* v_out = kv2.select(0, 1).data_ptr();
 
@@ -955,6 +961,8 @@ void BC_Attention::run
     if (use_qkv)
     {
         params.emplace_back(GP_mgemm_A, xptr);   // one sliced mgemm covers q, k, v (and a quantized gate)
+        if (gate_mode == 2 && g_weight && g_proj_fp16)
+            g_proj_fp16->lora_args(params, xptr, g_out);
         q_proj->lora_args(params, xptr, q_out);
         if (gate_mode == 2 && g_proj)
             g_proj->lora_args(params, xptr, g_out);
@@ -975,6 +983,8 @@ void BC_Attention::run
             params.emplace_back(GP_gemm_A, xptr);
             g_proj->lora_args(params, xptr, g_out);
         }
+        else if ((gate_mode == 1 || gate_mode == 2) && g_proj_fp16)
+            g_proj_fp16->lora_args(params, xptr, g_out);
     }
 
     // K/V projections

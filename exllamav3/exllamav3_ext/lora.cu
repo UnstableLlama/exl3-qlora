@@ -73,6 +73,7 @@ __global__ void kernel \
     const int R, \
     const int t_stride, \
     const int b_stride, \
+    const int y_stride, \
     const int N \
 ) \
 { \
@@ -83,7 +84,7 @@ __global__ void kernel \
     float acc = 0.0f; \
     for (int j = 0; j < R; ++j) \
         acc += tr[j] * __half2float(bc[(size_t) j * b_stride]); \
-    yt* yp = y + (size_t) blockIdx.y * N + n; \
+    yt* yp = y + (size_t) blockIdx.y * y_stride + n; \
     float v = load + acc; \
     *yp = store; \
 }
@@ -149,7 +150,12 @@ void lora_b_gr
     TORCH_CHECK_FLOAT_HALF(y);
     TORCH_CHECK_DIM(t, 2);
     TORCH_CHECK_DIM(b, 2);
-    TORCH_CHECK(t.is_contiguous() && b.is_contiguous() && y.is_contiguous(), "lora_b: tensors must be contiguous");
+    TORCH_CHECK(t.is_contiguous() && b.is_contiguous(), "lora_b: t and B must be contiguous");
+    TORCH_CHECK(y.dim() >= 2 && y.stride(-1) == 1, "lora_b: y must have unit column stride");
+    // y may be a column slice of a wider row-major static: rows are y.stride(-2) apart, and the
+    // leading dims must collapse onto that stride
+    for (int d = 0; d < y.dim() - 2; ++d)
+        TORCH_CHECK(y.stride(d) == y.stride(d + 1) * y.size(d + 1), "lora_b: y rows must be uniformly strided");
 
     int R = (int) b.size(0);
     int N = (int) y.size(-1);
@@ -161,12 +167,13 @@ void lora_b_gr
     dim3 grid(CEIL_DIVIDE(N, LORA_B_THREADS), m);
     int t_stride = (int) t.size(1);
     int b_stride = (int) b.size(1);
+    int y_stride = (int) y.stride(-2);
 
     #define INSTANCE(yt_, yt__, kernel) \
     if (y.dtype() == yt_) \
     { \
         kernel<<<grid, LORA_B_THREADS, 0, stream>>> \
-            ((const float*) t.data_ptr(), (const half*) b.data_ptr(), (yt__*) y.data_ptr(), R, t_stride, b_stride, N); \
+            ((const float*) t.data_ptr(), (const half*) b.data_ptr(), (yt__*) y.data_ptr(), R, t_stride, b_stride, y_stride, N); \
         if (graph) graph->record_param((void*) &kernel, GP_lora_y, 2); \
         if (graph) graph->record_param((void*) &kernel, GP_end, 0); \
     }
