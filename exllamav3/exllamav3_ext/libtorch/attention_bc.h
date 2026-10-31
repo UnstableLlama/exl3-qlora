@@ -32,6 +32,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
         bool,
         std::shared_ptr<BC_LinearEXL3>,
         c10::optional<at::Tensor>,
+        std::shared_ptr<BC_LinearFP16>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
@@ -91,6 +92,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("gate_softplus"),
     py::arg("g_proj"),
     py::arg("g_weight"),
+    py::arg("g_proj_fp16"),
     py::arg("qg_ptrs_trellis"),
     py::arg("qg_ptrs_suh"),
     py::arg("qg_ptrs_svh"),
@@ -185,5 +187,4 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("qsa_split_len") = 0,
     py::arg("qsa_programs") = 0
 )
-.def("run", &BC_Attention::run)
-.def("set_g_proj_fp16", &BC_Attention::set_g_proj_fp16, py::arg("g_proj"));
+.def("run", &BC_Attention::run);

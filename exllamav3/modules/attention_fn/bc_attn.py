@@ -231,6 +231,8 @@ class BCAttn:
             gate_softplus = self.gate_softplus,
             g_proj = module.g_proj.inner.bc if (self.gate_mode == 2 and self._has_bc(module.g_proj)) else None,
             g_weight = self.g_weight,
+            # the fp16 gate's linear, for its runtime LoRA (the gemm reads g_weight directly)
+            g_proj_fp16 = module.g_proj.inner.bc if self.g_weight is not None else None,
             qg_ptrs_trellis = mqg.ptrs_trellis if mqg is not None else None,
             qg_ptrs_suh = mqg.ptrs_suh if mqg is not None else None,
             qg_ptrs_svh = mqg.ptrs_svh if mqg is not None else None,
@@ -269,10 +271,6 @@ class BCAttn:
             h32 = h32,
             sinks = self.sinks,
         )
-
-        # The fp16 gate's linear, bound for its runtime LoRA (the gemm reads g_weight directly)
-        if self.g_weight is not None:
-            self.bc.set_g_proj_fp16(module.g_proj.inner.bc)
 
         # QSA indexer (Qwen3.8-Flash-Next): arm the sparse-selection stages. The armed instance
         # maintains the raw/pooled key planes in-graph on every step (both regimes), so the

@@ -2,7 +2,7 @@
 Runtime LoRA on BC_LinearEXL3. The graph-captured decode blocks add an adapter through the projection's C++ object
 (BC_LinearEXL3.lora_gr: the lora_a / lora_b kernels behind Linear.lora_sync), which run_lora exposes eagerly. It
 must match the unfused reference Linear.apply_lora computes, y + x @ A @ B, for fp16 and fp32 outputs, row counts
-up to the LORA_MAX_ROWS scratch (the largest graphed shape) and no further, adapters stacked along the rank dim, and
+up to the BC_LoRA::MAX_ROWS scratch (the largest graphed shape) and no further, adapters stacked along the rank dim, and
 a padded adapter over a narrower activation (the python path's zero-extension is never staged here).
 
 Linear.lora_sync is the hand-off the module dispatch guards (lora_graphed) rely on: it mirrors the attached dicts
@@ -22,7 +22,7 @@ from testlib.checkpoint import module_config
 from testlib.exl3 import checkpoint_tensors, generator
 
 KEY = "model.layers.0.self_attn.q_proj"
-MAX_ROWS = 128   # BC_LinearEXL3::LORA_MAX_ROWS
+MAX_ROWS = 128   # BC_LoRA::MAX_ROWS
 
 
 def build(directory, device, k, n, K = 4, codebook = "mul1", bias = False, seed = 1):

@@ -772,8 +772,8 @@ class Linear(Module):
     def lora_sync(self) -> bool:
         """
         Hand the runtime LoRA currently attached (``lora_a_tensors`` / ``lora_b_tensors``) to
-        the C++ ``BC_LinearEXL3``, which the graph-captured decode blocks (BC_Attention,
-        BC_GatedMLP, BC_MLP) run ``lora_gr`` on after this projection's GEMM, or detach it
+        the C++ linear, which the graph-captured decode blocks (BC_Attention, BC_GatedMLP,
+        BC_MLP, BC_GatedDeltaNetSplit) run ``lora_gr`` on after this projection's GEMM, or detach it
         when the dicts were emptied. Several adapters are stacked along the rank dim (B carries
         the scale, so ``x @ [A1 | A2] @ [B1; B2]`` is their sum). Only does work when the
         attached tensors changed; a change also drops every captured graph (graph structure

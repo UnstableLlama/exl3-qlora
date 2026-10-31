@@ -924,6 +924,9 @@ class GatedDeltaNet(Module):
                 self.o_proj.inner.bc,
                 self.ba_weight_t,
                 self.ba_bias,
+                # the b/a linears behind the merged GEMV, for their runtime LoRA deltas
+                self.b_proj.inner.bc,
+                self.a_proj.inner.bc,
                 self.dt_bias,
                 self.a_log,
                 self.num_k_heads,
@@ -935,8 +938,6 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            # The b/a linears behind the merged GEMV, for their runtime LoRA deltas
-            self.bc.set_ba_proj(self.b_proj.inner.bc, self.a_proj.inner.bc)
             self.bc_split = True
 
             # Sliced qkv+z bundle: both projections read x and are cut into equal-width column

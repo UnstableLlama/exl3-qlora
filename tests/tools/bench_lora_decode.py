@@ -38,7 +38,8 @@ MODES = {
 
 def child(args) -> dict:
     import torch
-    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler, LoRA
+    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
+    from exllamav3.model.lora import LoRA
 
     device = torch.device(args.device)
     torch.cuda.set_device(device)
@@ -61,10 +62,13 @@ def child(args) -> dict:
         torch.cuda.synchronize(device)
         adapter_bytes = torch.cuda.memory_allocated(device) - base_alloc
 
-    ids = tokenizer.encode(PROMPT, add_bos = True)
-    while ids.shape[-1] < args.prompt_len:
-        ids = torch.cat([ids, ids[:, 1:]], dim = -1)
-    ids = ids[:, :args.prompt_len]
+    if args.prompt is not None:
+        ids = tokenizer.encode(args.prompt, add_bos = True)
+    else:
+        ids = tokenizer.encode(PROMPT, add_bos = True)
+        while ids.shape[-1] < args.prompt_len:
+            ids = torch.cat([ids, ids[:, 1:]], dim = -1)
+        ids = ids[:, :args.prompt_len]
 
     def run(record: bool):
         gen = Generator(model = model, cache = cache, tokenizer = tokenizer, max_batch_size = args.batch)
@@ -122,7 +126,8 @@ def main():
     ap.add_argument("-a", "--adapter", default = None, help = "PEFT adapter directory (default: random, see --rank)")
     ap.add_argument("--rank", type = int, default = 16, help = "rank of the random adapter")
     ap.add_argument("--tokens", type = int, default = 128, help = "decode steps per job")
-    ap.add_argument("--prompt-len", type = int, default = 64)
+    ap.add_argument("--prompt-len", type = int, default = 64, help = "the default prompt is repeated/cut to this many tokens")
+    ap.add_argument("--prompt", default = None, help = "prompt text, used as is (default: a fixed prompt of --prompt-len tokens)")
     ap.add_argument("--batch", type = int, default = 1, help = "concurrent jobs (decode rows)")
     ap.add_argument("--repeats", type = int, default = 3, help = "timed generations per mode (best is reported)")
     ap.add_argument("--modes", default = "base,graph,unfused")
@@ -143,8 +148,16 @@ def main():
         rows = []
         for mode in modes:
             env = dict(os.environ, **MODES[mode], PYTHONPATH = os.pathsep.join([REPO, TESTS, os.environ.get("PYTHONPATH", "")]))
-            cmd = [sys.executable, os.path.abspath(__file__), "--child-mode", mode, "--work-dir", work] + \
-                  [a for a in sys.argv[1:] if a not in ("--work-dir",)]
+            passthrough = []
+            skip = False
+            for a in sys.argv[1:]:
+                if skip:
+                    skip = False
+                elif a == "--work-dir":
+                    skip = True
+                else:
+                    passthrough.append(a)
+            cmd = [sys.executable, os.path.abspath(__file__), "--child-mode", mode, "--work-dir", work] + passthrough
             r = subprocess.run(cmd, env = env, capture_output = True, text = True)
             if r.returncode != 0:
                 print(f"[{mode}] failed:\n{r.stdout[-2000:]}\n{r.stderr[-4000:]}")
@@ -163,23 +176,35 @@ def main():
                 if r["mode"] != "base":
                     print(f"  {r['mode']}: {100.0 * (r['ms_per_step'] / base['ms_per_step'] - 1.0):+.1f}% per-step time vs base")
 
-        # Agreement of the two adapted runs (same prompt, same adapter): tokens and decode-step logits
-        g, u = os.path.join(work, "graph.pt"), os.path.join(work, "unfused.pt")
-        if os.path.exists(g) and os.path.exists(u):
-            import torch
-            dg, du = torch.load(g), torch.load(u)
-            n = min(len(dg["tokens"]), len(du["tokens"]))
+        # Agreement of the two adapted runs (same prompt, same adapter): tokens and decode-step logits, and the
+        # adapter's own effect (base vs in-graph) as the scale to read that against
+        import torch
+
+        def compare(x, y):
+            """(identical token prefix, [per-step logits rfn over that prefix])"""
+            n = min(len(x["tokens"]), len(y["tokens"]))
             agree = 0
-            while agree < n and dg["tokens"][agree] == du["tokens"][agree]:
+            while agree < n and x["tokens"][agree] == y["tokens"][agree]:
                 agree += 1
             errs = []
-            for i in range(1, min(agree, len(dg["logits"]), len(du["logits"]))):
-                a, b = dg["logits"][i], du["logits"][i]
+            for i in range(1, min(agree, len(x["logits"]), len(y["logits"]))):
+                a, b = x["logits"][i], y["logits"][i]
                 m = torch.isfinite(a) & torch.isfinite(b)
                 errs.append(((a[m] - b[m]).norm() / b[m].norm()).item())
-            print(f"\ngraph vs unfused: first {agree}/{n} tokens identical; decode-step logits rfn "
+            return agree, n, errs
+
+        def report(label, x, y):
+            agree, n, errs = compare(x, y)
+            print(f"{label}: first {agree}/{n} tokens identical; decode-step logits rfn "
                   f"max {max(errs) if errs else float('nan'):.4f} mean {sum(errs) / len(errs) if errs else float('nan'):.4f} "
                   f"over {len(errs)} agreeing steps")
+
+        loaded = {m: torch.load(os.path.join(work, f"{m}.pt")) for m in MODES if os.path.exists(os.path.join(work, f"{m}.pt"))}
+        print()
+        if "graph" in loaded and "unfused" in loaded:
+            report("graph vs unfused", loaded["graph"], loaded["unfused"])
+        if "base" in loaded and "graph" in loaded:
+            report("adapter effect (base vs graph)", loaded["base"], loaded["graph"])
     return 0
 
 

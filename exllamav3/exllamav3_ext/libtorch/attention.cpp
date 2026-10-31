@@ -38,6 +38,7 @@ BC_Attention::BC_Attention
     bool _gate_softplus,
     std::shared_ptr<BC_LinearEXL3> _g_proj,
     c10::optional<at::Tensor> _g_weight,
+    std::shared_ptr<BC_LinearFP16> _g_proj_fp16,
     c10::optional<at::Tensor> _qg_ptrs_trellis,
     c10::optional<at::Tensor> _qg_ptrs_suh,
     c10::optional<at::Tensor> _qg_ptrs_svh,
@@ -98,6 +99,7 @@ BC_Attention::BC_Attention
     gate_softplus       (_gate_softplus),
     g_proj              (_g_proj),
     g_weight            (std::move(_g_weight)),
+    g_proj_fp16         (std::move(_g_proj_fp16)),
     qg_ptrs_trellis     (std::move(_qg_ptrs_trellis)),
     qg_ptrs_suh         (std::move(_qg_ptrs_suh)),
     qg_ptrs_svh         (std::move(_qg_ptrs_svh)),
@@ -912,7 +914,7 @@ void BC_Attention::run
 
     // A runtime LoRA attached or detached since capture changes the node list: drop the graph
     // and re-record it below
-    s.graph->refresh();
+    if (s.graph->refresh()) s.runs = 0;
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched.

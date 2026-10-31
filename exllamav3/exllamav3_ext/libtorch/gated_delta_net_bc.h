@@ -60,6 +60,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
         std::shared_ptr<BC_LinearEXL3>,
         at::Tensor,
         c10::optional<at::Tensor>,
+        std::shared_ptr<BC_LinearFP16>,
+        std::shared_ptr<BC_LinearFP16>,
         at::Tensor,
         at::Tensor,
         int,
@@ -76,6 +78,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("o_proj"),
     py::arg("ba_weight_t"),
     py::arg("ba_bias"),
+    py::arg("b_proj"),
+    py::arg("a_proj"),
     py::arg("dt_bias"),
     py::arg("a_log"),
     py::arg("num_k_heads"),
@@ -177,8 +181,7 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("K"),
     py::arg("mcg"),
     py::arg("mul1")
-)
-.def("set_ba_proj", &BC_GatedDeltaNetSplit::set_ba_proj, py::arg("b_proj"), py::arg("a_proj"));
+);
 
 py::class_<BC_Mamba2, std::shared_ptr<BC_Mamba2>>(m, "BC_Mamba2").def
 (

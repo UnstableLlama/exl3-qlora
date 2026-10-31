@@ -87,8 +87,10 @@ void BC_LoRA::set(c10::optional<at::Tensor> a_, c10::optional<at::Tensor> b_, in
         TORCH_CHECK(av.is_contiguous() && bv.is_contiguous(), "BC_LoRA::set: A and B must be contiguous");
         TORCH_CHECK(av.device() == device && bv.device() == device, "BC_LoRA::set: A and B must be on the weight's device");
         TORCH_CHECK(av.size(0) == bv.size(0) && av.size(0) > 0, "BC_LoRA::set: A (R, K) and B (R, N) ranks differ");
-        TORCH_CHECK(av.size(1) == K, "BC_LoRA::set: A width must be the linear's (padded) in_features");
-        TORCH_CHECK(bv.size(1) == N, "BC_LoRA::set: B width must be the linear's (padded) out_features");
+        // The python Linear pads to 128 columns, the trellis to 16: A and B may be wider than the stored weight
+        // (the kernels read only the first K / N columns), never narrower
+        TORCH_CHECK(av.size(1) >= K, "BC_LoRA::set: A is narrower than the linear's in_features");
+        TORCH_CHECK(bv.size(1) >= N, "BC_LoRA::set: B is narrower than the linear's out_features");
         t = at::empty({MAX_ROWS, av.size(0)}, av.options().dtype(at::kFloat));
     }
     else

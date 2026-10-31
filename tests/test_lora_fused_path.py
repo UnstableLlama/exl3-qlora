@@ -11,13 +11,13 @@ looked like a no-op at inference. The mgemm branches in attention
 (attn/sliding_attn) and GatedMLP stay fused and add the low-rank delta
 onto the mgemm output (pre-RoPE / pre-activation, matching Linear.forward
 semantics -- MultiLinear pairs are bias/softcap/scale-free by construction).
-The dense whole-block graphs (bc_attn/bc_swa, BC_GatedMLP, BC_MLP) take the
-adapter through each projection's BC_LinearEXL3 and add it in-graph; their
-dispatch must go through lora_graphed (the hand-off, which declines what the
-graph can't take) rather than run unconditionally. The other graph paths (the
-GDN split graph, MLA, Mamba2, the fused MoE expert kernels) have no LoRA
-stage and still fall back to unfused dispatch while any involved Linear
-carries LoRA tensors.
+The whole-block graphs (bc_attn/bc_swa, BC_GatedMLP, BC_MLP, the GDN split
+graph) take the adapter through each projection's C++ linear and add it
+in-graph; their dispatch must go through lora_graphed (the hand-off, which
+declines what the graph can't take) rather than run unconditionally. The
+other graph paths (GDN in KDA mode, MLA, Mamba2, the fused MoE expert
+kernels) have no LoRA stage and still fall back to unfused dispatch while
+any involved Linear carries LoRA tensors.
 
 Because the failure mode is SILENT (generation stays coherent, the adapter
 just doesn't run), these tests are tripwires on the guard conditions in the
@@ -167,7 +167,7 @@ def test_graph_owners_record_and_patch_lora_sites():
         # the three fp16-gate branches of run_gr share patch entries in run())
         assert n_gr and n_args and n_gr - n_args <= 3, \
             f"{fname}: {n_gr} lora_gr sites but {n_args} lora_args patches"
-        assert src.count(".refresh();") >= owners or src.count("->refresh();") >= owners, \
+        assert len(re.findall(r"(?:\.|->)refresh\(\)", src)) >= owners, \
             f"{fname}: graph owners lost their structure-epoch refresh"
     linear = _src("exllamav3", "exllamav3_ext", "libtorch", "linear.cpp")
     assert "Graph::bump_structure_epoch();" in linear, "set_lora must invalidate captured graphs"
@@ -197,8 +197,8 @@ def test_gdn_split_bsz1_graph_guarded():
         r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj, self\.a_proj, self\.o_proj,.*?"
         r"self\.f_a_proj, self\.f_b_proj, self\.g_a_proj, self\.g_b_proj",
         src, re.S), "GatedDeltaNet: split fused decode lost its runtime-LoRA hand-off / KDA guard"
-    assert "self.bc.set_ba_proj(self.b_proj.inner.bc, self.a_proj.inner.bc)" in src, \
-        "GatedDeltaNet: the b/a linears must be bound to the graph for their LoRA deltas"
+    assert re.search(r"ext\.BC_GatedDeltaNetSplit\([^)]*?self\.b_proj\.inner\.bc,\s*self\.a_proj\.inner\.bc,", src), \
+        "GatedDeltaNet: the b/a linears must be handed to the graph object for their LoRA deltas"
 
 
 def test_moe_expert_dispatch_guarded():
