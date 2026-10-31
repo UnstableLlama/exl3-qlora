@@ -220,14 +220,38 @@ def test_moe_expert_dispatch_guarded():
         r"self\.bc is not None and self\.support_quant_paths and not experts_lora",
         src), "BlockSparseMLP: BC single-expert path lost its runtime-LoRA guard"
     # bszN kernels (v1.2.0: replace the bsz-1 graph; may embed shared experts
-    # + shared gate) are the last tier since v1.5.0, so a LoRA on the fused
-    # shared-expert linears must divert into the torch/fused branch instead
-    assert "sh_fused_lora" in src and re.search(
+    # + shared gate) are the last tier since v1.5.0. A LoRA on the shared
+    # expert's linears is handed to their BC_LinearEXL3 (lora_graphed) and
+    # applied inside the shared BC_GatedMLP graph; one the graph declines, or
+    # one on the shared gate (projected from the raw weight inside the routed
+    # launch), must divert into the torch/fused branch instead
+    assert re.search(
+        r"sh_fused_lora = self\.bc_sh_exp and \(\s*"
+        r"not lora_graphed\(\*self\.shared_experts\.gates, \*self\.shared_experts\.ups,\s*"
+        r"\*self\.shared_experts\.downs\) or\s*"
+        r"has_runtime_lora\(self\.shared_gate\)",
+        src), "BlockSparseMLP: shared experts lost their runtime-LoRA hand-off / shared-gate guard"
+    assert re.search(
         r"no_reconstruct or experts_lora or sh_fused_lora or",
         src), "BlockSparseMLP: bszN kernels lost their shared-experts LoRA guard"
     assert re.search(
         r"assert bszn_eligible and not experts_lora and not sh_fused_lora",
         src), "BlockSparseMLP: bszN tier lost its LoRA assertion"
+    # ... and the C++ side must honour the hand-off: the one-expert fused launch
+    # of the shared expert (sh_coop) reads pointer tables and has no LoRA stage,
+    # so while an adapter is attached run_bszN must take the BC_GatedMLP graph
+    # (which emits the LoRA nodes) instead
+    bsmlp = _src("exllamav3", "exllamav3_ext", "libtorch", "blocksparse_mlp.cpp")
+    assert re.search(
+        r"if \(sh_coop && !shared_experts_lora\(\)\)",
+        bsmlp), "BC_BlockSparseMLP::run_bszN: shared-expert fused launch lost its runtime-LoRA check"
+    assert re.search(
+        r"else if \(shared_experts\)\s*\{[^}]*?shared_experts->run_bszN\(",
+        bsmlp, re.S), "BC_BlockSparseMLP::run_bszN: lost the BC_GatedMLP fallback for the shared expert"
+    bsmlp_h = _src("exllamav3", "exllamav3_ext", "libtorch", "blocksparse_mlp.h")
+    assert re.search(
+        r"bool shared_experts_lora\(\) const\s*\{.*?gate->has_lora\(\).*?up->has_lora\(\).*?down->has_lora\(\)",
+        bsmlp_h, re.S), "BC_BlockSparseMLP::shared_experts_lora must check all three shared projections"
     # batched reconstruct tier (v1.5.0) reads the base trellis; skipped under LoRA
     assert re.search(
         r"if not experts_lora:\s*\n\s*recon = self\._batch_recon_layer\(y\)",

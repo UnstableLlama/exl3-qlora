@@ -12,7 +12,7 @@ from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_graphed
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
@@ -1067,8 +1067,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
         # always fall through to the exl3_moe/dense path first, capping this tier's reach at
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
-        # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
-        # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
+        # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run as
+        # a one-expert fused launch, or through BC_GatedMLP's own multi-row graph (see mlp.py)
+        # while they carry a runtime LoRA, ahead of the kernel
         bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
 
         # Routing
@@ -1134,15 +1135,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # tier, the BC single-expert kernels and the bszN decode kernels) reads the expert
         # trellis weights directly and never sees a runtime LoRA. When one is loaded on any
         # routed expert projection, force the branch below that can take the per-expert
-        # torch path. The bszN kernels may also embed the shared experts (bc_sh_exp) and the
-        # shared gate, so they are additionally skipped when those carry a LoRA -- the
-        # torch/fused branch then runs the routed experts as usual and the shared experts
-        # through their own (guarded) forwards afterwards.
+        # torch path. The bszN kernels may also embed the shared experts (bc_sh_exp): a LoRA on
+        # the shared projections is handed to their BC_LinearEXL3 (lora_graphed) and applied by
+        # the shared BC_GatedMLP graph, which BC_BlockSparseMLP::run_bszN runs in place of its
+        # one-expert fused launch while one is attached; an adapter the graph can't take, or one
+        # on the shared gate (projected from the raw weight inside the routed launch), skips the
+        # kernels -- the torch/fused branch then runs the routed experts as usual and the shared
+        # experts through their own (guarded) forwards afterwards.
         # NOTE: routing reads routing_gate.inner.weight directly on all paths; a LoRA
         # on the router is not supported (and not used by training).
         experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)
         sh_fused_lora = self.bc_sh_exp and (
-            has_runtime_lora(*self.shared_experts.gates, *self.shared_experts.ups,
+            not lora_graphed(*self.shared_experts.gates, *self.shared_experts.ups,
                              *self.shared_experts.downs) or
             has_runtime_lora(self.shared_gate)
         )
@@ -1179,8 +1183,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Torch/C++/fused path
         # (experts_lora / sh_fused_lora: this is the only branch with a per-expert torch path,
-        # and the bszN kernels below would embed the fused shared experts, so both LoRA cases
-        # land here regardless of bsz)
+        # and the bszN kernels below would embed the shared experts and gate, so both LoRA
+        # cases land here regardless of bsz)
         elif (
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or experts_lora or sh_fused_lora or
@@ -1463,7 +1467,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # out-of-range picks are masked inside the kernel and contribute exact zeros. Every
         # quantized configuration that reaches this point has self.bc (it is built whenever the
         # quantized paths apply), so this is the last tier. Never reached with a runtime LoRA on
-        # the routed experts or on the fused shared experts/gate (see the branch above)
+        # the routed experts or the shared gate, nor with one on the shared experts that their
+        # graph declined (see the branch above); one it accepted is applied inside that graph
         else:
             assert bszn_eligible and not experts_lora and not sh_fused_lora
             self.bc.run_bszN(y, selected_experts, routing_weights)

@@ -153,9 +153,9 @@ void lora_b_gr
     TORCH_CHECK(t.is_contiguous() && b.is_contiguous(), "lora_b: t and B must be contiguous");
     TORCH_CHECK(y.dim() >= 2 && y.stride(-1) == 1, "lora_b: y must have unit column stride");
     // y may be a column slice of a wider row-major static: rows are y.stride(-2) apart, and the
-    // leading dims must collapse onto that stride
+    // leading dims (those of size > 1; a singleton's stride is irrelevant) must collapse onto it
     for (int d = 0; d < y.dim() - 2; ++d)
-        TORCH_CHECK(y.stride(d) == y.stride(d + 1) * y.size(d + 1), "lora_b: y rows must be uniformly strided");
+        TORCH_CHECK(y.size(d) == 1 || y.stride(d) == y.stride(d + 1) * y.size(d + 1), "lora_b: y rows must be uniformly strided");
 
     int R = (int) b.size(0);
     int N = (int) y.size(-1);

@@ -92,7 +92,7 @@ void BC_BlockSparseMLP::run_bszN
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
     // the result into the routed sum, through the sigmoid gate when there is one
     c10::optional<at::Tensor> sh_o;
-    if (sh_coop)
+    if (sh_coop && !shared_experts_lora())
     {
         // One-expert fused launch at the shared expert's own bit width (expert 0, weight 1);
         // the sigmoid gate, if any, is applied by the routed launch when it merges the result
@@ -102,6 +102,9 @@ void BC_BlockSparseMLP::run_bszN
     }
     else if (shared_experts)
     {
+        // The BC_GatedMLP graph: three launches, but its gate/up/down handles emit the runtime
+        // LoRA nodes (and the graph re-records on an adapter change), which the one-expert fused
+        // launch above, reading the pointer tables, cannot
         at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
         shared_experts->run_bszN(x_dense, out_d_sh_n);

@@ -95,6 +95,17 @@ struct BC_BlockSparseMLP
     std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
     at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
 
+    // A runtime LoRA on any shared expert projection: the fused launch reads the pointer tables
+    // and has no LoRA stage, so run_bszN takes the BC_GatedMLP graph (which has one) instead.
+    // The shared gate is not covered: the routed launch projects it from the raw weight, so a
+    // LoRA there keeps the whole layer off this path (python guard)
+    bool shared_experts_lora() const
+    {
+        auto& se = shared_experts;
+        return se && ((se->gate && se->gate->has_lora()) || (se->up && se->up->has_lora()) ||
+                      (se->down && se->down->has_lora()));
+    }
+
 #if defined(USE_ROCM)
     // RDNA fused decode (rocm/quant/exl3_gemv_multirow_rdna.cu, exl3_rocm_moe_decode): taken by run_bszN
     // for gated SiLU experts without biases or expert-range masking; anything else keeps the kernels above
