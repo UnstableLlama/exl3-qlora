@@ -774,8 +774,10 @@ class Linear(Module):
         Hand the runtime LoRA currently attached (``lora_a_tensors`` / ``lora_b_tensors``) to
         the C++ linear, which the graph-captured decode blocks (BC_Attention, BC_GatedMLP,
         BC_MLP, BC_GatedDeltaNetSplit) run ``lora_gr`` on after this projection's GEMM, or detach it
-        when the dicts were emptied. Several adapters are stacked along the rank dim (B carries
-        the scale, so ``x @ [A1 | A2] @ [B1; B2]`` is their sum). Only does work when the
+        when the dicts were emptied. A is stored ``[r, in]`` (PEFT's orientation, what the
+        kernels read) and B ``[r, out]``, so a single adapter is handed over as is and several
+        are stacked along the rank dim (B carries the scale, so ``x @ [A1; A2].T @ [B1; B2]`` is
+        their sum). Only does work when the
         attached tensors changed; a change also drops every captured graph (graph structure
         epoch) so they re-record with or without the LoRA nodes.
 
@@ -806,14 +808,16 @@ class Linear(Module):
             all(
                 a.dtype == torch.half and b.dtype == torch.half and
                 a.dim() == 2 and b.dim() == 2 and
-                a.shape[0] == k_w and a.shape[1] == b.shape[0] and b.shape[1] == n_w
+                a.shape[1] == k_w and a.shape[0] == b.shape[0] and b.shape[1] == n_w
                 for a, b in pairs
             )
         )
         if ok:
-            # A is kept [in, r] for the python path; the kernels read it transposed, (r, in)
-            a = torch.cat([a.T for a, _ in pairs], dim = 0).contiguous()
-            b = pairs[0][1].contiguous() if len(pairs) == 1 else torch.cat([b for _, b in pairs], dim = 0)
+            if len(pairs) == 1:
+                a, b = pairs[0][0].contiguous(), pairs[0][1].contiguous()
+            else:
+                a = torch.cat([a for a, _ in pairs], dim = 0)
+                b = torch.cat([b for _, b in pairs], dim = 0)
             bc.set_lora(a, b)
         elif bc is not None and bc.has_lora():
             bc.set_lora(None, None)
@@ -830,14 +834,15 @@ class Linear(Module):
             b = self.lora_b_tensors.get(lora)
             if b is not None:
                 if flat.dtype == a.dtype and xf.dtype == b.dtype:
-                    # Fused in-place accumulate: x += (x @ a) @ b, no
-                    # materialized delta or dtype-cast kernels. This runs per
+                    # Fused in-place accumulate: x += (x @ a.T) @ b, no
+                    # materialized delta or dtype-cast kernels (a is stored
+                    # [r, in]; the transposed view is free). This runs per
                     # adapted Linear on every decode step, so launch count
                     # matters more than anything else here.
-                    xf.addmm_(flat @ a, b)
+                    xf.addmm_(flat @ a.T, b)
                 else:
                     lora_in = flat.to(a.dtype)
-                    delta = lora_in @ a @ b
+                    delta = lora_in @ a.T @ b
                     xf += delta.to(xf.dtype)
 
 

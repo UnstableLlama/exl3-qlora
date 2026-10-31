@@ -48,9 +48,10 @@ class LoRA:
     """
     LoRA adapter loaded from PEFT format.
 
-    Stores pre-transposed and pre-scaled A/B weight matrices on target
-    Linear modules. During forward pass, Linear.forward() computes:
-    ``output += input @ A @ B`` for each loaded adapter.
+    Stores A in PEFT's native ``[r, in]`` orientation and B pre-transposed
+    and pre-scaled to ``[r, out]`` on target Linear modules. During forward
+    pass, Linear.forward() computes: ``output += input @ A.T @ B`` for each
+    loaded adapter; the graph-captured decode blocks read A as stored.
     """
 
     @staticmethod
@@ -210,25 +211,25 @@ class LoRA:
             if tensor.dtype in (torch.bfloat16, torch.float32):
                 tensor = tensor.to(torch.float16)
 
-            # Transpose for efficient matmul: x @ A @ B
             # PEFT stores lora_A as [rank, in_features] and
             # lora_B as [out_features, rank].
-            # We want A as [in_features, rank] and B as [rank, out_features].
-            tensor = tensor.T.contiguous()
-
-            # Pre-scale B matrix. The module's rank is the tensor's own leading
-            # dim (post-transpose [r, out]), NOT config r: a rank_pattern
-            # adapter (e.g. smaller rank on MoE routed experts) has per-module
-            # ranks, and alpha_pattern can override alpha per module.
+            # A is kept as is: the python path computes x @ A.T @ B (a free
+            # transposed view) and the graph kernels read A as (rank, in).
+            # B is transposed to [rank, out_features] and pre-scaled. The
+            # module's rank is the tensor's own leading dim (post-transpose
+            # [r, out]), NOT config r: a rank_pattern adapter (e.g. smaller
+            # rank on MoE routed experts) has per-module ranks, and
+            # alpha_pattern can override alpha per module.
             if lora_half == "lora_B":
+                tensor = tensor.T.contiguous()
                 scaling = self._module_scaling(full_path, tensor.shape[0])
                 if scaling != 1.0:
                     tensor.mul_(scaling)
 
             # Pad to match target dimensions (quantized layers may pad features to multiples of block size)
-            if lora_half == "lora_A" and tensor.shape[0] < target.in_features:
-                padded = torch.zeros(target.in_features, tensor.shape[1], dtype=tensor.dtype)
-                padded[:tensor.shape[0]] = tensor
+            if lora_half == "lora_A" and tensor.shape[1] < target.in_features:
+                padded = torch.zeros(tensor.shape[0], target.in_features, dtype=tensor.dtype)
+                padded[:, :tensor.shape[1]] = tensor
                 tensor = padded
             elif lora_half == "lora_B" and tensor.shape[1] < target.out_features:
                 padded = torch.zeros(tensor.shape[0], target.out_features, dtype=tensor.dtype)
@@ -310,7 +311,8 @@ class LoRA:
             adds the shift *after* that scaling).
 
         Both files store tensors in the trainer's internal orientation already sized to
-        the head Linear's padded in/out features, so no transpose/pad is needed here.
+        the head Linear's padded in/out features, so no pad is needed here; the head
+        LoRA's A ([in, r]) is transposed to the [r, in] the Linear stores.
         """
         head = self._find_module(model, "lm_head", Linear)
         embed = self._find_module(model, "model.embed_tokens", Embedding)
@@ -341,9 +343,9 @@ class LoRA:
             ml = safe_load_file(ml_path, device="cpu")
             applied = []
             if "lm_head.lora_a" in ml and head is not None and not head.is_sliced:
-                a = ml["lm_head.lora_a"].to(torch.float16).to(head.device)   # [in, r]
+                a = ml["lm_head.lora_a"].to(torch.float16).t().contiguous().to(head.device)   # [in, r] -> [r, in]
                 b = ml["lm_head.lora_b"].to(torch.float16).to(head.device)   # [r, out]
-                # apply_lora computes x @ a @ b with no scaling, so bake the module
+                # apply_lora computes x @ a.T @ b with no scaling, so bake the module
                 # scale (and the user's --lora-scaling) into b. NOT lora_scaling:
                 # see the module_lora_scale note in __init__.
                 b = b * self.module_lora_scale

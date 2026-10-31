@@ -1,7 +1,7 @@
 """
 Runtime LoRA on BC_LinearEXL3. The graph-captured decode blocks add an adapter through the projection's C++ object
 (BC_LinearEXL3.lora_gr: the lora_a / lora_b kernels behind Linear.lora_sync), which run_lora exposes eagerly. It
-must match the unfused reference Linear.apply_lora computes, y + x @ A @ B, for fp16 and fp32 outputs, row counts
+must match the unfused reference Linear.apply_lora computes, y + x @ A.T @ B, for fp16 and fp32 outputs, row counts
 up to the BC_LoRA::MAX_ROWS scratch (the largest graphed shape) and no further, adapters stacked along the rank dim, and
 a padded adapter over a narrower activation (the python path's zero-extension is never staged here).
 
@@ -34,16 +34,16 @@ def build(directory, device, k, n, K = 4, codebook = "mul1", bias = False, seed 
 
 
 def adapter(k, n, r, gen, device, std = 0.05):
-    """(A [in, r], B [r, out]) in the orientation LoRA registers on a Linear (B carries the scale)"""
-    a = (torch.randn(k, r, generator = gen) * std).half().to(device)
+    """(A [r, in], B [r, out]) in the orientation LoRA registers on a Linear (PEFT's A, B carries the scale)"""
+    a = (torch.randn(r, k, generator = gen) * std).half().to(device)
     b = (torch.randn(r, n, generator = gen) * std).half().to(device)
     return a, b
 
 
 def delta_ref(x, a, b):
-    """fp32 x @ A @ B over the rows of x (x may be narrower than A: the extra A rows multiply nothing)"""
+    """fp32 x @ A.T @ B over the rows of x (x may be narrower than A: the extra A columns multiply nothing)"""
     xf = x.float().view(-1, x.shape[-1])
-    return xf @ a.float()[:xf.shape[1]] @ b.float()
+    return xf @ a.float()[:, :xf.shape[1]].T @ b.float()
 
 
 def rel_max_err(got, ref) -> float:
@@ -67,7 +67,7 @@ def test_run_lora_matches_reference(tmp_path, device, rows, out_fp32):
     bc.run_lora(x, y_same)                    # no adapter attached: a no-op
     assert torch.equal(y_same, y)
 
-    bc.set_lora(a.T.contiguous(), b)
+    bc.set_lora(a, b)
     assert bc.has_lora()
     y_lora = y.clone()
     bc.run_lora(x, y_lora)
@@ -92,7 +92,7 @@ def test_row_limit_is_enforced(tmp_path, device):
     k, n, r = 512, 256, 8
     module = build(tmp_path, device, k, n)
     a, b = adapter(k, n, r, generator(3), device)
-    module.inner.bc.set_lora(a.T.contiguous(), b)
+    module.inner.bc.set_lora(a, b)
     x = torch.randn((1, MAX_ROWS + 1, k), device = device).half()
     y = torch.zeros((1, MAX_ROWS + 1, n), device = device).half()
     with pytest.raises(RuntimeError):
@@ -101,14 +101,14 @@ def test_row_limit_is_enforced(tmp_path, device):
 
 @torch.inference_mode()
 def test_padded_adapter_over_narrow_activation(tmp_path, device):
-    # in_features pads 2040 -> 2048; LoRA pads A to the padded width (zero rows), the activation stays 2040
+    # in_features pads 2040 -> 2048; LoRA pads A to the padded width (zero columns), the activation stays 2040
     k, n, r = 2040, 256, 8
     module = build(tmp_path, device, k, n)
     assert module.in_features == 2048
     gen = generator(5)
     a, b = adapter(module.in_features, n, r, gen, device)
-    a[k:] = 0
-    module.inner.bc.set_lora(a.T.contiguous(), b)
+    a[:, k:] = 0
+    module.inner.bc.set_lora(a, b)
     x = (torch.randn((1, 3, k), generator = gen) * 0.5).half().to(device)
     y = torch.zeros((1, 3, n), device = device, dtype = torch.float)
     module.inner.bc.run_lora(x, y)
@@ -165,7 +165,7 @@ def test_lora_sync_declines_what_the_kernels_cannot_take(tmp_path, device):
     assert not module.lora_sync() and not lora_graphed(module) and not bc.has_lora()
 
     # Shape the C++ object would reject: declined python-side, no exception
-    module.lora_a_tensors[owner], module.lora_b_tensors[owner] = a[:k - 16].contiguous(), b
+    module.lora_a_tensors[owner], module.lora_b_tensors[owner] = a[:, :k - 16].contiguous(), b
     assert not lora_graphed(module) and not bc.has_lora()
 
     # A good adapter is taken; a modules_to_save override then forces the unfused path, and the
@@ -191,7 +191,7 @@ def test_strided_output_slice(tmp_path, device):
     module = build(tmp_path, device, k, n)
     gen = generator(23)
     a, b = adapter(k, n, r, gen, device)
-    module.inner.bc.set_lora(a.T.contiguous(), b)
+    module.inner.bc.set_lora(a, b)
     x = (torch.randn((2, 3, k), generator = gen) * 0.5).half().to(device)
     wide = torch.zeros((2, 3, 2 * n), device = device, dtype = torch.float)
     right = wide.narrow(-1, n, n)
