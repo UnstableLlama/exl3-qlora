@@ -46,10 +46,17 @@ def child(args) -> dict:
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = max(4096, (args.prompt_len + args.tokens + 256) * args.batch))
-    model.load(device = str(device))
+    if args.per_device:
+        # split across GPUs; the python-side memory figures then sum over every device
+        model.load(use_per_device = args.per_device)
+        mem_devices = list(range(torch.cuda.device_count()))
+    else:
+        model.load(device = str(device))
+        mem_devices = [device]
+    allocated = lambda: sum(torch.cuda.memory_allocated(d) for d in mem_devices)
     tokenizer = Tokenizer.from_config(config)
     torch.cuda.synchronize(device)
-    base_alloc = torch.cuda.memory_allocated(device)
+    base_alloc = allocated()
 
     adapter = None
     adapter_bytes = 0
@@ -60,7 +67,7 @@ def child(args) -> dict:
             adapter_dir = write_random_adapter(model, os.path.join(args.work_dir, "adapter"), rank = args.rank, seed = 0)
         adapter = LoRA.from_directory(model, adapter_dir)
         torch.cuda.synchronize(device)
-        adapter_bytes = torch.cuda.memory_allocated(device) - base_alloc
+        adapter_bytes = allocated() - base_alloc
 
     if args.prompt is not None:
         ids = tokenizer.encode(args.prompt, add_bos = True)
@@ -96,13 +103,14 @@ def child(args) -> dict:
 
     with torch.inference_mode():
         run(False)   # warmup: autotune, graph capture (with the adapter nodes when attached)
-        torch.cuda.reset_peak_memory_stats(device)
-        before = torch.cuda.memory_allocated(device)
+        for d in mem_devices:
+            torch.cuda.reset_peak_memory_stats(d)
+        before = allocated()
         results = []
         for _ in range(args.repeats):
             n, dt, tokens, logits = run(True)
             results.append((n, dt))
-        peak = torch.cuda.max_memory_allocated(device) - before
+        peak = sum(torch.cuda.max_memory_allocated(d) for d in mem_devices) - before
     n, dt = min(results, key = lambda r: r[1] / max(r[0], 1))
     out = {
         "mode": args.mode,
@@ -132,6 +140,9 @@ def main():
     ap.add_argument("--repeats", type = int, default = 3, help = "timed generations per mode (best is reported)")
     ap.add_argument("--modes", default = "base,graph,unfused")
     ap.add_argument("--device", default = "cuda:0")
+    ap.add_argument("--per-device", type = float, nargs = "+", default = None,
+                    help = "split the model over GPUs with these VRAM targets in GB (exllamav3 use_per_device)")
+    ap.add_argument("--json", default = None, help = "also write the per-mode results to this JSON file")
     ap.add_argument("--work-dir", default = None)
     ap.add_argument("--child-mode", default = None, help = argparse.SUPPRESS)
     args = ap.parse_args()
@@ -164,6 +175,10 @@ def main():
                 return 1
             rows.append(json.loads(r.stdout.strip().splitlines()[-1]))
 
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump({"model": args.model, "adapter": args.adapter, "rank": args.rank, "batch": args.batch,
+                           "prompt_len": args.prompt_len, "tokens": args.tokens, "rows": rows}, f, indent = 1)
         print(f"\nmodel {args.model}  batch {args.batch}  prompt {args.prompt_len}  decode {args.tokens} steps  "
               f"adapter {'random r=' + str(args.rank) if args.adapter is None else args.adapter}\n")
         print(f"{'mode':<10}{'tok/s':>10}{'ms/step':>10}{'gen peak MiB':>14}{'adapter MiB':>13}   first tokens")
