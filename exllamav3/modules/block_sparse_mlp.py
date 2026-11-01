@@ -12,7 +12,7 @@ from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
-from .linear import has_runtime_lora, lora_graphed, runtime_lora_epoch
+from .linear import has_runtime_lora, lora_graphed, lora_epoch
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
@@ -484,8 +484,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.bc = None
         self.bc_sh_exp = False
-        self._experts_lora = False
-        self._experts_lora_epoch = -1
+        # Runtime LoRA routing, refreshed when an adapter is attached or detached (_lora_refresh)
+        self._lora_epoch = -1
+        self._experts_lora = self._sh_fused_lora = self._shared_gate_lora = False
         self.fused_mode_buffers = None
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
@@ -1046,6 +1047,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         super().unload()
 
 
+    def _lora_refresh(self):
+        # Runtime LoRA routing for this layer (see the notes in forward), recomputed only when
+        # an adapter was attached or detached (lora_epoch)
+        self._lora_epoch = lora_epoch.value
+        self._experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)
+        self._shared_gate_lora = has_runtime_lora(self.shared_gate)
+        self._sh_fused_lora = bool(self.bc_sh_exp) and (
+            not lora_graphed(*self.shared_experts.gates, *self.shared_experts.ups,
+                             *self.shared_experts.downs) or
+            self._shared_gate_lora
+        )
+
     @override
     def forward(
         self,
@@ -1169,16 +1182,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # experts through their own (guarded) forwards afterwards.
         # NOTE: routing reads routing_gate.inner.weight directly on all paths; a LoRA
         # on the router is not supported (and not used by training).
-        # (kept until an adapter changes: this is 3 x num_experts modules, per layer and token)
-        if self._experts_lora_epoch != runtime_lora_epoch():
-            self._experts_lora_epoch = runtime_lora_epoch()
-            self._experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)
+        # (recomputed only when an adapter changes: this is 3 x num_experts modules)
+        if self._lora_epoch != lora_epoch.value:
+            self._lora_refresh()
         experts_lora = self._experts_lora
-        sh_fused_lora = self.bc_sh_exp and (
-            not lora_graphed(*self.shared_experts.gates, *self.shared_experts.ups,
-                             *self.shared_experts.downs) or
-            has_runtime_lora(self.shared_gate)
-        )
+        sh_fused_lora = self._sh_fused_lora
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
@@ -1711,7 +1719,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.shared_gate:
                 # add_sigmoid_gate_proj projects against the raw gate weight, skipping
                 # any runtime LoRA on the shared gate -- take the forward path then
-                if bsz > 32 or has_runtime_lora(self.shared_gate):
+                if bsz > 32 or self._shared_gate_lora:
                     z = self.shared_gate.forward(x, params)
                     ext.add_sigmoid_gate(y, z, final_hidden_states)
                 else:

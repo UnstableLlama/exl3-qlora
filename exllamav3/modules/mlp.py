@@ -6,7 +6,7 @@ from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
-from .linear import has_runtime_lora, lora_graphed
+from .linear import has_runtime_lora, lora_graphed, lora_epoch
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
@@ -274,6 +274,9 @@ class MLP(Module):
 
         self.bc = None
         self.bsz1_pa_args = []
+        # Runtime LoRA routing, refreshed when an adapter is attached or detached
+        self._lora_epoch = -1
+        self._lora_bc = True
 
 
     @override
@@ -384,6 +387,12 @@ class MLP(Module):
         return y
 
 
+    def _lora_refresh(self):
+        # The graphed decode path needs the up/down adapters handed to the C++ linears
+        # (lora_graphed syncs them); recomputed only when an adapter was attached or detached
+        self._lora_epoch = lora_epoch.value
+        self._lora_bc = lora_graphed(*self.ups, *self.downs)
+
     @override
     def forward(
         self,
@@ -394,13 +403,14 @@ class MLP(Module):
 
         # Fused C++ path for single-token decode, replayed through an internal CUDA graph from
         # the third invocation on. A runtime LoRA on up/down is handed to their BC_LinearEXL3
-        # and added inside the graph (lora_graphed syncs it; guard per call: the graph is
-        # cached and a LoRA can be attached/detached after build)
+        # and added inside the graph (_lora_refresh syncs it when an adapter is attached or
+        # detached; the cached graph re-records itself)
+        if self._lora_epoch != lora_epoch.value:
+            self._lora_refresh()
         bsz, q_len, _ = x.shape
         if (
             self.bc is not None and bsz == 1 and q_len == 1 and
-            x.dtype == torch.float16 and x.is_contiguous() and
-            lora_graphed(*self.ups, *self.downs)
+            x.dtype == torch.float16 and x.is_contiguous() and self._lora_bc
         ):
             d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
             self.bc.run_bsz1(x, d)
@@ -730,6 +740,10 @@ class GatedMLP(Module):
 
         self.bc = None
         self.bsz1_pa_args = []
+        # Runtime LoRA routing, refreshed when an adapter is attached or detached
+        self._lora_epoch = -1
+        self._lora_gu = False
+        self._lora_bc = True
 
 
     @override
@@ -851,6 +865,18 @@ class GatedMLP(Module):
         self.load_local(self.device, 0)
 
 
+    def _lora_refresh(self):
+        # The fused paths bypass Linear.forward, which is what applies a runtime LoRA. The BC
+        # graph fuses the whole MLP (gate/up/act/down) and adds the gate/up deltas before the
+        # activation and the down delta on its output itself, once the adapters are handed to
+        # the projections' C++ linears (lora_graphed syncs them); an adapter it can't take
+        # forces the slower branches. The mgemm branch adds the gate/up deltas onto its output
+        # pre-activation itself (_lora_gu), and down goes through Linear.forward. Recomputed
+        # only when an adapter was attached or detached
+        self._lora_epoch = lora_epoch.value
+        self._lora_gu = has_runtime_lora(*self.gates, *self.ups)
+        self._lora_bc = lora_graphed(*self.gates, *self.ups, *self.downs)
+
     @override
     def forward(
         self,
@@ -859,6 +885,8 @@ class GatedMLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
         bsz, q_len, dim = x.shape
+        if self._lora_epoch != lora_epoch.value:
+            self._lora_refresh()
 
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
@@ -869,21 +897,12 @@ class GatedMLP(Module):
             r = [qs] if qs is not None else range(0, self.num_slices)
             d = None
 
-            # The fused paths below bypass Linear.forward, which is what applies
-            # a runtime LoRA. The BC graph fuses the whole MLP (gate/up/act/down)
-            # and adds the gate/up deltas before the activation and the down
-            # delta on its output itself, once the adapters are handed to the
-            # projections' BC_LinearEXL3 (lora_graphed); an adapter it can't
-            # take forces the branches below. The mgemm branch stays
-            # LoRA-correct on its own: gate/up deltas are added onto the mgemm
-            # output pre-activation, and down goes through Linear.forward
-            # (which applies its LoRA).
-            gu_lora = has_runtime_lora(*self.gates, *self.ups)
+            # Runtime LoRA routing: see _lora_refresh
+            gu_lora = self._lora_gu
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN \
-                        and lora_graphed(*self.gates, *self.ups, *self.downs):
+                if self.bc is not None and bsz * q_len <= MAX_BSZN and self._lora_bc:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))

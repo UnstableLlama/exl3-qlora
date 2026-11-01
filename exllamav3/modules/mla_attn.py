@@ -6,7 +6,7 @@ from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_epoch
 from .layernorm import LayerNorm
 from ..model.model_tp_alloc import TPAllocation
 from .attention_fn.mla_triton import (
@@ -184,6 +184,9 @@ class MLAttention(Module):
         self.idx_wk = None
         self.idx_k_norm = None
         self.idx_weights = None
+        # Runtime LoRA routing, refreshed when an adapter is attached or detached (_lora_refresh)
+        self._lora_epoch = -1
+        self._lora_any = False
 
         self.cache_layers = []
         self.tp_cache_lookup = {}
@@ -440,6 +443,14 @@ class MLAttention(Module):
         self.dispatch_cache = {}
 
 
+    def _lora_refresh(self):
+        # Runtime LoRA on any projection the decode graph binds (see forward), recomputed only
+        # when an adapter was attached or detached (lora_epoch)
+        self._lora_epoch = lora_epoch.value
+        self._lora_any = has_runtime_lora(self.q_proj, self.q_a_proj,
+                                          self.kv_a_proj_with_mqa, self.o_proj,
+                                          self.idx_wq_b, self.idx_wk, self.idx_weights)
+
     @override
     def forward(
         self,
@@ -454,6 +465,8 @@ class MLAttention(Module):
                 self.tp_collect(params["backend"], x, False)
             return to2(x, out_dtype, self.out_dtype)
 
+        if self._lora_epoch != lora_epoch.value:
+            self._lora_refresh()
         bsz, seqlen, _ = x.shape
         if self.head_gate is not None:
             assert not self.tp_reduce, "Tensor parallelism does not split the MLA head gate yet"
@@ -1039,17 +1052,15 @@ class MLAttention(Module):
         # including per-step declines (missing shared selection).
         # The graph binds the projections' base trellis (inner.bc) and never sees a runtime
         # LoRA, so fall back to the dispatch path -- which routes through Linear.forward -- while
-        # one is loaded (guard per call: graphs are cached and a LoRA can be attached/detached
-        # after build). q_a_proj/q_b_proj here are DeepSeek's architectural low-rank
+        # one is loaded (_lora_refresh, recomputed when an adapter is attached or detached).
+        # q_a_proj/q_b_proj here are DeepSeek's architectural low-rank
         # factorization, not adapters. NOTE: kv_b_proj is absorbed into w_uk_flat on every path,
         # so an adapter on it is not applied at all -- not a training target. The DSA indexer
         # projections (idx_wq_b/idx_wk/idx_weights) are likewise bound into the graph.
         if (
             seqlen <= MAX_DECODE_QLEN and bsz <= _bc_max_bsz and
             params.get("causal", True) and params.get("inv_freq") is None and
-            not has_runtime_lora(self.q_proj, self.q_a_proj,
-                                 self.kv_a_proj_with_mqa, self.o_proj,
-                                 self.idx_wq_b, self.idx_wk, self.idx_weights)
+            not self._lora_any
         ):
             y = self.bc_mla_step(x, params, layer, block_table, cache_seqlens)
             if y is not None:

@@ -4,7 +4,7 @@ import torch
 from ..model.config import Config
 from ..util.tensor import get_for_device, buffered_arange, to2, g_tensor_cache
 from . import Module, Linear
-from .linear import has_runtime_lora
+from .linear import has_runtime_lora, lora_epoch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
@@ -200,6 +200,9 @@ class Mamba2(Module):
 
         self.bc = None
         self.bc_k_in = None
+        # Runtime LoRA routing, refreshed when an adapter is attached or detached (_lora_refresh)
+        self._lora_epoch = -1
+        self._lora_any = False
         self.bc_n_in = None
         self.bc_n_out = None
         self.bc_padded_in = False
@@ -358,6 +361,13 @@ class Mamba2(Module):
             self.bc.set_stage_key(bsz, seqlen, True, id(rsl))
 
 
+    def _lora_refresh(self):
+        # The decode graph binds the in/o projections' base weights and never sees a runtime
+        # LoRA: fall back to the torch path while one is attached (recomputed only when an
+        # adapter was attached or detached, lora_epoch)
+        self._lora_epoch = lora_epoch.value
+        self._lora_any = has_runtime_lora(self.in_proj, self.o_proj)
+
     @override
     def forward(
         self,
@@ -372,6 +382,8 @@ class Mamba2(Module):
                 self.tp_collect(params["backend"], x, False)
             return to2(x, out_dtype, self.out_dtype)
 
+        if self._lora_epoch != lora_epoch.value:
+            self._lora_refresh()
         bsz, seqlen, _ = x.shape
         save_history = params.get("recurrent_history", False)
         # Token-by-token speculative pass (recurrent draft models), see GatedDeltaNet.forward
@@ -426,8 +438,7 @@ class Mamba2(Module):
             recurrent_slots is not None and
             x.dtype == torch.float16 and x.is_contiguous() and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
-            not spec_step and
-            not has_runtime_lora(self.in_proj, self.o_proj)
+            not spec_step and not self._lora_any
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
-from .linear import has_runtime_lora, lora_graphed
+from .linear import has_runtime_lora, lora_graphed, lora_epoch
 from ..ext import exllamav3_ext as ext
 from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
@@ -800,6 +800,10 @@ class GatedDeltaNet(Module):
 
         self.bc = None
         self.bc_split = False
+        # Runtime LoRA routing, refreshed when an adapter is attached or detached (_lora_refresh)
+        self._lora_epoch = -1
+        self._lora_bc = True
+        self._lora_qkvz = False
         self.bsz1_pa_args = []
         self.ba_weight_t = None
         self.ba_bias = None
@@ -1213,6 +1217,21 @@ class GatedDeltaNet(Module):
             self.bc.set_stage_key(bsz, seqlen, True, id(rsl))
 
 
+    def _lora_refresh(self):
+        # Runtime LoRA routing for this layer, recomputed only when an adapter was attached or
+        # detached (lora_epoch): the graphed decode path needs the qkv/z/b/a/o adapters handed
+        # to the C++ linears (lora_graphed syncs them) and, in KDA mode, none at all; the sliced
+        # qkv/z bundle carries no adapter
+        self._lora_epoch = lora_epoch.value
+        self._lora_qkvz = has_runtime_lora(self.qkv_proj, self.z_proj)
+        self._lora_bc = (
+            lora_graphed(self.qkv_proj, self.z_proj, self.b_proj, self.a_proj, self.o_proj)
+            if not self.kda else
+            not has_runtime_lora(self.qkv_proj, self.z_proj, self.b_proj, self.a_proj, self.o_proj,
+                                 self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj,
+                                 self.f_proj, self.g_proj)
+        )
+
     @override
     def forward(
         self,
@@ -1227,6 +1246,8 @@ class GatedDeltaNet(Module):
                 self.tp_collect(params["backend"], x, False)
             return to2(x, out_dtype, self.out_dtype)
 
+        if self._lora_epoch != lora_epoch.value:
+            self._lora_refresh()
         bsz, seqlen, _ = x.shape
         save_history = params.get("recurrent_history", False)
         # A speculative pass fed one token at a time (recurrent draft models): step 0 is a plain
@@ -1307,21 +1328,14 @@ class GatedDeltaNet(Module):
         # history) shape from the third invocation of that shape on. The graph reads projection
         # weights directly (qkv/z/o trellis, b/a via the merged ba_weight_t buffer). A runtime
         # LoRA on qkv/z/b/a/o is handed to the projections' C++ linears and added inside the
-        # graph (lora_graphed syncs it per call: the graph is cached and a LoRA can be attached
-        # or detached after build). The KDA graph (forget/output gate projections embedded as
-        # base weights) takes no adapter and falls back to the torch path while one is loaded.
+        # graph (_lora_refresh syncs it when an adapter is attached or detached; the cached graph
+        # re-records itself). The KDA graph (forget/output gate projections embedded as base
+        # weights) takes no adapter and falls back to the torch path while one is loaded.
         if (
             self.bc_split and save_state and
             recurrent_slots is not None and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
-            not spec_step and
-            (
-                lora_graphed(self.qkv_proj, self.z_proj, self.b_proj, self.a_proj, self.o_proj)
-                if not self.kda else
-                not has_runtime_lora(self.qkv_proj, self.z_proj, self.b_proj, self.a_proj, self.o_proj,
-                                     self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj,
-                                     self.f_proj, self.g_proj)
-            )
+            not spec_step and self._lora_bc
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
@@ -1425,7 +1439,7 @@ class GatedDeltaNet(Module):
             # path while one is loaded so the adapter is not silently dropped.
             if (
                 getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32 and
-                not has_runtime_lora(self.qkv_proj, self.z_proj)
+                not self._lora_qkvz
             ):
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:

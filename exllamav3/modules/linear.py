@@ -39,18 +39,30 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 _lora_graph_enable = os.environ.get("EXL3_LORA_GRAPH", "1") != "0"
 
 
-# Bumped on every runtime LoRA attach or detach, so a block that scans many projections per
-# decode step (BlockSparseMLP: every routed expert) can keep the answer until something changes
-_runtime_lora_epoch = 0
+class _RuntimeLoRAEpoch:
+    """
+    Counter bumped on every runtime LoRA attach or detach (``model.lora.LoRA``, the trainer's
+    ``set_runtime_lora`` / ``clear_runtime_lora``, ``Linear.unload``, ``Linear.load``). The decode
+    modules keep their adapter routing decisions (which fused path may run, which projections
+    carry a delta, see ``has_runtime_lora`` / ``lora_graphed``) and recompute them only when
+    ``value`` moved, so supporting runtime adapters costs one integer compare per block per token
+    rather than a walk over every projection.
+    """
+    __slots__ = ("value",)
+
+    def __init__(self):
+        self.value = 0
+
+
+lora_epoch = _RuntimeLoRAEpoch()
 
 
 def runtime_lora_epoch() -> int:
-    return _runtime_lora_epoch
+    return lora_epoch.value
 
 
 def bump_runtime_lora_epoch():
-    global _runtime_lora_epoch
-    _runtime_lora_epoch += 1
+    lora_epoch.value += 1
 
 
 def has_runtime_lora(*linears) -> bool:
@@ -638,6 +650,9 @@ class Linear(Module):
         if isinstance(inner, LinearFP16) and inner.swap_device is None and not isinstance(inner, LinearFP16Packed):
             inner._pinned_store, inner.weight = pin_alias(inner.weight)
             inner.bc = ext.BC_LinearFP16(inner.weight, inner.bias)
+            # A fresh C++ handle carries no runtime LoRA; let lora_sync hand it over again
+            self._lora_graph_src = ()
+            bump_runtime_lora_epoch()
         elif isinstance(inner, LinearEXL3):
             from ..util.tensor import g_tensor_cache
             inner._pinned_store, inner.trellis = pin_alias(inner.trellis)
@@ -646,6 +661,7 @@ class Linear(Module):
                 inner.mcg, inner.mul1, g_tensor_cache.get(*inner.bsz1_xh_args))
             # A fresh C++ handle carries no runtime LoRA; let lora_sync hand it over again
             self._lora_graph_src = ()
+            bump_runtime_lora_epoch()
 
     @override
     def unload(self):

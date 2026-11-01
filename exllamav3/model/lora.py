@@ -327,6 +327,7 @@ class LoRA:
                 # Saved [out, in]; the override wants [in, out].
                 w = ms["lm_head.weight"].t().contiguous().to(torch.float16).to(head.device)
                 head.lora_full_weight = w
+                bump_runtime_lora_epoch()
                 self._full_weight_targets.append(head)
                 applied.append("lm_head")
             if "model.embed_tokens.weight" in ms and embed is not None:
@@ -427,11 +428,11 @@ class LoRA:
         for target in self.target_modules.values():
             target.lora_a_tensors.pop(self, None)
             target.lora_b_tensors.pop(self, None)
-        bump_runtime_lora_epoch()
 
         # Revert in-place module adapters (modules_to_save head/embed, folded embed LoRA).
         for linear in self._full_weight_targets:
             linear.lora_full_weight = None
+        bump_runtime_lora_epoch()
         self._sync_graphs()
         for embed, original in reversed(self._embed_restore):
             embed.embedding.weight.data = original
