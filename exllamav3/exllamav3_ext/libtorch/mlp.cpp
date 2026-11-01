@@ -125,7 +125,10 @@ void BC_GatedMLP::run_bszN
             capture.finish();
         }
 
-        at::Tensor gu_n = slot_pair_view(gu, num_tokens);
+        // The two slots of the (2, num_tokens, width) view run_bszN_gr takes of gu
+        // (slot_pair_view), as raw offsets: no per-step tensor views on the replay path
+        void* gu0 = (void*) gu.data_ptr();
+        void* gu1 = (void*) ((char*) gu0 + (size_t) num_tokens * gu.size(2) * gu.element_size());
         std::vector<PPTR> args;
         if (gu_ptrs_trellis)
         {
@@ -137,13 +140,13 @@ void BC_GatedMLP::run_bszN
             // patch them with their (static) values so the site walk stays aligned and the final
             // GP_gemm_C entry binds to the down projection
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
+            args.emplace_back(GP_gemm_C, gu0);
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
+            args.emplace_back(GP_gemm_C, gu1);
         }
         // Runtime LoRA sites, in run_bszN_gr's order (static outputs patched with their own values)
-        if (gate) gate->lora_args(args, (void*) x.data_ptr(), (void*) gu_n.select(0, 0).data_ptr());
-        if (up) up->lora_args(args, (void*) x.data_ptr(), (void*) gu_n.select(0, 1).data_ptr());
+        if (gate) gate->lora_args(args, (void*) x.data_ptr(), gu0);
+        if (up) up->lora_args(args, (void*) x.data_ptr(), gu1);
         args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
         if (down->bias)
         {

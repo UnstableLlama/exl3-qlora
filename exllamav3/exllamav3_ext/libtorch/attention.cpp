@@ -953,11 +953,12 @@ void BC_Attention::run
 
     // Runtime LoRA nodes follow each projection in run_gr; their sites are patched in the same
     // order (static intermediates included, to keep the site walk aligned)
-    at::Tensor kv2 = s.kv.view({2, R, num_kv_heads * head_dim});
+    // (raw offsets: s.kv is exactly the (2, R, kv_dim) buffer run_gr views it as, so V starts at
+    // the midpoint; no per-step tensor views on the replay path)
     void* q_out = gate_mode == 3 ? s.qg2.data_ptr() : s.q2.data_ptr();
     void* g_out = gate_mode != 0 ? s.g2.data_ptr() : nullptr;
-    void* k_out = kv2.select(0, 0).data_ptr();
-    void* v_out = kv2.select(0, 1).data_ptr();
+    void* k_out = s.kv.data_ptr();
+    void* v_out = (void*) ((char*) k_out + s.kv.nbytes() / 2);
 
     // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
     if (use_qkv)

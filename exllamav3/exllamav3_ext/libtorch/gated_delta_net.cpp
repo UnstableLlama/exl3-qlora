@@ -402,6 +402,9 @@ void BC_GatedDeltaNetSplit::run_bszN
     // Runtime LoRA sites follow their projections in run_bszN_gr and are patched in the same
     // order (static outputs with their own addresses); no entries without an adapter
     void* xptr = (void*) x.data_ptr();
+    // a_proj's half of the (R, 2 * num_v_heads) ba buffer as a raw offset (what
+    // s.ba.narrow(-1, num_v_heads, num_v_heads) addresses): no per-step tensor views on the replay path
+    void* ba_a_ptr = (void*) ((char*) s.ba.data_ptr() + (size_t) num_v_heads * s.ba.stride(-1) * s.ba.element_size());
     std::vector<PPTR> args;
     args.reserve(24);
     if (kda)
@@ -418,7 +421,7 @@ void BC_GatedDeltaNetSplit::run_bszN
         z_proj->lora_args(args, xptr, s.z_flat.data_ptr());
         args.emplace_back(GP_gdn_ba_x, xptr);
         if (b_proj) b_proj->lora_args(args, xptr, s.ba.data_ptr());
-        if (a_proj) a_proj->lora_args(args, xptr, s.ba.narrow(-1, num_v_heads, num_v_heads).data_ptr());
+        if (a_proj) a_proj->lora_args(args, xptr, ba_a_ptr);
     }
     else
     {
@@ -428,7 +431,7 @@ void BC_GatedDeltaNetSplit::run_bszN
         z_proj->lora_args(args, xptr, s.z_flat.data_ptr());
         args.emplace_back(GP_gdn_ba_x, xptr);
         if (b_proj) b_proj->lora_args(args, xptr, s.ba.data_ptr());
-        if (a_proj) a_proj->lora_args(args, xptr, s.ba.narrow(-1, num_v_heads, num_v_heads).data_ptr());
+        if (a_proj) a_proj->lora_args(args, xptr, ba_a_ptr);
     }
     args.emplace_back(GP_conv1d_state, (void*) conv_state.data_ptr());
     args.emplace_back(GP_conv1d_slots, (void*) slots.data_ptr());
