@@ -16,6 +16,16 @@ Usage::
 Compatible with adapters trained via PEFT/Unsloth on the full-precision
 base model. LoRA weights are applied on top of the dequantized output
 of each target linear layer.
+
+Execution: ``Linear.forward`` adds ``x @ A @ B`` after the quantized GEMM
+(prefill, batched decode, any unfused path). The graph-captured decode blocks
+(BC_Attention, BC_GatedMLP, BC_MLP, BC_GatedDeltaNetSplit) take the adapter
+through each target ``Linear``'s C++ linear (``Linear.lora_sync``, done lazily
+by the modules' dispatch guards) and add it as nodes of their CUDA graphs; the
+fused multi-linear GEMM branches add it onto their output. Modules whose
+graphs have no LoRA stage (MLA, DSA, GDN in KDA mode, Mamba2, routed MoE
+experts) fall back to the unfused path while an adapter is attached. See
+``doc/lora_fused_decode.md``.
 """
 
 from __future__ import annotations
@@ -25,7 +35,7 @@ import math
 import re
 import torch
 from safetensors.torch import load_file as safe_load_file
-from ..modules.linear import Linear
+from ..modules.linear import Linear, bump_runtime_lora_epoch
 from ..modules.embedding import Embedding
 
 from typing import TYPE_CHECKING
@@ -38,9 +48,10 @@ class LoRA:
     """
     LoRA adapter loaded from PEFT format.
 
-    Stores pre-transposed and pre-scaled A/B weight matrices on target
-    Linear modules. During forward pass, Linear.forward() computes:
-    ``output += input @ A @ B`` for each loaded adapter.
+    Stores A in PEFT's native ``[r, in]`` orientation and B pre-transposed
+    and pre-scaled to ``[r, out]`` on target Linear modules. During forward
+    pass, Linear.forward() computes: ``output += input @ A.T @ B`` for each
+    loaded adapter; the graph-captured decode blocks read A as stored.
     """
 
     @staticmethod
@@ -200,25 +211,25 @@ class LoRA:
             if tensor.dtype in (torch.bfloat16, torch.float32):
                 tensor = tensor.to(torch.float16)
 
-            # Transpose for efficient matmul: x @ A @ B
             # PEFT stores lora_A as [rank, in_features] and
             # lora_B as [out_features, rank].
-            # We want A as [in_features, rank] and B as [rank, out_features].
-            tensor = tensor.T.contiguous()
-
-            # Pre-scale B matrix. The module's rank is the tensor's own leading
-            # dim (post-transpose [r, out]), NOT config r: a rank_pattern
-            # adapter (e.g. smaller rank on MoE routed experts) has per-module
-            # ranks, and alpha_pattern can override alpha per module.
+            # A is kept as is: the python path computes x @ A.T @ B (a free
+            # transposed view) and the graph kernels read A as (rank, in).
+            # B is transposed to [rank, out_features] and pre-scaled. The
+            # module's rank is the tensor's own leading dim (post-transpose
+            # [r, out]), NOT config r: a rank_pattern adapter (e.g. smaller
+            # rank on MoE routed experts) has per-module ranks, and
+            # alpha_pattern can override alpha per module.
             if lora_half == "lora_B":
+                tensor = tensor.T.contiguous()
                 scaling = self._module_scaling(full_path, tensor.shape[0])
                 if scaling != 1.0:
                     tensor.mul_(scaling)
 
             # Pad to match target dimensions (quantized layers may pad features to multiples of block size)
-            if lora_half == "lora_A" and tensor.shape[0] < target.in_features:
-                padded = torch.zeros(target.in_features, tensor.shape[1], dtype=tensor.dtype)
-                padded[:tensor.shape[0]] = tensor
+            if lora_half == "lora_A" and tensor.shape[1] < target.in_features:
+                padded = torch.zeros(tensor.shape[0], target.in_features, dtype=tensor.dtype)
+                padded[:, :tensor.shape[1]] = tensor
                 tensor = padded
             elif lora_half == "lora_B" and tensor.shape[1] < target.out_features:
                 padded = torch.zeros(tensor.shape[0], target.out_features, dtype=tensor.dtype)
@@ -232,6 +243,7 @@ class LoRA:
                 target.lora_a_tensors[self] = tensor
             else:
                 target.lora_b_tensors[self] = tensor
+            bump_runtime_lora_epoch()
 
             self.target_modules[module_key] = target
             loaded += 1
@@ -273,6 +285,10 @@ class LoRA:
         # adapter actually takes effect at inference instead of being silently dropped.
         self._load_module_adapters(model, os.path.dirname(config_path))
 
+        # Hand the adapter to the graph-captured decode paths now (one graph re-record for the
+        # whole model) rather than module by module on the first decode step
+        self._sync_graphs()
+
     def _find_module(self, model, key, cls):
         """Locate a loaded module by exact key, falling back to the unique module of
         the given type (handles key-prefix variation across architectures)."""
@@ -296,7 +312,8 @@ class LoRA:
             adds the shift *after* that scaling).
 
         Both files store tensors in the trainer's internal orientation already sized to
-        the head Linear's padded in/out features, so no transpose/pad is needed here.
+        the head Linear's padded in/out features, so no pad is needed here; the head
+        LoRA's A ([in, r]) is transposed to the [r, in] the Linear stores.
         """
         head = self._find_module(model, "lm_head", Linear)
         embed = self._find_module(model, "model.embed_tokens", Embedding)
@@ -310,6 +327,7 @@ class LoRA:
                 # Saved [out, in]; the override wants [in, out].
                 w = ms["lm_head.weight"].t().contiguous().to(torch.float16).to(head.device)
                 head.lora_full_weight = w
+                bump_runtime_lora_epoch()
                 self._full_weight_targets.append(head)
                 applied.append("lm_head")
             if "model.embed_tokens.weight" in ms and embed is not None:
@@ -327,14 +345,15 @@ class LoRA:
             ml = safe_load_file(ml_path, device="cpu")
             applied = []
             if "lm_head.lora_a" in ml and head is not None and not head.is_sliced:
-                a = ml["lm_head.lora_a"].to(torch.float16).to(head.device)   # [in, r]
+                a = ml["lm_head.lora_a"].to(torch.float16).t().contiguous().to(head.device)   # [in, r] -> [r, in]
                 b = ml["lm_head.lora_b"].to(torch.float16).to(head.device)   # [r, out]
-                # apply_lora computes x @ a @ b with no scaling, so bake the module
+                # apply_lora computes x @ a.T @ b with no scaling, so bake the module
                 # scale (and the user's --lora-scaling) into b. NOT lora_scaling:
                 # see the module_lora_scale note in __init__.
                 b = b * self.module_lora_scale
                 head.lora_a_tensors[self] = a
                 head.lora_b_tensors[self] = b
+                bump_runtime_lora_epoch()
                 self.target_modules.setdefault("lm_head", head)
                 applied.append("lm_head")
             if "embed_tokens.lora_a" in ml and embed is not None:
@@ -396,6 +415,14 @@ class LoRA:
                 return ".".join(parts[:j]), p
         return None, None
 
+    def _sync_graphs(self):
+        """Mirror the attached state of every target Linear into its C++ linear (Linear.lora_sync), so the
+        captured decode graphs pick the adapter up, or drop it, on their next run."""
+        for target in list(self.target_modules.values()) + list(self._full_weight_targets):
+            sync = getattr(target, "lora_sync", None)
+            if sync is not None:
+                sync()
+
     def unload(self):
         """Remove this adapter's tensors from all target modules."""
         for target in self.target_modules.values():
@@ -405,6 +432,8 @@ class LoRA:
         # Revert in-place module adapters (modules_to_save head/embed, folded embed LoRA).
         for linear in self._full_weight_targets:
             linear.lora_full_weight = None
+        bump_runtime_lora_epoch()
+        self._sync_graphs()
         for embed, original in reversed(self._embed_restore):
             embed.embedding.weight.data = original
 

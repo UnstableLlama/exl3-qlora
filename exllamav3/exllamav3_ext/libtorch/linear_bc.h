@@ -7,7 +7,12 @@ py::class_<BC_LinearFP16, std::shared_ptr<BC_LinearFP16>>(m, "BC_LinearFP16").de
     py::arg("weight"),
     py::arg("bias") = py::none()
 )
-.def("run", &BC_LinearFP16::run);
+.def("run", &BC_LinearFP16::run)
+.def("set_lora", &BC_LinearFP16::set_lora, py::arg("a"), py::arg("b"))
+.def("has_lora", &BC_LinearFP16::has_lora)
+.def("run_lora", &BC_LinearFP16::run_lora)
+.def_property_readonly("lora_a", [] (const BC_LinearFP16& l) { return l.lora.a; })
+.def_property_readonly("lora_b", [] (const BC_LinearFP16& l) { return l.lora.b; });
 //.def("run_cublas", &BC_LinearFP16::run_cublas);
 
 py::class_<BC_LinearEXL3, std::shared_ptr<BC_LinearEXL3>>(m, "BC_LinearEXL3").def
@@ -32,4 +37,9 @@ py::class_<BC_LinearEXL3, std::shared_ptr<BC_LinearEXL3>>(m, "BC_LinearEXL3").de
     py::arg("xh")
 )
 .def("run", &BC_LinearEXL3::run)
-.def("run_alloc", &BC_LinearEXL3::run_alloc);
+.def("run_alloc", &BC_LinearEXL3::run_alloc)
+.def("set_lora", &BC_LinearEXL3::set_lora, py::arg("a"), py::arg("b"))
+.def("has_lora", &BC_LinearEXL3::has_lora)
+.def("run_lora", &BC_LinearEXL3::run_lora)
+.def_property_readonly("lora_a", [] (const BC_LinearEXL3& l) { return l.lora.a; })
+.def_property_readonly("lora_b", [] (const BC_LinearEXL3& l) { return l.lora.b; });

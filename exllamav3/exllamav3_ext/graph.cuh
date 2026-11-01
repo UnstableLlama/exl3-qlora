@@ -2,6 +2,7 @@
 
 #include <ATen/Tensor.h>
 #include <vector>
+#include <cstdint>
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 #include <cuda_runtime.h>
@@ -96,7 +97,10 @@ enum GraphedParams
 
     GP_moe_bias_add_sel,
     GP_moe_bias_add_weighted_sel,
-    GP_moe_bias_add_weighted_weights
+    GP_moe_bias_add_weighted_weights,
+
+    GP_lora_x,
+    GP_lora_y
 };
 
 class Graph
@@ -127,6 +131,16 @@ public:
     bool ready_to_record;
     bool disabled;
 
+    // Launch-sequence epoch. A captured graph is a fixed node list, so anything that adds or
+    // removes nodes from a run_gr() workload after capture (attaching or detaching a runtime
+    // LoRA on a BC_LinearEXL3 the graph projects through) has to re-record it. Rather than track
+    // which graphs reference which linear, such a change bumps the global epoch; a graph captured
+    // under an older epoch is dropped by refresh() on its next run and re-recorded like a fresh
+    // one. Changes are rare (adapter load/unload), so invalidating every graph is fine
+    static uint64_t structure_epoch;
+    uint64_t captured_epoch;
+    static void bump_structure_epoch() { ++structure_epoch; }
+
     Graph();
     ~Graph();
 
@@ -134,6 +148,9 @@ public:
     void capture_end();
     // Best effort, no throwing. Call on the thread/device that began capture.
     void capture_abort() noexcept;
+    // Drop a graph captured before the current structure epoch so the owner re-records it (its
+    // first run after this is eager again). Returns true when the graph was dropped
+    bool refresh();
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
     void launch(std::vector<PPTR> params, cudaStream_t stream);

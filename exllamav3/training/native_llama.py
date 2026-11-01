@@ -3272,7 +3272,9 @@ class NativeLlamaQLoRA(nn.Module):
                 a = torch.cat([a, w.init_a0_master.to(a.device)], dim=1)
                 b = torch.cat([b, w.init_b0_master.to(b.device)
                                * (-w.scale * scaling)], dim=0)
-            backbone.set_runtime_lora(w.linear, self, a.to(torch.float16),
+            # The runtime slots keep A in PEFT's [r, in] orientation; the
+            # trainer's master is [in, r].
+            backbone.set_runtime_lora(w.linear, self, a.t().contiguous().to(torch.float16),
                                       b.to(torch.float16))
 
     @torch.no_grad()

@@ -1,11 +1,12 @@
 from __future__ import annotations
 from functools import cached_property
 from typing_extensions import override
+import os
 import torch
 import numpy as np
 from ..model.config import Config
 from . import Module
-from .quant import LinearFP16, LinearEXL3
+from .quant import LinearFP16, LinearFP16Packed, PackedSegment, packed_fmt, LinearEXL3
 from .quant.exl3_lib.hessian_packed import accumulate_, packed_numel
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
@@ -32,17 +33,65 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+# EXL3_LORA_GRAPH=0 keeps runtime LoRA adapters out of the captured decode graphs: the BC paths then
+# decline while an adapter is attached and the modules take the unfused per-linear path (the
+# reference for the in-graph application, and the A/B for its benchmarks)
+_lora_graph_enable = os.environ.get("EXL3_LORA_GRAPH", "1") != "0"
+
+
+class _RuntimeLoRAEpoch:
+    """
+    Counter bumped on every runtime LoRA attach or detach (``model.lora.LoRA``, the trainer's
+    ``set_runtime_lora`` / ``clear_runtime_lora``, ``Linear.unload``, ``Linear.load``). The decode
+    modules keep their adapter routing decisions (which fused path may run, which projections
+    carry a delta, see ``has_runtime_lora`` / ``lora_graphed``) and recompute them only when
+    ``value`` moved, so supporting runtime adapters costs one integer compare per block per token
+    rather than a walk over every projection.
+    """
+    __slots__ = ("value",)
+
+    def __init__(self):
+        self.value = 0
+
+
+lora_epoch = _RuntimeLoRAEpoch()
+
+
+def runtime_lora_epoch() -> int:
+    return lora_epoch.value
+
+
+def bump_runtime_lora_epoch():
+    lora_epoch.value += 1
+
+
 def has_runtime_lora(*linears) -> bool:
     """
     True when any of the given Linear modules currently carries a runtime LoRA
     (tensors registered by ``model.lora.LoRA``). The fused multi-linear decode
-    kernels (``exl3_mgemm`` / BC graphs) read the trellis storage directly and
-    never see these tensors, so any fused branch over modules for which this
-    returns True must fall back to the per-linear ``Linear.forward`` path or
-    the adapter is silently dropped. ``None`` entries are allowed (optional
-    projections like g_proj).
+    kernels (``exl3_mgemm``) read the trellis storage directly and never see
+    these tensors, so a fused branch over modules for which this returns True
+    must add the low-rank delta itself or fall back to the per-linear
+    ``Linear.forward`` path, or the adapter is silently dropped. ``None``
+    entries are allowed (optional projections like g_proj).
     """
     return any(l is not None and l.lora_a_tensors for l in linears)
+
+
+def lora_graphed(*linears) -> bool:
+    """
+    True when every given Linear (``None`` allowed) either carries no runtime LoRA
+    or has handed it to its ``BC_LinearEXL3`` (:meth:`Linear.lora_sync`), so a
+    graph-captured decode block that runs ``lora_gr`` after each of these
+    projections applies the adapters itself. False sends the caller to the
+    unfused path. The hand-off is lazy: the adapter dicts are written directly
+    by ``LoRA`` / the trainer, so the first call after a change does the sync
+    (and the captured graphs re-record through the graph structure epoch).
+    """
+    for l in linears:
+        if l is not None and not l.lora_sync():
+            return False
+    return True
 
 
 class Linear(Module):
@@ -121,6 +170,10 @@ class Linear(Module):
         # an adapter's modules_to_save (e.g. native QLoRA --train-head). When set, it
         # supersedes the quantized base matmul for this Linear. Default None -> no-op.
         self.lora_full_weight = None
+        # The adapter tensors last handed to the C++ BC_LinearEXL3 (lora_sync), and whether that
+        # hand-off covers everything attached (so graphed decode paths may run)
+        self._lora_graph_src = ()
+        self._lora_graphed = True
         # Optional frequency-selected column subset for drafting (see modules/sparse_head.py); the
         # regular forward never consults it
         self.sparse_head = None
@@ -155,6 +208,18 @@ class Linear(Module):
             padded[:w.shape[0]] = w
         return padded.contiguous()
 
+
+    def _packed_source(self) -> bool:
+        """Conversion with packed_fp16_source: natively quantized tensors stay packed (LinearFP16Packed)"""
+        return bool(getattr(self.config.infer_params, "packed_fp16_source", False)) and not self.is_sliced
+
+    def _make_packed(self, segments: list, bias: torch.Tensor | None) -> bool:
+        self.inner = LinearFP16Packed(
+            self.in_features, self.out_features, segments, bias, self.pad_out,
+            global_scale = self.weight_scale, out_dtype = self.out_dtype, key = self.key,
+        )
+        self.quant_type = "fp16"
+        return True
 
     # Row scales (Transformers-specific?)
     def apply_fp8_scales_(self, weight: torch.Tensor, scale: torch.Tensor):
@@ -221,6 +286,22 @@ class Linear(Module):
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
+                if self._packed_source() and self.transposed_load:
+                    segs, col0, ok = [], 0, True
+                    for k in key:
+                        w = self.config.stc.get_tensor(k + ".weight", dev, no_defer = True, arena = False)
+                        fmt = packed_fmt(w)
+                        if fmt is None or fmt == 1:
+                            ok = False
+                            break
+                        si = self.config.stc.get_tensor(k + ".weight_scale_inv", dev, optional = True, no_defer = True)
+                        block = (128, 128) if si is not None and si.dim() == 2 else None
+                        segs.append(PackedSegment(w, si, fmt, col0 = col0, block = block))
+                        col0 += w.shape[0]
+                    if ok:
+                        bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
+                        bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
+                        return self._make_packed(segs, self.pad_out(bias))
                 weight = []
                 for k in key:
                     # fp8 parts (Ling 3.x q/k/v) carry their own block scales: dequantize each before the concat
@@ -247,6 +328,10 @@ class Linear(Module):
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
                     w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
+                    if self._packed_source() and self.transposed_load and scale_q.dtype == torch.uint8 \
+                            and packed_fmt(w_raw) is not None:
+                        # Conversion: keep the bytes packed, dequantize per use (LinearFP16Packed)
+                        return self._make_packed([PackedSegment(w_raw, scale_q, packed_fmt(w_raw))], None)
                     weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
                     if self.transposed_load:
                         weight = weight.T
@@ -254,6 +339,21 @@ class Linear(Module):
                     bias = None
                     scale = scale_inv = None
                 else:
+                    if self._packed_source() and self.transposed_load:
+                        # fp8 with a per-tensor / per-row weight_scale or a block weight_scale_inv (Transformers
+                        # finegrained fp8, DeepSeek-V3 style): the fp8 bytes stay packed
+                        w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
+                        fmt = packed_fmt(w_raw)
+                        if fmt is not None and fmt != 1:
+                            sc_ = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+                            si_ = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, optional = True, no_defer = True)
+                            assert sc_ is None or si_ is None
+                            block = (128, 128) if si_ is not None and si_.dim() == 2 else None
+                            sc_ = sc_ if sc_ is not None else si_
+                            if sc_ is None or sc_.dim() <= 2:
+                                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = True)
+                                return self._make_packed([PackedSegment(w_raw, sc_, fmt, block = block)], bias)
+                        del w_raw
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
@@ -368,6 +468,10 @@ class Linear(Module):
                 scales = scales[sl].contiguous()
                 if bias is not None:
                     bias = bias[sl].contiguous()
+            if self._packed_source():
+                # (out, G, 16) bytes are (out, in / 2) nibble pairs in row order, scales (out, G) E8M0
+                seg = PackedSegment(blocks.reshape(blocks.shape[0], -1), scales, 1, block = (1, 32))
+                return self._make_packed([seg], self.pad_out(bias.half() if bias is not None else None))
             weight = _mxfp4_dequant(blocks, scales)
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
@@ -409,6 +513,16 @@ class Linear(Module):
                 # Fused checkpoint tensor in FP8/FP4-block form (DeepSeek-V4 wo_a): dequantize the
                 # whole tensor before slicing out this group's rows
                 scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
+                if scale_q is not None and scale_q.dim() == 2 and self._packed_source() and self.ftranspose_after_load \
+                        and packed_fmt(weight) is not None and scale_q.dtype == torch.uint8:
+                    r0, r1 = self.frange
+                    br = weight.shape[0] // scale_q.shape[0]
+                    if r0 % br == 0 and r1 % br == 0:
+                        bias = self.config.stc.get_tensor(self.fkey + ".bias", self.device, optional = True, no_defer = True)
+                        if bias is not None:
+                            bias = self.pad_out(bias[r0:r1].contiguous())
+                        seg = PackedSegment(weight[r0:r1].contiguous(), scale_q[r0 // br:r1 // br].contiguous(), packed_fmt(weight))
+                        return self._make_packed([seg], bias)
                 if scale_q is not None and scale_q.dim() == 2:
                     weight = self.dequant_e8m0_blocks_(weight, scale_q)
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
@@ -533,15 +647,21 @@ class Linear(Module):
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
 
-        if isinstance(inner, LinearFP16) and inner.swap_device is None:
+        if isinstance(inner, LinearFP16) and inner.swap_device is None and not isinstance(inner, LinearFP16Packed):
             inner._pinned_store, inner.weight = pin_alias(inner.weight)
             inner.bc = ext.BC_LinearFP16(inner.weight, inner.bias)
+            # A fresh C++ handle carries no runtime LoRA; let lora_sync hand it over again
+            self._lora_graph_src = ()
+            bump_runtime_lora_epoch()
         elif isinstance(inner, LinearEXL3):
             from ..util.tensor import g_tensor_cache
             inner._pinned_store, inner.trellis = pin_alias(inner.trellis)
             inner.bc = ext.BC_LinearEXL3(
                 inner.trellis, inner.suh, inner.svh, inner.K, inner.bias,
                 inner.mcg, inner.mul1, g_tensor_cache.get(*inner.bsz1_xh_args))
+            # A fresh C++ handle carries no runtime LoRA; let lora_sync hand it over again
+            self._lora_graph_src = ()
+            bump_runtime_lora_epoch()
 
     @override
     def unload(self):
@@ -552,6 +672,9 @@ class Linear(Module):
         self.sparse_head = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
+        bump_runtime_lora_epoch()
+        self._lora_graph_src = ()
+        self._lora_graphed = True
 
 
     @override
@@ -660,12 +783,30 @@ class Linear(Module):
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
             # Drop the affected rows; the inf_nan counter above still reports them
             finite = torch.isfinite(x).all(dim = 1)
+            row_w = params.get("capture_row_w")
             if not finite.all():
                 x = x[finite]
                 rows = x.shape[0]
+                if row_w is not None:
+                    row_w = row_w[finite]
 
             accumulate_(params["capture"][self.qmap]["H"], x)
             params["capture"][self.qmap]["count"] += rows
+
+            # Row-weighted Hessian alongside the plain one (affinity-weighted expert Hessians, see
+            # conversion/moe_affinity.py), combined with it before quantization. The weights are an
+            # expert's routing weights, so most rows are zero and only the routed ones accumulate
+            if row_w is not None:
+                hd = params["capture"][self.qmap]
+                if "H_aff" not in hd:
+                    hd["H_aff"] = torch.zeros_like(hd["H"])
+                    hd["aff_sum"] = torch.zeros((), dtype = torch.float, device = hd["H"].device)
+                row_w = row_w.to(torch.float).clamp_min(0)
+                routed = row_w.nonzero().flatten()
+                if routed.numel():
+                    xw = x[routed] * row_w[routed].sqrt().unsqueeze(1).to(x.dtype)
+                    accumulate_(hd["H_aff"], xw)
+                    hd["aff_sum"] += row_w.sum()
 
 
     @override
@@ -738,6 +879,64 @@ class Linear(Module):
         return x
 
 
+    def lora_sync(self) -> bool:
+        """
+        Hand the runtime LoRA currently attached (``lora_a_tensors`` / ``lora_b_tensors``) to
+        the C++ linear, which the graph-captured decode blocks (BC_Attention, BC_GatedMLP,
+        BC_MLP, BC_GatedDeltaNetSplit) run ``lora_gr`` on after this projection's GEMM, or detach it
+        when the dicts were emptied. A is stored ``[r, in]`` (PEFT's orientation, what the
+        kernels read) and B ``[r, out]``, so a single adapter is handed over as is and several
+        are stacked along the rank dim (B carries the scale, so ``x @ [A1; A2].T @ [B1; B2]`` is
+        their sum). Only does work when the
+        attached tensors changed; a change also drops every captured graph (graph structure
+        epoch) so they re-record with or without the LoRA nodes.
+
+        Returns True when the graphed paths may run: nothing attached, or everything attached
+        is in the C++ object (``BC_LinearEXL3`` or, for unquantized layers such as the GDN b/a
+        and headwise-gate projections, ``BC_LinearFP16``). False (a ``lora_full_weight``
+        override, a shape or dtype the kernels don't take, ``EXL3_LORA_GRAPH=0``) means the
+        module must take the unfused path, where ``Linear.forward`` applies the adapter.
+        """
+        if not self.lora_a_tensors and self.lora_full_weight is None and not self._lora_graph_src:
+            return True   # nothing attached, nothing handed off (the common case)
+        pairs = [(a, self.lora_b_tensors[k]) for k, a in self.lora_a_tensors.items() if k in self.lora_b_tensors]
+        src = tuple(t for ab in pairs for t in ab)
+        if self.lora_full_weight is not None:
+            src += (self.lora_full_weight,)
+        if len(src) == len(self._lora_graph_src) and all(p is q for p, q in zip(src, self._lora_graph_src)):
+            return self._lora_graphed
+
+        bc = getattr(self.inner, "bc", None) if self.quant_type in ("exl3", "fp16") else None
+        # The C++ object checks the adapter against the stored weight's own geometry; decline
+        # here (unfused path) rather than fail there if the two ever differ
+        if self.quant_type == "fp16" and bc is not None:
+            k_w, n_w = self.inner.weight.shape
+        else:
+            k_w, n_w = self.in_features, self.out_features
+        ok = (
+            bool(pairs) and bc is not None and _lora_graph_enable and self.lora_full_weight is None and
+            all(
+                a.dtype == torch.half and b.dtype == torch.half and
+                a.dim() == 2 and b.dim() == 2 and
+                a.shape[1] == k_w and a.shape[0] == b.shape[0] and b.shape[1] == n_w
+                for a, b in pairs
+            )
+        )
+        if ok:
+            if len(pairs) == 1:
+                a, b = pairs[0][0].contiguous(), pairs[0][1].contiguous()
+            else:
+                a = torch.cat([a for a, _ in pairs], dim = 0)
+                b = torch.cat([b for _, b in pairs], dim = 0)
+            bc.set_lora(a, b)
+        elif bc is not None and bc.has_lora():
+            bc.set_lora(None, None)
+
+        self._lora_graph_src = src
+        self._lora_graphed = ok or (not pairs and self.lora_full_weight is None)
+        return self._lora_graphed
+
+
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
         flat = lora_input.view(-1, lora_input.shape[-1])
         xf = x.view(-1, x.shape[-1])
@@ -745,14 +944,15 @@ class Linear(Module):
             b = self.lora_b_tensors.get(lora)
             if b is not None:
                 if flat.dtype == a.dtype and xf.dtype == b.dtype:
-                    # Fused in-place accumulate: x += (x @ a) @ b, no
-                    # materialized delta or dtype-cast kernels. This runs per
+                    # Fused in-place accumulate: x += (x @ a.T) @ b, no
+                    # materialized delta or dtype-cast kernels (a is stored
+                    # [r, in]; the transposed view is free). This runs per
                     # adapted Linear on every decode step, so launch count
                     # matters more than anything else here.
-                    xf.addmm_(flat @ a, b)
+                    xf.addmm_(flat @ a.T, b)
                 else:
                     lora_in = flat.to(a.dtype)
-                    delta = lora_in @ a @ b
+                    delta = lora_in @ a.T @ b
                     xf += delta.to(xf.dtype)
 
 
@@ -772,6 +972,9 @@ class Linear(Module):
         else:
             return 2 * self.in_features * self.out_features
     def storage_size(self):
+        # A packed conversion-time inner holds the checkpoint bytes, not the fp16 form the size was planned for
+        if self.inner is not None and hasattr(self.inner, "storage_bytes"):
+            return self.inner.storage_bytes()
         return self._storage_size
 
 

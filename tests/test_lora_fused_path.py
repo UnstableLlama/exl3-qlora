@@ -8,13 +8,16 @@ applied. Before the fix, token-by-token generation on an EXL3-quantized base
 silently dropped the k/v (and gated-attn q), gate/up (and BC-path down) LoRA
 components, so an adapter that visibly steered the training-side forward
 looked like a no-op at inference. The mgemm branches in attention
-(attn/sliding_attn) and GatedMLP now stay fused and add the low-rank delta
+(attn/sliding_attn) and GatedMLP stay fused and add the low-rank delta
 onto the mgemm output (pre-RoPE / pre-activation, matching Linear.forward
 semantics -- MultiLinear pairs are bias/softcap/scale-free by construction).
-The whole-block graph paths (bc_attn/bc_swa, the BC bsz-1 MLP graph, the GDN
-split graph, the fused MoE expert kernels) cannot take a post-hoc delta and
-still fall back to unfused dispatch while any involved Linear carries LoRA
-tensors.
+The whole-block graphs (bc_attn/bc_swa, BC_GatedMLP, BC_MLP, the GDN split
+graph) take the adapter through each projection's C++ linear and add it
+in-graph; their dispatch must go through lora_graphed (the hand-off, which
+declines what the graph can't take) rather than run unconditionally. The
+other graph paths (GDN in KDA mode, MLA, Mamba2, the fused MoE expert
+kernels) have no LoRA stage and still fall back to unfused dispatch while
+any involved Linear carries LoRA tensors.
 
 Because the failure mode is SILENT (generation stays coherent, the adapter
 just doesn't run), these tests are tripwires on the guard conditions in the
@@ -38,9 +41,45 @@ def _src(*rel: str) -> str:
         return f.read()
 
 
+# The per-token guards moved out of the forward paths: each module recomputes its runtime-LoRA
+# routing booleans in _lora_refresh when the global lora_epoch moved (an adapter was attached or
+# detached) and the fused dispatch sites test the cached boolean. Each guard test below pins all
+# three parts: the dispatch site reads the cached name, _lora_refresh computes that name from the
+# same linears as the old per-call guard, and forward compares the epoch and refreshes before the
+# dispatch runs.
+
+def _class_src(src: str, name: str) -> str:
+    # one class body (to the next top-level class or EOF); mlp.py holds MLP and GatedMLP
+    m = re.search(rf"^class {name}\b", src, re.M)
+    assert m, f"class {name} not found"
+    n = re.search(r"^class ", src[m.end():], re.M)
+    return src[m.start():m.end() + n.start()] if n else src[m.start():]
+
+
+def _lora_refresh_src(cls_src: str) -> str:
+    m = re.search(r"^    def _lora_refresh\(self\):\n(.*?)(?=^    (?:@|def )|\Z)", cls_src, re.S | re.M)
+    assert m, "_lora_refresh not defined"
+    return m.group(1)
+
+
+def _forward_refresh_then(cls_src: str, dispatch: str) -> re.Match:
+    # forward must compare the epoch and call _lora_refresh, and the fused dispatch site (in
+    # forward or in a decode method that follows it in the file) must come after that refresh
+    fwd = re.search(r"^    def forward\(", cls_src, re.M)
+    assert fwd, "no forward"
+    body = cls_src[fwd.start():]
+    m = re.search(r"if self\._lora_epoch != lora_epoch\.value:\s*\n\s*self\._lora_refresh\(\)", body)
+    assert m, "forward lost its runtime-LoRA epoch compare / _lora_refresh call"
+    d = re.search(dispatch, body[m.end():], re.S)
+    assert d, f"fused dispatch site not found after the epoch refresh: {dispatch}"
+    return d
+
+
 def test_helper_defined():
     src = _src("exllamav3", "modules", "linear.py")
     assert "def has_runtime_lora(" in src
+    assert "def lora_graphed(" in src
+    assert "def lora_sync(" in src
 
 
 @pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
@@ -65,14 +104,21 @@ def test_attention_mgemm_branches_apply_lora(fname):
 
 def test_gated_mlp_fused_branches_guarded():
     src = _src("exllamav3", "modules", "mlp.py")
-    # Checked across ALL slices (uniform BC decision), once per forward.
-    assert "gu_lora = has_runtime_lora(*self.gates, *self.ups)" in src
-    assert "down_lora = has_runtime_lora(*self.downs)" in src
+    cls = _class_src(src, "GatedMLP")
+    refresh = _lora_refresh_src(cls)
+    # Checked across ALL slices (uniform BC decision), recomputed when an
+    # adapter is attached or detached; forward reads the cached answer after
+    # the epoch refresh
+    assert "self._lora_gu = has_runtime_lora(*self.gates, *self.ups)" in refresh, \
+        "GatedMLP: _lora_refresh lost the gate/up runtime-LoRA check"
+    _forward_refresh_then(cls, r"gu_lora = self\._lora_gu\b")
     # gate/up mgemm branch stays fused and adds the LoRA delta onto the mgemm
     # output BEFORE the activation (gate/up inject pre-activation); down goes
     # through Linear.forward, which applies its own LoRA
     i = src.index("self.multi_gu[s].ptrs_trellis")
     gu_block = src[i:src.index("activation_fn_call", i)]
+    assert "if gu_lora:" in gu_block, \
+        "GatedMLP: multi_gu branch no longer tests the cached gate/up LoRA flag"
     assert "self.gates[s].apply_lora(xf" in gu_block, \
         "GatedMLP: multi_gu branch lost its gate LoRA delta"
     assert "self.ups[s].apply_lora(xf" in gu_block, \
@@ -80,23 +126,36 @@ def test_gated_mlp_fused_branches_guarded():
     # the BC bszN graph (v1.2.0: generalized from bsz-1 to bsz*q_len <=
     # MAX_BSZN) fuses the whole MLP (gate/up/act/down) and cannot take a
     # post-hoc delta, so it must yield to an unfused branch when ANY of the
-    # three carries a LoRA
-    assert re.search(
-        r"self\.bc is not None and bsz \* q_len <= MAX_BSZN[^:]*?"
-        r"not \(gu_lora or down_lora\)",
-        src, re.S), "GatedMLP: BC bszN branch lost its runtime-LoRA guard"
+    # three carries a LoRA the graph can't take
+    assert "self._lora_bc = lora_graphed(*self.gates, *self.ups, *self.downs)" in refresh, \
+        "GatedMLP: _lora_refresh lost the BC bszN runtime-LoRA hand-off"
+    _forward_refresh_then(
+        cls, r"self\.bc is not None and bsz \* q_len <= MAX_BSZN and self\._lora_bc\b")
 
 
 @pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
 def test_bc_attn_graph_dispatch_guarded(fname):
     # bc_attn/bc_swa graph-captured decode blocks run projections through
     # o_proj as one C++ call; the dispatch (not the cached graph build) must
-    # check for a runtime LoRA on every involved projection
+    # hand a runtime LoRA on every involved projection to the graph (or
+    # decline) on every call
     src = _src("exllamav3", "modules", fname)
-    assert re.search(
-        r"bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and\s*"
-        r"not has_runtime_lora\(self\.q_proj, self\.k_proj, self\.v_proj,",
-        src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA guard"
+    cls = _class_src(src, "Attention" if fname == "attn.py" else "SlidingAttention")
+    refresh = _lora_refresh_src(cls)
+    _forward_refresh_then(
+        cls, r"bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and self\._lora_bc\b")
+    if fname == "attn.py":
+        # BC_Attention has no stage for a fused kv projection
+        assert re.search(
+            r"self\._lora_bc = \(\s*"
+            r"lora_graphed\(self\.q_proj, self\.k_proj, self\.v_proj, self\.o_proj, self\.g_proj\) and\s*"
+            r"not has_runtime_lora\(getattr\(self, \"kv_proj\", None\)\)\s*\)",
+            refresh), f"{fname}: _lora_refresh lost the graph hand-off / kv_proj guard"
+    else:
+        assert re.search(
+            r"self\._lora_bc = "
+            r"lora_graphed\(self\.q_proj, self\.k_proj, self\.v_proj, self\.o_proj, self\.g_proj\)\s*$",
+            refresh, re.M), f"{fname}: _lora_refresh lost the graph hand-off guard"
 
 
 @pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
@@ -107,19 +166,24 @@ def test_sliced_qkv_bundle_dispatch_guarded(fname):
     # projection carries a runtime LoRA so the pairwise branches (which add
     # the delta) run instead
     src = _src("exllamav3", "modules", fname)
-    assert re.search(
-        r"self\.multi_qkv is not None and bsz \* q_len <= 32 and\s*"
-        r"not has_runtime_lora\(self\.q_proj, self\.k_proj, self\.v_proj, self\.g_proj\)",
-        src), f"{fname}: sliced qkv bundle dispatch lost its runtime-LoRA guard"
+    cls = _class_src(src, "Attention" if fname == "attn.py" else "SlidingAttention")
+    refresh = _lora_refresh_src(cls)
+    assert "self._lora_qkvg = has_runtime_lora(self.q_proj, self.k_proj, self.v_proj, self.g_proj)" \
+        in refresh, f"{fname}: _lora_refresh lost the sliced-bundle q/k/v/g runtime-LoRA check"
+    _forward_refresh_then(
+        cls, r"self\.multi_qkv is not None and bsz \* q_len <= 32 and not self\._lora_qkvg\b")
 
 
 def test_gdn_sliced_qkvz_bundle_dispatch_guarded():
     # Same for the GDN qkv/z sliced bundle on the non-graph torch path
     src = _src("exllamav3", "modules", "gated_delta_net.py")
-    assert re.search(
-        r"getattr\(self, \"multi_qkvz\", None\) is not None and bsz \* seqlen <= 32 and\s*"
-        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj\)",
-        src), "GDN: sliced qkv/z bundle dispatch lost its runtime-LoRA guard"
+    cls = _class_src(src, "GatedDeltaNet")
+    refresh = _lora_refresh_src(cls)
+    assert "self._lora_qkvz = has_runtime_lora(self.qkv_proj, self.z_proj)" in refresh, \
+        "GDN: _lora_refresh lost the sliced-bundle qkv/z runtime-LoRA check"
+    _forward_refresh_then(
+        cls, r"getattr\(self, \"multi_qkvz\", None\) is not None and bsz \* seqlen <= 32 and\s*"
+             r"not self\._lora_qkvz\b")
 
 
 def test_mla_graph_dispatch_guarded():
@@ -129,10 +193,15 @@ def test_mla_graph_dispatch_guarded():
     # (q_a_proj here is DeepSeek's architectural low-rank factorization, not an
     # adapter; kv_b_proj is absorbed into w_uk_flat on every path.)
     src = _src("exllamav3", "modules", "mla_attn.py")
+    cls = _class_src(src, "MLAttention")
+    refresh = _lora_refresh_src(cls)
     assert re.search(
-        r"params\.get\(\"causal\", True\)[^:]*?"
-        r"not has_runtime_lora\(self\.q_proj, self\.q_a_proj,",
-        src, re.S), "MLAttention: graph-captured decode lost its runtime-LoRA guard"
+        r"self\._lora_any = has_runtime_lora\(self\.q_proj, self\.q_a_proj,\s*"
+        r"self\.kv_a_proj_with_mqa, self\.o_proj,\s*"
+        r"self\.idx_wq_b, self\.idx_wk, self\.idx_weights\)",
+        refresh), "MLAttention: _lora_refresh lost a graph-bound projection from its runtime-LoRA check"
+    _forward_refresh_then(
+        cls, r"params\.get\(\"causal\", True\)[^:]*?not self\._lora_any\b")
 
 
 def test_plain_mlp_bsz1_graph_guarded():
@@ -140,10 +209,31 @@ def test_plain_mlp_bsz1_graph_guarded():
     # the whole MLP in one graph-captured C++ call, reading the up/down
     # trellis directly; it must yield to the per-linear path under a LoRA
     src = _src("exllamav3", "modules", "mlp.py")
-    assert re.search(
-        r"self\.bc is not None and bsz == 1 and q_len == 1[^:]*?"
-        r"not has_runtime_lora\(\*self\.ups, \*self\.downs\)",
-        src, re.S), "MLP: BC bsz-1 branch lost its runtime-LoRA guard"
+    cls = _class_src(src, "MLP")
+    refresh = _lora_refresh_src(cls)
+    assert "self._lora_bc = lora_graphed(*self.ups, *self.downs)" in refresh, \
+        "MLP: _lora_refresh lost the BC bsz-1 runtime-LoRA hand-off"
+    _forward_refresh_then(
+        cls, r"self\.bc is not None and bsz == 1 and q_len == 1[^:]*?self\._lora_bc\b")
+
+
+def test_graph_owners_record_and_patch_lora_sites():
+    # Every lora_gr node a graph owner records must be patched at replay in the
+    # same order (lora_args), or the site walk misaligns and the graph replays
+    # against stale pointers (or fails with "Graph update failed"). Owners also
+    # refresh their graphs so an attach/detach after capture re-records
+    for fname, owners in (("attention.cpp", 1), ("mlp.cpp", 2), ("gated_delta_net.cpp", 1)):
+        src = _src("exllamav3", "exllamav3_ext", "libtorch", fname)
+        n_gr = len(re.findall(r"->lora_gr\(", src))
+        n_args = len(re.findall(r"->lora_args\(", src))
+        # (attention.cpp records more sites than it patches: the interleaved-gate q branch and
+        # the three fp16-gate branches of run_gr share patch entries in run())
+        assert n_gr and n_args and n_gr - n_args <= 3, \
+            f"{fname}: {n_gr} lora_gr sites but {n_args} lora_args patches"
+        assert len(re.findall(r"(?:\.|->)refresh\(\)", src)) >= owners, \
+            f"{fname}: graph owners lost their structure-epoch refresh"
+    linear = _src("exllamav3", "exllamav3_ext", "libtorch", "linear.cpp")
+    assert "Graph::bump_structure_epoch();" in linear, "set_lora must invalidate captured graphs"
 
 
 def test_mamba2_bsz1_graph_guarded():
@@ -151,22 +241,34 @@ def test_mamba2_bsz1_graph_guarded():
     # graph-captured call, reading both projection trellises directly
     # (v1.2.0: generalized from bsz-1 to bsz/seqlen up to the BC limits)
     src = _src("exllamav3", "modules", "mamba2.py")
-    assert re.search(
-        r"self\.bc is not None and save_state and[^:]*?"
-        r"not has_runtime_lora\(self\.in_proj, self\.o_proj\)",
-        src, re.S), "Mamba2: BC fused decode lost its runtime-LoRA guard"
+    cls = _class_src(src, "Mamba2")
+    refresh = _lora_refresh_src(cls)
+    assert "self._lora_any = has_runtime_lora(self.in_proj, self.o_proj)" in refresh, \
+        "Mamba2: _lora_refresh lost the in/o projection runtime-LoRA check"
+    _forward_refresh_then(
+        cls, r"self\.bc is not None and save_state and[^:]*?not self\._lora_any\b")
 
 
 def test_gdn_split_bsz1_graph_guarded():
     # BC_GatedDeltaNetSplit runs the whole layer in one call, reading qkv/z/o
-    # trellis and the merged (base-weights-only) ba_weight_t buffer directly
-    # (v1.2.0: generalized from bsz-1 to bsz/seqlen up to the BC limits)
+    # trellis and the merged ba_weight_t buffer directly. The split (Qwen3.5)
+    # graph takes a runtime LoRA on qkv/z/b/a/o through lora_graphed; the KDA
+    # graph (forget/output gates embedded as base weights) must still decline
     src = _src("exllamav3", "modules", "gated_delta_net.py")
+    cls = _class_src(src, "GatedDeltaNet")
+    refresh = _lora_refresh_src(cls)
     assert re.search(
-        r"self\.bc_split and save_state and[^:]*?"
-        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj,.*?"
-        r"self\.f_a_proj, self\.f_b_proj, self\.g_a_proj, self\.g_b_proj",
-        src, re.S), "GatedDeltaNet: split fused decode lost its runtime-LoRA guard (incl. KDA gates)"
+        r"self\._lora_bc = \(\s*"
+        r"lora_graphed\(self\.qkv_proj, self\.z_proj, self\.b_proj, self\.a_proj, self\.o_proj\)\s*"
+        r"if not self\.kda else\s*"
+        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj, self\.a_proj, self\.o_proj,\s*"
+        r"self\.f_a_proj, self\.f_b_proj, self\.g_a_proj, self\.g_b_proj,\s*"
+        r"self\.f_proj, self\.g_proj\)\s*\)",
+        refresh), "GatedDeltaNet: _lora_refresh lost the split hand-off / KDA runtime-LoRA guard"
+    _forward_refresh_then(
+        cls, r"self\.bc_split and save_state and[^:]*?not spec_step and self\._lora_bc\b")
+    assert re.search(r"ext\.BC_GatedDeltaNetSplit\([^)]*?self\.b_proj\.inner\.bc,\s*self\.a_proj\.inner\.bc,", src), \
+        "GatedDeltaNet: the b/a linears must be handed to the graph object for their LoRA deltas"
 
 
 def test_moe_expert_dispatch_guarded():
@@ -174,7 +276,15 @@ def test_moe_expert_dispatch_guarded():
     # mlp() closure calling gates/ups/downs .forward) while an adapter is
     # loaded on any routed expert projection
     src = _src("exllamav3", "modules", "block_sparse_mlp.py")
-    assert "experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)" in src
+    cls = _class_src(src, "BlockSparseMLP")
+    refresh = _lora_refresh_src(cls)
+    # routed experts: 3 x num_experts modules, scanned only when an adapter changes
+    assert "self._experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)" in refresh, \
+        "BlockSparseMLP: _lora_refresh lost the routed-expert runtime-LoRA check"
+    # forward reads the cached routed/shared answers after the epoch refresh, before any
+    # of the branch selections below
+    _forward_refresh_then(
+        cls, r"experts_lora = self\._experts_lora\s*\n\s*sh_fused_lora = self\._sh_fused_lora\b")
     # branch selection forces the torch-capable branch
     assert re.search(
         r"no_reconstruct or experts_lora or",
@@ -188,22 +298,46 @@ def test_moe_expert_dispatch_guarded():
         r"self\.bc is not None and self\.support_quant_paths and not experts_lora",
         src), "BlockSparseMLP: BC single-expert path lost its runtime-LoRA guard"
     # bszN kernels (v1.2.0: replace the bsz-1 graph; may embed shared experts
-    # + shared gate) are the last tier since v1.5.0, so a LoRA on the fused
-    # shared-expert linears must divert into the torch/fused branch instead
-    assert "sh_fused_lora" in src and re.search(
+    # + shared gate) are the last tier since v1.5.0. A LoRA on the shared
+    # expert's linears is handed to their BC_LinearEXL3 (lora_graphed) and
+    # applied inside the shared BC_GatedMLP graph; one the graph declines, or
+    # one on the shared gate (projected from the raw weight inside the routed
+    # launch), must divert into the torch/fused branch instead
+    assert "self._shared_gate_lora = has_runtime_lora(self.shared_gate)" in refresh, \
+        "BlockSparseMLP: _lora_refresh lost the shared-gate runtime-LoRA check"
+    assert re.search(
+        r"self\._sh_fused_lora = bool\(self\.bc_sh_exp\) and \(\s*"
+        r"not lora_graphed\(\*self\.shared_experts\.gates, \*self\.shared_experts\.ups,\s*"
+        r"\*self\.shared_experts\.downs\) or\s*"
+        r"self\._shared_gate_lora\s*\)",
+        refresh), "BlockSparseMLP: _lora_refresh lost the shared-experts hand-off / shared-gate guard"
+    assert re.search(
         r"no_reconstruct or experts_lora or sh_fused_lora or",
         src), "BlockSparseMLP: bszN kernels lost their shared-experts LoRA guard"
     assert re.search(
         r"assert bszn_eligible and not experts_lora and not sh_fused_lora",
         src), "BlockSparseMLP: bszN tier lost its LoRA assertion"
+    # ... and the C++ side must honour the hand-off: the one-expert fused launch
+    # of the shared expert (sh_coop) reads pointer tables and has no LoRA stage,
+    # so while an adapter is attached run_bszN must take the BC_GatedMLP graph
+    # (which emits the LoRA nodes) instead
+    bsmlp = _src("exllamav3", "exllamav3_ext", "libtorch", "blocksparse_mlp.cpp")
+    assert re.search(
+        r"if \(sh_coop && !shared_experts_lora\(\)\)",
+        bsmlp), "BC_BlockSparseMLP::run_bszN: shared-expert fused launch lost its runtime-LoRA check"
+    assert re.search(
+        r"else if \(shared_experts\)\s*\{[^}]*?shared_experts->run_bszN\(",
+        bsmlp, re.S), "BC_BlockSparseMLP::run_bszN: lost the BC_GatedMLP fallback for the shared expert"
+    bsmlp_h = _src("exllamav3", "exllamav3_ext", "libtorch", "blocksparse_mlp.h")
+    assert re.search(
+        r"bool shared_experts_lora\(\) const\s*\{.*?gate->has_lora\(\).*?up->has_lora\(\).*?down->has_lora\(\)",
+        bsmlp_h, re.S), "BC_BlockSparseMLP::shared_experts_lora must check all three shared projections"
     # batched reconstruct tier (v1.5.0) reads the base trellis; skipped under LoRA
     assert re.search(
         r"if not experts_lora:\s*\n\s*recon = self\._batch_recon_layer\(y\)",
         src), "BlockSparseMLP: batched reconstruct tier lost its runtime-LoRA guard"
     # raw-weight shared gate projection falls back to Linear.forward
-    assert re.search(
-        r"bsz > 32 or has_runtime_lora\(self\.shared_gate\)",
-        src), "BlockSparseMLP: add_sigmoid_gate_proj lost its shared-gate LoRA guard"
+    _forward_refresh_then(cls, r"bsz > 32 or self\._shared_gate_lora\b")
     # CPU expert offload (v1.2.0) computes from a CPU copy of the base expert
     # weights with no GPU fallback available; must reject a routed-expert LoRA
     # loudly instead of silently bypassing it
@@ -221,17 +355,21 @@ def test_moe_expert_lora_slow_path_notice_present():
 
 
 def _stash_lora(*linears):
+    from exllamav3.modules.linear import bump_runtime_lora_epoch
     stash = [(l, l.lora_a_tensors, l.lora_b_tensors) for l in linears if l is not None]
     for l, _, _ in stash:
         l.lora_a_tensors = {}
         l.lora_b_tensors = {}
+    bump_runtime_lora_epoch()
     return stash
 
 
 def _restore_lora(stash):
+    from exllamav3.modules.linear import bump_runtime_lora_epoch
     for l, a, b in stash:
         l.lora_a_tensors = a
         l.lora_b_tensors = b
+    bump_runtime_lora_epoch()
 
 
 def test_mgemm_lora_delta_parity_gpu():
@@ -295,7 +433,9 @@ def test_mgemm_lora_delta_parity_gpu():
     assert attn is not None, "no Attention with multi_kv + k/v LoRA in this model/adapter"
     x = (torch.randn(1, 8, attn.hidden_size, device = attn.device) * 0.05).half()
 
+    # project_qkv is called directly here, without the forward that refreshes the routing
     def qkv_fused():
+        attn._lora_refresh()
         q, k, v, g = attn.project_qkv(x, {})
         return k.reshape(-1), v.reshape(-1)
 
@@ -303,6 +443,7 @@ def test_mgemm_lora_delta_parity_gpu():
         mkv, mqg = attn.multi_kv, attn.multi_qg
         attn.multi_kv = None
         attn.multi_qg = None
+        attn._lora_refresh()
         try:
             q, k, v, g = attn.project_qkv(x, {})
         finally:
@@ -406,6 +547,7 @@ def test_sliding_attention_padded_mgemm_lora(bsz, q_len, fuse_qg, fuse_kv):
         # The sliced bundle is present but the stub has no project_qkv_sliced:
         # with a runtime LoRA loaded the dispatch must not reach it
         multi_qkv=multi,
+        _lora_qkvg=True, _lora_qg=True, _lora_kv=True,
         num_q_heads=1, num_kv_heads=1, head_dim=width, v_norm=None,
         prealloc_qgh_1=torch.empty(2, 1, padded, dtype=torch.float16),
         prealloc_kvh_1=torch.empty(2, 1, padded, dtype=torch.float16),

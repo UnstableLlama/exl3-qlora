@@ -77,6 +77,7 @@ struct BC_Attention
     bool gate_softplus;
     std::shared_ptr<BC_LinearEXL3> g_proj;
     c10::optional<at::Tensor> g_weight;   // unquantized full gate: fp16 (hidden, qh*hd)
+    std::shared_ptr<BC_LinearFP16> g_proj_fp16;   // the fp16 gate's linear behind g_weight, for its runtime LoRA only
     c10::optional<at::Tensor> qg_ptrs_trellis;
     c10::optional<at::Tensor> qg_ptrs_suh;
     c10::optional<at::Tensor> qg_ptrs_svh;
@@ -216,6 +217,7 @@ struct BC_Attention
         bool gate_softplus,
         std::shared_ptr<BC_LinearEXL3> g_proj,
         c10::optional<at::Tensor> g_weight,
+        std::shared_ptr<BC_LinearFP16> g_proj_fp16,
         c10::optional<at::Tensor> qg_ptrs_trellis,
         c10::optional<at::Tensor> qg_ptrs_suh,
         c10::optional<at::Tensor> qg_ptrs_svh,
