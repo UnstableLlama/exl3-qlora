@@ -35,7 +35,7 @@ import math
 import re
 import torch
 from safetensors.torch import load_file as safe_load_file
-from ..modules.linear import Linear
+from ..modules.linear import Linear, bump_runtime_lora_epoch
 from ..modules.embedding import Embedding
 
 from typing import TYPE_CHECKING
@@ -243,6 +243,7 @@ class LoRA:
                 target.lora_a_tensors[self] = tensor
             else:
                 target.lora_b_tensors[self] = tensor
+            bump_runtime_lora_epoch()
 
             self.target_modules[module_key] = target
             loaded += 1
@@ -351,6 +352,7 @@ class LoRA:
                 b = b * self.module_lora_scale
                 head.lora_a_tensors[self] = a
                 head.lora_b_tensors[self] = b
+                bump_runtime_lora_epoch()
                 self.target_modules.setdefault("lm_head", head)
                 applied.append("lm_head")
             if "embed_tokens.lora_a" in ml and embed is not None:
@@ -425,6 +427,7 @@ class LoRA:
         for target in self.target_modules.values():
             target.lora_a_tensors.pop(self, None)
             target.lora_b_tensors.pop(self, None)
+        bump_runtime_lora_epoch()
 
         # Revert in-place module adapters (modules_to_save head/embed, folded embed LoRA).
         for linear in self._full_weight_targets:

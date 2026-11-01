@@ -12,7 +12,7 @@ from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
-from .linear import has_runtime_lora, lora_graphed
+from .linear import has_runtime_lora, lora_graphed, runtime_lora_epoch
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
@@ -484,6 +484,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.bc = None
         self.bc_sh_exp = False
+        self._experts_lora = False
+        self._experts_lora_epoch = -1
         self.fused_mode_buffers = None
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
@@ -1167,7 +1169,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # experts through their own (guarded) forwards afterwards.
         # NOTE: routing reads routing_gate.inner.weight directly on all paths; a LoRA
         # on the router is not supported (and not used by training).
-        experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)
+        # (kept until an adapter changes: this is 3 x num_experts modules, per layer and token)
+        if self._experts_lora_epoch != runtime_lora_epoch():
+            self._experts_lora_epoch = runtime_lora_epoch()
+            self._experts_lora = has_runtime_lora(*self.gates, *self.ups, *self.downs)
+        experts_lora = self._experts_lora
         sh_fused_lora = self.bc_sh_exp and (
             not lora_graphed(*self.shared_experts.gates, *self.shared_experts.ups,
                              *self.shared_experts.downs) or

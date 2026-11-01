@@ -1889,11 +1889,15 @@ def set_runtime_lora(linear, owner, a: torch.Tensor, b: torch.Tensor) -> None:
     by ``owner``, so ``model.forward`` / generation applies them. ``a`` / ``b``
     are moved to the linear's device.
     """
+    from ..modules.linear import bump_runtime_lora_epoch
     linear.lora_a_tensors[owner] = a.to(linear.device)
     linear.lora_b_tensors[owner] = b.to(linear.device)
+    bump_runtime_lora_epoch()
 
 
 def clear_runtime_lora(linear, owner) -> None:
     """Remove ``owner``'s adapter tensors from a native ``Linear``'s LoRA slots."""
+    from ..modules.linear import bump_runtime_lora_epoch
     linear.lora_a_tensors.pop(owner, None)
     linear.lora_b_tensors.pop(owner, None)
+    bump_runtime_lora_epoch()

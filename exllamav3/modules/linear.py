@@ -39,6 +39,20 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 _lora_graph_enable = os.environ.get("EXL3_LORA_GRAPH", "1") != "0"
 
 
+# Bumped on every runtime LoRA attach or detach, so a block that scans many projections per
+# decode step (BlockSparseMLP: every routed expert) can keep the answer until something changes
+_runtime_lora_epoch = 0
+
+
+def runtime_lora_epoch() -> int:
+    return _runtime_lora_epoch
+
+
+def bump_runtime_lora_epoch():
+    global _runtime_lora_epoch
+    _runtime_lora_epoch += 1
+
+
 def has_runtime_lora(*linears) -> bool:
     """
     True when any of the given Linear modules currently carries a runtime LoRA
@@ -642,6 +656,7 @@ class Linear(Module):
         self.sparse_head = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
+        bump_runtime_lora_epoch()
         self._lora_graph_src = ()
         self._lora_graphed = True
 
