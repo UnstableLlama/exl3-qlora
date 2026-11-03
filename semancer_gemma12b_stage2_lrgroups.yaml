@@ -1,0 +1,68 @@
+# EXL3 QLoRA -- Gemma-4-12B-it: STAGE 2 of the new-vocabulary recipe. Full LoRA SFT on
+# top of the stage-1 token rows (resumed; they keep training and are re-exported), with
+# a gentler LR on the global-attention layers -- the layers that carry long-range
+# recall and that a heavy adapter trained at 2k context damages most.
+# Launch: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#           python training/qlora_train.py --config semancer_gemma12b_stage2_lrgroups.yaml
+
+model: /home/unstable/weights/google_gemma-4-12B-it/6.00bpw
+out: out/semancer_gemma12b_stage2
+resume: out/semancer_gemma12b_stage1_tokens/final   # stage-1 rows; adapter shapes must match
+reset_optimizer: true                               # new trainable set -> fresh optimizer
+
+parallel: split
+split_even: true
+
+r: 32
+alpha: 32
+use_rslora: true
+init_lora: pissa
+lr: 0.00004
+lr_groups:
+  - name: global_attn          # every full-attention block, by its attention kind
+    layers: [global_attention]
+    lr: 0.00001
+trainable_tokens:              # same set as stage 1 (positional rows)
+  - IceWing
+  - MudWing
+  - NightWing
+  - RainWing
+  - SandWing
+  - SeaWing
+  - SkyWing
+trainable_tokens_head: auto
+trainable_tokens_lr: 0.0005    # rows keep moving, slower than in stage 1
+weight_decay: 0.0
+scheduler: cosine
+warmup_ratio: 0.1
+epochs: 4
+batch: 4
+grad_accum: 1
+max_grad_norm: 1.0
+compute_dtype: bfloat16
+
+dataset: UnstableLlama/semancy
+messages_key: messages
+prompt_format: gemma4-nothink
+seq_len: 2048
+pack: true
+pack_algo: bfd
+shuffle: true
+
+targets:
+  - down_proj
+  - gate_proj
+  - up_proj
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+offload_activations: true
+attn_impl: auto
+sample_every: 0
+checkpoint_every: 5
+keep_checkpoints: 0
+eval_split: test
+eval_every: 5
+save_best: true
+run_log: qlora_runs.csv

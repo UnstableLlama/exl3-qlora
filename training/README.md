@@ -219,7 +219,82 @@ style at runtime on both Qwen3.5-MoE-family and Gemma4-MoE), but MoE decode is
 significantly slower while such an adapter is loaded — for serving speed,
 deploy by merge-and-requantize.
 
+## Per-group learning rates (`lr_groups`)
+
+Axolotl's `lr_groups`, for every backend (SFT single/split/DDP, EBFT, the
+preference methods, GRPO): adapters whose module matches a group leave the
+default param group for one at that group's LR, same schedule and weight
+decay. A group selects by `modules` (substrings of the native module key --
+`layers.5.`, `q_proj`, dots literal so `layers.5.` is not layer 53 -- or
+`re:<regex>`) and/or `layers` (block indices, `"a-b"` ranges, or the
+`global_attention` / `sliding_attention` keywords, resolved from each block's
+own attention kind), AND across keys. `lr` is absolute, `lr_mul` relative to
+`lr`. First matching group wins; a group that matches nothing is an error.
+The motivating case is Gemma, whose few global-attention layers carry the
+long-range recall that a heavy adapter trained at short context damages:
+
+```yaml
+lr: 0.00004
+lr_groups:
+  - name: global_attn
+    layers: [global_attention]      # every full-attention block, whatever the model size
+    lr: 0.00001
+```
+
+CLI form: `--lr-groups global_attn:1e-5:global_attention early:x0.5:L0-7,down_proj`
+(`NAME:LR:SEL[,SEL...]`; `x0.5` = multiplier, `L5` / `L0-7` = blocks, anything
+else a module substring). The trainer logs each group's tensor/param count and
+LR; the per-group LRs follow the one schedule, and a resume must use the same
+groups (the optimizer state is positional). CPU-tested in
+`tests/test_native_llama.py` (`test_lr_groups_param_groups`).
+
+## Trained token rows: a new-vocabulary stage (`trainable_tokens`)
+
+A names-heavy domain (invented tribes, houses, places) tokenizes every name
+into shared subword pieces -- all the tribe names end in the same two tokens
+-- and the model keeps confusing them. The fix that does not resize anything
+is to make the names single tokens by repurposing the model's spare
+`<unusedN>` ids, give those rows a sensible start, and train ONLY those rows
+before the ordinary SFT:
+
+1. **Repurpose the tokens** -- `training/repurpose_tokens.py --model M --map
+   '<unused6>=IceWing' '<unused7>=MudWing' ... --out tok/ --write` renames the
+   vocab entries and registers them as added tokens (the tokenizer then matches
+   the names whole in text), edits `tokenizer_config.json` /
+   `added_tokens.json` to match, and verifies by re-tokenizing. Dry run by
+   default; `--list` shows the spare tokens. No embedding resize: the ids
+   already exist in the quantized model. CPU-tested in
+   `tests/test_repurpose_tokens.py`.
+2. **Stage 1, rows only** -- `trainable_tokens: [IceWing, MudWing, ...]` with
+   `targets: []` and `trainable_tokens_init: {IceWing: "IceWing, an ice dragon
+   tribe ...", ...}` (inline or a .json/.yaml file; the row starts at the MEAN
+   of the base rows of the description's tokens). Only the `n x hidden` rows
+   train (fp32 master + Adam state for n rows, not the table). On a tied model
+   (Gemma) the head columns for those tokens ARE the same rows
+   (`trainable_tokens_head: auto` -> tied; HF semantics, where `lm_head` and
+   `embed_tokens` share one tensor), so the loss runs through the materialized
+   supervised-position head with those columns swapped in, as `lora_head`
+   does. Use a high `lr` (1e-3..1e-2) or `trainable_tokens_lr`. Every
+   checkpoint logs each row's cosine to its init, relative move and norm
+   ratio.
+3. **Stage 2, the SFT** -- `resume:` the stage-1 adapter dir, keep
+   `trainable_tokens` (the rows keep training and are re-exported) and set
+   the usual `targets` (+ `lr_groups` above).
+
+The rows are saved to `trainable_tokens.safetensors` next to the adapter;
+`LoRA.from_directory` writes them into the embedding at load time and
+applies the head columns through the LM head's runtime LoRA slot as a rank-n
+adapter (column deltas x a one-hot selector), so `qlora_infer_native.py`,
+`--sample-every` and the realtime serving path all see them;
+`merge_lora_bf16.py` writes them into the bf16 weights for a requantize.
+Mutually exclusive with `train_embeddings` / `lora_embed`; single/split
+backends only. Point the trainer and the inference loader at the edited
+tokenizer (copy the three files into the model dir, or `--in-place`). CPU-
+tested in `tests/test_native_llama.py`
+(`test_trainable_token_rows_embed_and_head`).
+
 ## MTP (multi-token prediction) head training
+
 
 Qwen3.5/3.6 checkpoints ship a one-block MTP head -- the self-speculative
 draft the generator runs with `draft_model = Model.from_config(config,

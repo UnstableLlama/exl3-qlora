@@ -17,8 +17,13 @@ Supports **default** and **pissa** inits (pissa exports the rank-2r combined
 ``[A|A0] / [s·B;-s·B0]`` form with the scale baked into B and config ``r``
 unchanged, so the same ``alpha/r`` merge is correct). **Rejects** adapters with a
 PEFT ``rank_pattern``/``alpha_pattern`` (e.g. mixed-rank MoE ``expert_r``): those
-need per-module scales this single-scale merge would get wrong. Only touches
-linear ``lora_A``/``lora_B`` tensors — head/embed LoRA sidecars are not handled.
+need per-module scales this single-scale merge would get wrong. Touches the
+linear ``lora_A``/``lora_B`` tensors and, when the adapter carries
+``trainable_tokens.safetensors`` (``--trainable-tokens``), writes the trained
+rows into ``embed_tokens.weight`` (and ``lm_head.weight`` when the head columns
+trained separately; a tied model shares the tensor). The head/embed LoRA
+sidecars (``lora_modules`` / ``modules_to_save``) are not handled.
+
 
 Usage:
     python training/merge_lora_bf16.py \
@@ -70,6 +75,25 @@ def main():
         weight_of_mod[f"{mod}.weight"] = mod
     print(f"merging {len(weight_of_mod)} weights")
 
+    # Trained token rows: {HF weight key suffix: (ids, rows)} -- matched by suffix
+    # (model.embed_tokens.weight / model.language_model.embed_tokens.weight ...).
+    row_writes: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    tt_path = os.path.join(args.adapter, "trainable_tokens.safetensors")
+    if os.path.exists(tt_path):
+        tt = load_file(tt_path)
+        ids = tt["embed_tokens.token_ids"].long()
+        row_writes["embed_tokens.weight"] = (ids, tt["embed_tokens.rows"])
+        head_mode = cfg.get("trainable_tokens_head", "off")
+        if head_mode == "separate" and "lm_head.rows" in tt:
+            row_writes["lm_head.weight"] = (ids, tt["lm_head.rows"])
+        elif head_mode == "tied" and not cfg.get("tie_word_embeddings", True):
+            # Trained as tied (shared rows) but the base keeps a separate head:
+            # write the same rows into the head so the merged model matches.
+            row_writes["lm_head.weight"] = (ids, tt["embed_tokens.rows"])
+        print(f"writing {len(ids)} trained token rows into {sorted(row_writes)}")
+    rows_written = 0
+
+
     os.makedirs(args.out, exist_ok=True)
     idx = json.load(open(os.path.join(args.base, "model.safetensors.index.json")))
     shard_of: dict[str, list[str]] = {}
@@ -81,9 +105,20 @@ def main():
         sd = load_file(os.path.join(args.base, shard))
         touched = False
         for wk in keys:
+            for suffix, (ids, rows) in row_writes.items():
+                if wk.endswith(suffix):
+                    W = sd[wk]
+                    assert rows.shape[1] == W.shape[1], \
+                        f"{wk}: row width {rows.shape[1]} != hidden {W.shape[1]}"
+                    W = W.clone()
+                    W[ids] = rows.to(W.dtype)
+                    sd[wk] = W
+                    rows_written += 1
+                    touched = True
             if wk not in weight_of_mod:
                 continue
             ab = mods[weight_of_mod[wk]]
+
             delta = scale * (ab["B"].float() @ ab["A"].float())   # [out,in]
             W = sd[wk]
             assert delta.shape == W.shape, f"{wk}: delta{tuple(delta.shape)} != W{tuple(W.shape)}"
@@ -95,6 +130,11 @@ def main():
     assert merged == len(weight_of_mod), \
         f"merged {merged} weights but adapter has {len(weight_of_mod)} " \
         f"(a target module was missing from the base index?)"
+    assert rows_written == len(row_writes), \
+        f"wrote trained token rows into {rows_written} tensors but expected " \
+        f"{sorted(row_writes)} (tied base with no lm_head.weight? then only the " \
+        f"embedding needs them -- check adapter_config tie_word_embeddings)"
+
 
     # Copy every non-shard file verbatim (config, tokenizer, index, ...).
     shard_names = set(shard_of)

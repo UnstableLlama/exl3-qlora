@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import sys
@@ -70,8 +71,9 @@ COMMON_KEYS = {
     "min_response_words", "uppercase_response", "max_samples", "shuffle",
     "shuffle_seed", "seq_len", "pack", "pack_algo", "ga_loss",
     "profile_dequant", "dequant_mode", "dequant_cache",
-    "targets", "train_embeddings",
+    "targets", "train_embeddings", "lr_groups",
     "train_head", "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
+
     "head_vocab_chunk", "max_grad_norm", "save_every", "checkpoint_every",
     "keep_checkpoints", "resume", "reset_optimizer", "eval_split",
     "eval_dataset", "eval_config", "eval_text_key", "eval_max_samples",
@@ -91,6 +93,10 @@ SINGLE_ONLY_KEYS = {
     "device", "parallel", "reserve_per_device", "use_per_device", "split_even", "optim",
     "inspect", "lora_embed", "lora_head", "module_lora_lr_mul",
     "offload_embed_head_optim",
+    # Trained token rows (the new-vocabulary stage); native single/split only.
+    "trainable_tokens", "trainable_tokens_init", "trainable_tokens_head",
+    "trainable_tokens_lr",
+
     "offload_activations", "offload_mode", "vram_spillover", "use_liger",
     # Streamed routed experts (Session 59) and the PLE n-gram table in RAM
     # (Session 58); the native single-device backend only.
@@ -125,7 +131,7 @@ EBFT_KEYS = {
     "no_whiten", "whiten_tol", "feature_fracs",
     "rollout_sampler", "sampler_cache_tokens",
     # optimization
-    "lr", "weight_decay", "optim", "adam_betas", "scheduler", "warmup_ratio",
+    "lr", "lr_groups", "weight_decay", "optim", "adam_betas", "scheduler", "warmup_ratio",
     "warmup_steps", "epochs", "steps", "batch", "grad_accum", "max_grad_norm",
     # data
     "mode", "dataset", "dataset_split", "dataset_config", "instruction_key",
@@ -163,10 +169,11 @@ GRPO_KEYS = {
     "loss_type", "scale_rewards", "importance_sampling_level",
     "mask_truncated_completions", "rollout_sampler", "sampler_cache_tokens",
     # optimization
-    "lr", "weight_decay", "optim", "adam_betas", "scheduler", "warmup_ratio",
+    "lr", "lr_groups", "weight_decay", "optim", "adam_betas", "scheduler", "warmup_ratio",
     "warmup_steps", "epochs", "steps", "batch", "max_grad_norm",
     # data
     "dataset", "dataset_split", "dataset_config", "prompt_key", "prompt_format",
+
     "chat_template_file", "template_vars", "strip_sys_prompt_extras",
     "max_samples", "shuffle", "shuffle_seed",
     # eval / saving
@@ -200,7 +207,7 @@ PREF_KEYS = {
     "dpo_loss", "kto_loss", "desirable_weight", "undesirable_weight",
     "orpo_nll",
     # optimization
-    "lr", "weight_decay", "optim", "scheduler", "warmup_ratio",
+    "lr", "lr_groups", "weight_decay", "optim", "scheduler", "warmup_ratio",
     "warmup_steps", "epochs", "steps", "batch", "grad_accum", "max_grad_norm",
     # data
     "dataset", "dataset_split", "dataset_config", "prompt_key",
@@ -281,6 +288,11 @@ SINGLE_ONLY_DEFAULTS = {
     "lora_embed": False,
     "lora_head": False,
     "module_lora_lr_mul": 1.0,
+    "trainable_tokens": None,
+    "trainable_tokens_init": None,
+    "trainable_tokens_head": "auto",
+    "trainable_tokens_lr": None,
+
     "offload_embed_head_optim": False,
     "offload_activations": False,
     "offload_mode": "async",
@@ -419,9 +431,17 @@ def append_arg(argv: list[str], key: str, value: Any, *, ddp: bool) -> None:
         return
     if isinstance(value, (list, tuple)):
         argv.append(flag)
-        argv.extend(str(v) for v in value)
+        # Structured entries (lr_groups: a list of mappings) travel as JSON;
+        # the backends parse a JSON object per entry.
+        argv.extend(json.dumps(v) if isinstance(v, dict) else str(v) for v in value)
+        return
+    if isinstance(value, dict):
+        # A mapping-valued key (trainable_tokens_init inline) is forwarded as
+        # one JSON argument.
+        argv.extend([flag, json.dumps(value)])
         return
     argv.extend([flag, str(value)])
+
 
 
 def flatten_config(data: dict[str, Any]) -> dict[str, Any]:

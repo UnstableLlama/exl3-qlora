@@ -53,7 +53,8 @@ from collections import deque
 import torch
 
 from exllamav3 import Config, Model, Tokenizer
-from exllamav3.training.native_llama import NativeLlamaQLoRA
+from exllamav3.training.native_llama import (NativeLlamaQLoRA, parse_lr_group_specs,
+                                             describe_lr_groups)
 
 # Local run logger + self-contained HTML report -- the default logging path
 # (replaces wandb for shareable dashboards). Same dir on sys.path when this file
@@ -184,7 +185,9 @@ RUN_LOG_FIELDS = [
     "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
     "max_samples", "train_embeddings", "train_head",
     "lora_embed", "lora_head", "module_lora_lr_mul",
+    "lr_groups", "trainable_tokens", "trainable_tokens_lr",
     "prompt_format",
+
     "trainable_params", "n_train", "n_val", "n_eval2",
     "start_loss", "end_loss", "best_val", "best_val_step",
     "start_val", "start_eval2", "final_val", "final_eval2",
@@ -649,8 +652,128 @@ def encode_prompt_response(tokenizer, prompt_text, response_text, eot):
     return prompt_ids, resp_ids
 
 
+def _resolve_token_spec(tokenizer, spec, vocab_size: int) -> list[int]:
+    """One ``--trainable-tokens`` entry -> ids: an int id, an ``a-b`` id range
+    (inclusive) or a token string that must be exactly one token."""
+    s = str(spec).strip()
+    if re.fullmatch(r"\d+", s):
+        ids = [int(s)]
+    elif re.fullmatch(r"\d+-\d+", s):
+        a, b = map(int, s.split("-"))
+        if b < a:
+            raise SystemExit(f"--trainable-tokens: bad range {s!r}")
+        ids = list(range(a, b + 1))
+    else:
+        tid = tokenizer.single_id(s)
+        if tid is None:
+            enc = tokenizer.encode(s, add_bos=False, encode_special_tokens=True).flatten().tolist()
+            if len(enc) != 1:
+                raise SystemExit(
+                    f"--trainable-tokens: {s!r} is not a single token (encodes to "
+                    f"{len(enc)} ids: {enc}). Repurpose an <unusedN> token first "
+                    f"(training/repurpose_tokens.py) or give the id.")
+            tid = enc[0]
+        ids = [int(tid)]
+    for t in ids:
+        if not 0 <= t < vocab_size:
+            raise SystemExit(f"--trainable-tokens: id {t} outside the vocabulary (0..{vocab_size - 1})")
+    return ids
+
+
+def resolve_trainable_tokens(tokenizer, specs, vocab_size: int) -> list[int]:
+    """``--trainable-tokens`` entries -> sorted unique token ids."""
+    ids: set[int] = set()
+    for spec in specs or []:
+        ids.update(_resolve_token_spec(tokenizer, spec, vocab_size))
+    if not ids:
+        raise SystemExit("--trainable-tokens given but resolved to no token ids")
+    return sorted(ids)
+
+
+def load_trainable_token_init_map(arg):
+    """``--trainable-tokens-init``: a JSON object string, or a .json / .yaml file,
+    mapping token (string or id) -> description text. Returns a dict or None."""
+    if not arg:
+        return None
+    s = str(arg).strip()
+    if s.startswith("{"):
+        m = json.loads(s)
+    elif os.path.exists(s):
+        with open(s, encoding="utf8") as f:
+            if s.endswith((".yaml", ".yml")):
+                import yaml
+                m = yaml.safe_load(f)
+            else:
+                m = json.load(f)
+    else:
+        raise SystemExit(f"--trainable-tokens-init: {s!r} is neither a JSON object nor a file")
+    if isinstance(m, list):
+        # [{"token": ..., "init": ...}, ...] is accepted too.
+        m = {e["token"]: e.get("init", e.get("text", "")) for e in m}
+    if not isinstance(m, dict):
+        raise SystemExit("--trainable-tokens-init must map token -> description text")
+    return m
+
+
+def build_trainable_token_init(tokenizer, init_map, token_ids, embed_weight,
+                               head_weight=None):
+    """Description init for trained token rows (the recipe behind a new-vocabulary
+    stage: start a repurposed token near the words that describe it rather than
+    at the <unused> row's arbitrary value). For each ``token -> text`` the row is
+    the MEAN of the base embedding rows of ``text``'s tokens -- the trained tokens
+    themselves are excluded from that mean (their base rows are the arbitrary
+    values being replaced). With ``head_weight`` ([hidden, vocab]) the head
+    columns get the same treatment under key ``("head", id)``. Returns the dict
+    ``NativeLlamaQLoRA(trainable_token_init=...)`` takes, plus the
+    ``[(token, id, n_desc_tokens)]`` summary for the log."""
+    if not init_map:
+        return None, []
+    trained = set(token_ids)
+    vocab = embed_weight.shape[0]
+    out, summary = {}, []
+    for tok, text in init_map.items():
+        tid = _resolve_token_spec(tokenizer, tok, vocab)
+        if len(tid) != 1:
+            raise SystemExit(f"--trainable-tokens-init: {tok!r} must name one token")
+        tid = tid[0]
+        if tid not in trained:
+            raise SystemExit(f"--trainable-tokens-init: {tok!r} (id {tid}) is not in "
+                             f"--trainable-tokens")
+        desc = tokenizer.encode(str(text), add_bos=False,
+                                encode_special_tokens=False).flatten().tolist()
+        desc = [d for d in desc if d not in trained]
+        if not desc:
+            raise SystemExit(f"--trainable-tokens-init: the description for {tok!r} has no "
+                             f"usable tokens (only trained tokens / empty)")
+        idx = torch.tensor(desc, dtype=torch.long, device=embed_weight.device)
+        out[tid] = embed_weight[idx].to(torch.float32).mean(dim=0).cpu()
+        if head_weight is not None:
+            out[("head", tid)] = head_weight[:, idx.to(head_weight.device)].to(
+                torch.float32).mean(dim=1).cpu()
+        summary.append((str(tok), tid, len(desc)))
+    return out, summary
+
+
+def print_trainable_token_stats(net, tokenizer, limit: int = 40) -> None:
+    """Log how far each trained token row has moved from its init (cosine,
+    relative move, norm ratio) -- the health check of a new-vocabulary stage."""
+    stats = net.trainable_token_stats()
+    if not stats:
+        return
+    pieces = tokenizer.get_id_to_piece_list(include_special_tokens=True)
+    print("  [tokens] id  piece            cos-to-init  rel-move  norm-ratio")
+    for s in stats[:limit]:
+        t = s["token_id"]
+        piece = pieces[t] if t < len(pieces) else "?"
+        print(f"  [tokens] {t:<5d}{piece[:16]:<16} {s['cos_to_init']:>10.4f} "
+              f"{s['rel_move']:>9.4f} {s['norm_ratio']:>11.4f}")
+    if len(stats) > limit:
+        print(f"  [tokens] ... {len(stats) - limit} more")
+
+
 def build_optimizer(param_groups, lr, optim="adamw"):
     """Build the optimizer over the trainable param groups.
+
 
     ``adamw`` is torch's AdamW: ``m``/``v`` in fp32 = 8 bytes per trainable param.
     For a 262M-param r=64 adapter that is ~2.1 GB of optimizer state (split across
@@ -1711,8 +1834,23 @@ def _run_main():
                          "when that is set; otherwise the error scale is "
                          "estimated from the trellis bitrate (std·2^-K).")
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr-groups", "--lr-group", nargs="*", default=None, dest="lr_groups",
+                    metavar="SPEC",
+                    help="Per-module-group learning rates (axolotl's lr_groups). Each "
+                         "SPEC is a JSON object {\"name\", \"lr\" | \"lr_mul\", "
+                         "\"modules\": [...], \"layers\": [...]} or the compact form "
+                         "NAME:LR:SEL[,SEL...] where LR is absolute (1e-5) or a "
+                         "multiplier (x0.25) and each SEL is a module-key substring "
+                         "(layers.5. / q_proj / re:regex), a block index or a-b "
+                         "range (prefix L: L5, L0-9) or global_attention / "
+                         "sliding_attention (Gemma's full-attention layers). The "
+                         "matched adapters leave the default group for one at that "
+                         "LR, same schedule; first matching group wins; a group "
+                         "matching nothing is an error. E.g. "
+                         "--lr-groups global_attn:1e-5:global_attention")
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
+
     ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit"],
                     default="adamw",
                     help="Optimizer. 'adamw' = torch AdamW (fp32 moments, 8 "
@@ -1968,7 +2106,39 @@ def _run_main():
                          "delta to the head logits at the supervised positions; "
                          "memory scales with supervised tokens, params are tiny. "
                          "Saved to lora_modules.safetensors (merge-path).")
+    ap.add_argument("--trainable-tokens", nargs="*", default=None, metavar="TOKEN",
+                    help="Train only these embedding ROWS (PEFT trainable_token_indices; "
+                         "axolotl's embed_tokens.weight$[a:b] unfrozen_parameters) -- the "
+                         "new-vocabulary stage: repurposed <unusedN> tokens that should "
+                         "become single tokens for domain names. Each TOKEN is a token "
+                         "string ('<unused6>', 'IceWing'), an id (6) or an id range "
+                         "(6-33). n x hidden trainable params, the table stays frozen. "
+                         "On a tied model (Gemma) the head columns for those tokens are "
+                         "the same rows (see --trainable-tokens-head). Mutually exclusive "
+                         "with --train-embeddings/--lora-embed. Saved to "
+                         "trainable_tokens.safetensors; applied by LoRA.from_directory "
+                         "and merge_lora_bf16.py.")
+    ap.add_argument("--trainable-tokens-init", default=None, metavar="JSON|FILE",
+                    help="Initialize trained token rows from a description: a JSON "
+                         "object (or path to a .json/.yaml file) mapping token -> text; "
+                         "the row starts at the MEAN of the base embedding rows of the "
+                         "text's tokens (and the head columns likewise under "
+                         "--trainable-tokens-head separate). Tokens not in the map "
+                         "start from their base row.")
+    ap.add_argument("--trainable-tokens-head", choices=["auto", "tied", "separate", "off"],
+                    default="auto",
+                    help="How the LM-head columns of --trainable-tokens train: auto = "
+                         "tied on a tie_word_embeddings model (one shared row per token, "
+                         "HF semantics), off otherwise; tied/separate/off force it. "
+                         "Anything but off routes the loss through the materialized "
+                         "supervised-position head (as --lora-head does).")
+    ap.add_argument("--trainable-tokens-lr", type=float, default=None,
+                    help="Learning rate for the trained token rows (their own param "
+                         "group, no weight decay, same schedule). Default: --lr. "
+                         "Embedding rows usually want a much higher LR than LoRA "
+                         "(1e-3..1e-2 when trained alone).")
     ap.add_argument("--module-lora-lr-mul", type=float, default=1.0,
+
                     help="LR multiplier for the embed/head LoRA adapters "
                          "(--lora-embed/--lora-head): their own optimizer param "
                          "group at lr * this, following the same schedule. S64 "
@@ -2303,6 +2473,9 @@ def _run_main():
         "lora_embed": int(bool(args.lora_embed)),
         "lora_head": int(bool(args.lora_head)),
         "module_lora_lr_mul": args.module_lora_lr_mul,
+        "lr_groups": describe_lr_groups(parse_lr_group_specs(args.lr_groups)),
+        "trainable_tokens": len(args.trainable_tokens) if args.trainable_tokens else "",
+        "trainable_tokens_lr": "" if args.trainable_tokens_lr is None else args.trainable_tokens_lr,
         "prompt_format": args.prompt_format,
     }
 
@@ -2410,7 +2583,36 @@ def _run_main():
     ms_dtype = torch.bfloat16 if args.offload_embed_head_optim else torch.float32
     _FAIL_CTX["phase"] = "build_net"
     _FAIL_CTX["record"]["arch"] = getattr(config, "architecture", "")
+    # Trained token rows (--trainable-tokens): resolve the token specs against
+    # the tokenizer, and the optional description init against the base table.
+    trainable_tokens = None
+    token_init = None
+    if args.trainable_tokens is not None:
+        if args.train_embeddings or args.lora_embed:
+            raise SystemExit("--trainable-tokens is mutually exclusive with "
+                             "--train-embeddings / --lora-embed (pick one embedding mode).")
+        _embed_mod, _blocks, _fnorm, _lm_head = _backbone_cfg.split_decoder(model)
+        _table = _backbone_cfg.embed_weight(_embed_mod)
+        trainable_tokens = resolve_trainable_tokens(tokenizer, args.trainable_tokens,
+                                                    _table.shape[0])
+        init_map = load_trainable_token_init_map(args.trainable_tokens_init)
+        head_w = (_backbone_cfg.head_weight_closure(_lm_head)()
+                  if (init_map and args.trainable_tokens_head == "separate") else None)
+        token_init, init_summary = build_trainable_token_init(
+            tokenizer, init_map, trainable_tokens, _table, head_w)
+        pieces = tokenizer.get_id_to_piece_list(include_special_tokens=True)
+        shown = ", ".join(f"{pieces[t] if t < len(pieces) else '?'}({t})"
+                          for t in trainable_tokens[:12])
+        print(f" -- trainable token rows: {len(trainable_tokens)} "
+              f"[{shown}{', ...' if len(trainable_tokens) > 12 else ''}]"
+              f"; head columns: {args.trainable_tokens_head}")
+        for tok, tid, n in init_summary:
+            print(f"      init {tok} ({tid}) <- mean of {n} description tokens")
+        del head_w, _table
+    elif args.trainable_tokens_init or args.trainable_tokens_lr is not None:
+        raise SystemExit("--trainable-tokens-init / --trainable-tokens-lr need --trainable-tokens.")
     net = NativeLlamaQLoRA(
+
         model, r=args.r, alpha=args.alpha, target_modules=args.targets,
         use_rslora=args.use_rslora,
         compute_dtype=cdt, gradient_checkpointing=not args.no_grad_ckpt,
@@ -2418,9 +2620,12 @@ def _run_main():
         attn_impl=args.attn_impl, head_vocab_chunk=args.head_vocab_chunk,
         modules_to_save_dtype=ms_dtype,
         lora_embed=args.lora_embed, lora_head=args.lora_head,
+        trainable_tokens=trainable_tokens, trainable_token_init=token_init,
+        trainable_tokens_head=args.trainable_tokens_head,
         offload_activations=args.offload_activations,
         offload_mode=args.offload_mode, use_liger=args.use_liger,
         expert_r=args.expert_r, lora_dropout=args.lora_dropout,
+
         # A bare --mtp-targets (empty list) means the default head target list;
         # the net reads None as that default ([] = load the head, adapt nothing
         # -- what the validate gate builds).
@@ -2764,20 +2969,31 @@ def _run_main():
     if args.module_lora_lr_mul != 1.0 and not (args.lora_embed or args.lora_head):
         raise SystemExit("--module-lora-lr-mul has nothing to scale without "
                          "--lora-embed and/or --lora-head.")
+    # Per-group LR knobs, shared by every param_groups() call below (the initial
+    # build and the cold restart on a mismatched resume): --lr-groups splits the
+    # per-linear adapters by module/layer, --trainable-tokens-lr sets the trained
+    # token rows' own group. Groups must be built identically on resume.
+    lr_groups = parse_lr_group_specs(args.lr_groups)
+    pg_kwargs = dict(base_lr=args.lr, module_lora_lr_mul=args.module_lora_lr_mul,
+                     lr_groups=lr_groups, trainable_tokens_lr=args.trainable_tokens_lr)
     if args.offload_embed_head_optim:
-        lora_groups = net.lora_param_groups(args.weight_decay, args.lr,
-                                            args.module_lora_lr_mul)
+        lora_groups = net.lora_param_groups(args.weight_decay, **pg_kwargs)
         opt = build_optimizer(lora_groups, args.lr, args.optim)
         offload_opt = build_cpu_offload_optimizer(net.modules_to_save_parameters(), args.lr)
         print(f" -- embed/head optimizer offloaded to CPU (torchao, bf16 stochastic "
               f"rounding); excluded from grad clip, follows the LoRA LR schedule")
     else:
-        opt = build_optimizer(net.param_groups(args.weight_decay, args.lr,
-                                               args.module_lora_lr_mul),
+        opt = build_optimizer(net.param_groups(args.weight_decay, **pg_kwargs),
                               args.lr, args.optim)
     if args.module_lora_lr_mul != 1.0:
         print(f" -- embed/head LoRA adapters in their own param group at "
               f"lr x {args.module_lora_lr_mul:g} = {args.lr * args.module_lora_lr_mul:.2e}")
+    for g in opt.param_groups:
+        if g.get("name"):
+            n_p = sum(p.numel() for p in g["params"])
+            print(f" -- param group '{g['name']}': {len(g['params'])} tensors, "
+                  f"{n_p:,} params at lr {g['lr']:.2e}"
+                  f"{'' if g.get('weight_decay') else ', no weight decay'}")
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     # 5a. Optionally restore optimizer/schedule/step from the resumed checkpoint so
@@ -2802,11 +3018,9 @@ def _run_main():
                 print(f" -- note: optimizer state in {args.resume} does not match "
                       f"the trunk+MTP parameter set ({e}); starting the optimizer "
                       f"and schedule cold (as --reset-optimizer).")
-                groups = (net.lora_param_groups(args.weight_decay, args.lr,
-                                                args.module_lora_lr_mul)
+                groups = (net.lora_param_groups(args.weight_decay, **pg_kwargs)
                           if args.offload_embed_head_optim else
-                          net.param_groups(args.weight_decay, args.lr,
-                                           args.module_lora_lr_mul))
+                          net.param_groups(args.weight_decay, **pg_kwargs))
                 opt = build_optimizer(groups, args.lr, args.optim)
                 sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
                 resume_state = None
@@ -3106,6 +3320,9 @@ def _run_main():
             "lora_embed": int(bool(args.lora_embed)),
             "lora_head": int(bool(args.lora_head)),
             "module_lora_lr_mul": args.module_lora_lr_mul,
+            "lr_groups": describe_lr_groups(parse_lr_group_specs(args.lr_groups)),
+            "trainable_tokens": len(args.trainable_tokens) if args.trainable_tokens else "",
+            "trainable_tokens_lr": "" if args.trainable_tokens_lr is None else args.trainable_tokens_lr,
             "trainable_params": net.num_trainable(), "n_train": len(examples),
             "n_val": len(val_examples), "n_eval2": len(val2_examples),
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
@@ -3364,6 +3581,7 @@ def _run_main():
                                    best_val=best_val, best_val_step=best_val_step,
                                    ema=ema, offload_opt=offload_opt)
                 print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
+                print_trainable_token_stats(net, tokenizer)
                 prune_checkpoints(args.out, args.keep_checkpoints)
 
             if prof is not None:

@@ -97,8 +97,10 @@ import contextlib
 import json
 import math
 import os
+import re
 import torch
 import torch.nn as nn
+
 import torch.nn.functional as F
 
 from . import backbone
@@ -322,9 +324,176 @@ def _rotate_half_neox(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _lr_group_layer_match(w, layers, block_meta) -> bool:
+    """Does wrapper ``w`` fall in the ``layers`` selection of an lr_groups spec?
+    Entries: block indices (int or "a-b" inclusive ranges, trunk blocks only),
+    or the keywords ``global_attention`` / ``sliding_attention`` (the HF
+    ``layer_types`` names: a block's attention is global when its metadata
+    ``sliding_window`` is -1). OR across entries."""
+    bi = getattr(w, "block_index", None)
+    if bi is None or getattr(w, "in_mtp", False):
+        return False
+    for ent in layers:
+        if isinstance(ent, str) and ent in ("global_attention", "sliding_attention"):
+            if block_meta is None or bi >= len(block_meta):
+                raise ValueError(f"lr_groups: '{ent}' needs the block metadata")
+            sw = int(block_meta[bi].get("sliding_window", -1) or -1)
+            if (sw <= 0) == (ent == "global_attention"):
+                return True
+            continue
+        if isinstance(ent, str) and "-" in ent.strip("-"):
+            lo, hi = ent.split("-", 1)
+            if int(lo) <= bi <= int(hi):
+                return True
+            continue
+        if bi == int(ent):
+            return True
+    return False
+
+
+def _lr_group_module_match(key: str, modules) -> bool:
+    """Does module ``key`` (the native key, e.g.
+    ``model.layers.5.self_attn.q_proj``) match one of the ``modules`` patterns?
+    A pattern is a plain SUBSTRING of the key (``layers.5.``, ``q_proj``,
+    ``language_model.layers.11.``) -- dots are literal, so ``layers.5.`` does
+    not catch layer 53 -- or, with a ``re:`` prefix, a regex searched in it."""
+    for pat in modules:
+        pat = str(pat)
+        if pat.startswith("re:"):
+            if re.search(pat[3:], key):
+                return True
+        elif pat in key:
+            return True
+    return False
+
+
+def parse_lr_group_specs(specs):
+    """Parse ``--lr-groups`` entries into the dict form ``NativeLlamaQLoRA.param_groups``
+    takes (``{"name", "lr" | "lr_mul", "modules": [...], "layers": [...]}``).
+
+    Each entry is a JSON object (what the YAML launcher forwards for an
+    ``lr_groups:`` list) or the compact ``NAME:LR:SEL[,SEL...]``: LR is absolute
+    (``1e-5``) or a multiplier on --lr (``x0.25``); a SEL is a block selector when
+    it is ``L<idx>`` / ``L<a>-<b>`` / ``global_attention`` / ``sliding_attention``,
+    otherwise a module-key substring (``layers.5.``, ``q_proj``) or ``re:<regex>``.
+    Returns ``None`` for no groups."""
+    if not specs:
+        return None
+    out = []
+    for i, s in enumerate(specs):
+        s = str(s).strip()
+        if not s:
+            continue
+        if s.startswith("{"):
+            d = json.loads(s)
+            if not isinstance(d, dict):
+                raise ValueError(f"--lr-groups entry {i}: expected a JSON object, got {s!r}")
+            out.append(d)
+            continue
+        parts = s.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError(f"--lr-groups entry {i}: expected NAME:LR:SEL[,SEL...] or a "
+                             f"JSON object, got {s!r}")
+        name, lr_s, sels = parts
+        d = {"name": name or f"lr_group_{i}"}
+        if lr_s.lower().startswith("x"):
+            d["lr_mul"] = float(lr_s[1:])
+        else:
+            d["lr"] = float(lr_s)
+        modules, layers = [], []
+        for sel in filter(None, (x.strip() for x in sels.split(","))):
+            if sel in ("global_attention", "sliding_attention"):
+                layers.append(sel)
+            elif re.fullmatch(r"L\d+(-\d+)?", sel):
+                body = sel[1:]
+                layers.append(body if "-" in body else int(body))
+            else:
+                modules.append(sel)
+        if modules:
+            d["modules"] = modules
+        if layers:
+            d["layers"] = layers
+        out.append(d)
+    return out or None
+
+
+def describe_lr_groups(groups) -> str:
+    """One-line summary of ``--lr-groups`` for the log / run CSV."""
+    if not groups:
+        return ""
+    parts = []
+    for g in groups:
+        lr = f"{g['lr']:.2e}" if "lr" in g else f"x{g['lr_mul']:g}"
+        sel = ",".join(list(map(str, g.get("modules") or [])) +
+                       [f"L{x}" if not str(x).endswith("_attention") else str(x)
+                        for x in (g.get("layers") or [])])
+        parts.append(f"{g.get('name', '?')}={lr}[{sel}]")
+    return " ".join(parts)
+
+
+def resolve_lr_groups(wrappers, block_meta, specs: list[dict], base_lr: float,
+                      weight_decay: float) -> tuple[list, list[dict]]:
+    """Split the adapted wrappers' LoRA params into the default group and one
+    optimizer param group per ``lr_groups`` spec (axolotl's ``lr_groups``
+    knob, extended with layer selection).
+
+    Each spec is a dict: ``name`` (label), ``lr`` (absolute) or ``lr_mul``
+    (times ``base_lr``), and the selection -- ``modules`` (key substrings /
+    ``re:`` regexes, see :func:`_lr_group_module_match`) and/or ``layers``
+    (block indices, ``"a-b"`` ranges, ``global_attention`` /
+    ``sliding_attention``; see :func:`_lr_group_layer_match`); a wrapper
+    must satisfy every selection key given (AND across keys, OR within one).
+    Specs apply in order, first match wins; a wrapper matched by none stays
+    in the default group. A spec that matches nothing is an error (a typo
+    would otherwise silently train at the base LR). Returns ``(default_params,
+    groups)`` with ``groups[i] = {"params", "lr", "weight_decay", "name"}``.
+    """
+    assigned: dict[int, int] = {}          # id(wrapper) -> spec index
+    for si, spec in enumerate(specs):
+        if not isinstance(spec, dict):
+            raise ValueError(f"lr_groups entry {si} must be a mapping, got {spec!r}")
+        modules = spec.get("modules") or []
+        layers = spec.get("layers") or []
+        if isinstance(modules, str):
+            modules = [modules]
+        if isinstance(layers, (str, int)):
+            layers = [layers]
+        if not modules and not layers:
+            raise ValueError(f"lr_groups entry {spec.get('name', si)!r} selects nothing "
+                             f"(give modules and/or layers)")
+        if ("lr" in spec) == ("lr_mul" in spec):
+            raise ValueError(f"lr_groups entry {spec.get('name', si)!r} needs exactly one "
+                             f"of lr / lr_mul")
+        hit = 0
+        for w in wrappers:
+            if id(w) in assigned:
+                continue
+            if modules and not _lr_group_module_match(w.key, modules):
+                continue
+            if layers and not _lr_group_layer_match(w, layers, block_meta):
+                continue
+            assigned[id(w)] = si
+            hit += 1
+        if hit == 0:
+            raise ValueError(
+                f"lr_groups entry {spec.get('name', si)!r} matched no adapted module "
+                f"(modules={modules}, layers={layers}); example keys: "
+                f"{[w.key for w in wrappers[:3]]}")
+    default: list = []
+    groups = [{"params": [], "weight_decay": weight_decay,
+               "lr": float(s["lr"]) if "lr" in s else float(base_lr) * float(s["lr_mul"]),
+               "name": str(s.get("name", f"lr_group_{i}"))}
+              for i, s in enumerate(specs)]
+    for w in wrappers:
+        si = assigned.get(id(w))
+        (default if si is None else groups[si]["params"]).extend([w.lora_a, w.lora_b])
+    return default, groups
+
+
 class DiffLinear(nn.Module):
     """
     Differentiable linear over a frozen native ``Linear`` module.
+
 
     The frozen effective weight is reconstructed on every call from the EXL3
     trellis (or read directly for an fp16 inner layer) via ``get_weight_tensor``
@@ -353,6 +522,15 @@ class DiffLinear(nn.Module):
     # linear to take trellis parts from, so it uses the legacy closure path.
     _trellis_parts = None
     _had = None
+
+    # Index of the decoder block this linear belongs to (0-based, within its
+    # own stack: the trunk's blocks, or the MTP head's), set by the net at
+    # construction; None for a headless / standalone wrapper. Read by the
+    # per-group learning-rate selection (``lr_groups``: ``layers`` / the
+    # ``global_attention`` / ``sliding_attention`` keywords).
+    block_index = None
+    in_mtp = False
+
 
     # Quantization-aware training mode (training.quant_aware): "" = off (the
     # default; eval/validate paths and pre-feature checkpoints are exact).
@@ -630,6 +808,11 @@ class NativeLlamaQLoRA(nn.Module):
     # logprobs in preference training (DPO/KTO) -- the PEFT "disable adapter"
     # trick, so no second model copy is ever loaded.
     _adapters_off = False
+    # Trained token rows (trainable_tokens): how the head columns for those
+    # tokens are handled ("tied" / "separate" / "off"). Class default for
+    # headless instances; the Parameters themselves are read via getattr.
+    trainable_tokens_head = "off"
+
     # EBFT feature taps (collect_hidden): (set[int] block idxs, [b,P] positions
     # or None) while active, else None. Class default so older pickles/subclasses
     # without the attribute still run the forward untapped.
@@ -667,9 +850,28 @@ class NativeLlamaQLoRA(nn.Module):
         mtp_targets: Optional[Iterable[str]] = None,
         mtp_loss_weight: float = 1.0,
         freeze_trunk: bool = False,
+        trainable_tokens: Optional[Iterable[int]] = None,
+        trainable_token_init: Optional[dict] = None,
+        trainable_tokens_head: str = "auto",
     ):
         """
+        ``trainable_tokens`` (optional): token ids whose EMBEDDING ROWS train
+        (PEFT ``trainable_token_indices`` / axolotl's row-sliced
+        ``unfrozen_parameters`` on ``embed_tokens``) while the rest of the
+        table stays frozen -- the "new vocabulary" stage: repurposed
+        ``<unusedN>`` tokens for names a domain needs as single tokens. Only
+        ``n x hidden`` fp32 parameters (+ Adam state), not the whole table.
+        ``trainable_token_init`` maps a token id to an initial row (``[hidden]``
+        tensor, raw table units, before the module's multiplier); ids not in
+        it start from the base row. ``trainable_tokens_head``: ``"auto"``
+        (the tied model's head columns for those tokens are the SAME trained
+        rows, as in HF where lm_head and embed_tokens share one tensor;
+        untied: head frozen), ``"tied"`` (force sharing), ``"separate"``
+        (own trainable head columns, init from the base head), ``"off"``.
+        See :meth:`trainable_token_parameters`.
+
         ``mtp_model`` (optional): the model's loaded MTP (multi-token
+
         prediction) head, ``Model.from_config(config, component="mtp")``, to
         train NEXT TO the trunk -- see :meth:`_forward_mtp`. ``mtp_targets``
         are the leaf names adapted inside the head (same vocabulary as
@@ -816,7 +1018,9 @@ class NativeLlamaQLoRA(nn.Module):
         has_mrope = False
         n_trunk_wrappers = 0
         for blk, wrap, out_blocks, out_meta, out_devs in plan:
+            n_wrappers_before = len(wrappers)
             backbone.assert_block_supported(blk)
+
             has_mrope = has_mrope or backbone.attn_has_mrope(blk)
             meta = backbone.block_metadata(blk)
             is_moe = meta.get("mlp_kind", "dense") == "moe"
@@ -1018,6 +1222,12 @@ class NativeLlamaQLoRA(nn.Module):
             out_blocks.append(entry)
             out_meta.append(meta)
             out_devs.append(backbone.block_device(blk))
+            # Tag every linear wrapped for this block with its block index (and
+            # which stack it is in), for the per-group LR selection.
+            for w in wrappers[n_wrappers_before:]:
+                w.block_index = len(out_blocks) - 1
+                w.in_mtp = out_blocks is not self.blocks
+
             if out_blocks is self.blocks:
                 n_trunk_wrappers = len(wrappers)   # plan is trunk-then-MTP
 
@@ -1266,6 +1476,69 @@ class NativeLlamaQLoRA(nn.Module):
             self.head_lora_b = nn.Parameter(torch.zeros(r, vocab, dtype=torch.float32, device=dev))
             init_lora_a_(self.head_lora_a, hid)
 
+        # --- trainable token rows (new-vocabulary stage) -----------------------
+        # A small set of embedding ROWS trains while the table stays frozen: the
+        # fp32 master is [n, hidden] (plus a [vocab] row map), so a 262k-vocab
+        # table costs nothing beyond the n rows. The forward looks the batch up
+        # in the frozen table and swaps the trained rows in at the positions
+        # whose token is in the set (masked_scatter, differentiable w.r.t. the
+        # rows). On a tied model the same rows are the head's columns for those
+        # tokens (HF semantics: one shared tensor), so the loss runs through the
+        # materialized supervised-position head with those columns replaced.
+        self.token_ids = None            # [n] long, sorted unique ids, or None
+        self.token_rows = None           # [n, d] fp32 Parameter (embedding rows)
+        self.head_token_rows = None      # None | token_rows (tied) | own [n, d] Parameter
+        self._token_row_map = None       # [vocab] long: id -> row index, -1 = frozen
+        self._token_init_rows = None     # [n, d] fp32 CPU snapshot of the init rows (stats)
+        self.trainable_tokens_head = "off"
+        if trainable_tokens is not None:
+            ids = sorted({int(t) for t in trainable_tokens})
+            if not ids:
+                raise ValueError("trainable_tokens is empty")
+            if self.train_embeddings or self.lora_embed:
+                raise ValueError("trainable_tokens and train_embeddings/lora_embed both "
+                                 "train the embedding; pick one")
+            table = backbone.embed_weight(self.embed)                       # [V, d]
+            vocab, hid = table.shape
+            if ids[0] < 0 or ids[-1] >= vocab:
+                raise ValueError(f"trainable_tokens ids must be in [0, {vocab}); got "
+                                 f"{ids[0]}..{ids[-1]}")
+            dev = self._block_devices[0]
+            self.token_ids = torch.tensor(ids, dtype=torch.long)
+            rows = table[self.token_ids.to(table.device)].detach().to(torch.float32).clone()  # [n, d]
+            if trainable_token_init:
+                for i, tid in enumerate(ids):
+                    v = trainable_token_init.get(tid)
+                    if v is not None:
+                        rows[i] = torch.as_tensor(v, dtype=torch.float32).reshape(hid)
+            self._token_init_rows = rows.clone().cpu()
+            self.token_rows = nn.Parameter(rows.to(dev))
+            row_map = torch.full((vocab,), -1, dtype=torch.long)
+            row_map[self.token_ids] = torch.arange(len(ids))
+            self._token_row_map = row_map.to(dev)
+            mode = trainable_tokens_head
+            if mode == "auto":
+                mode = "tied" if self.tie_word_embeddings else "off"
+            if mode not in ("tied", "separate", "off"):
+                raise ValueError(f"bad trainable_tokens_head {trainable_tokens_head!r}")
+            if mode != "off" and (self.train_head or self.lora_head):
+                raise ValueError("trainable_tokens_head and train_head/lora_head both "
+                                 "train the LM head columns; pick one")
+            if mode == "tied":
+                self.head_token_rows = self.token_rows
+            elif mode == "separate":
+                hw = backbone.head_weight_closure(self.lm_head)()            # [d, V]
+                hid_h = hw.shape[0]
+                cols = hw[:, self.token_ids.to(hw.device)].detach().t().to(torch.float32)  # [n, d]
+                if trainable_token_init:
+                    for i, tid in enumerate(ids):
+                        v = trainable_token_init.get(("head", tid))
+                        if v is not None:
+                            cols[i] = torch.as_tensor(v, dtype=torch.float32).reshape(hid_h)
+                self.head_token_rows = nn.Parameter(cols.to(self._head_device))
+            self.trainable_tokens_head = mode
+
+
         # --- freeze the trunk (MTP-only stage 2) ------------------------------
         # Every trunk-side trainable keeps its VALUE (a resumed trunk adapter
         # still applies in the forward, and save_adapter still exports it) but
@@ -1285,9 +1558,11 @@ class NativeLlamaQLoRA(nn.Module):
                     w.lora_a.requires_grad_(False)
                     w.lora_b.requires_grad_(False)
             for p in (self.embed_weight, self.head_weight, self.embed_lora_a,
-                      self.embed_lora_b, self.head_lora_a, self.head_lora_b):
+                      self.embed_lora_b, self.head_lora_a, self.head_lora_b,
+                      self.token_rows, self.head_token_rows):
                 if p is not None:
                     p.requires_grad_(False)
+
 
     def trunk_trainable(self) -> bool:
         """True when anything OUTSIDE the MTP head can receive a gradient: a
@@ -1299,12 +1574,14 @@ class NativeLlamaQLoRA(nn.Module):
         for w in self._wrappers:
             if w.r > 0 and id(w) not in mtp_ids and w.lora_a.requires_grad:
                 return True
-        for p in self.module_lora_parameters() + self.modules_to_save_parameters():
+        for p in (self.module_lora_parameters() + self.modules_to_save_parameters()
+                  + self.trainable_token_parameters()):
             if p.requires_grad:
                 return True
         return False
 
     # --- forward -----------------------------------------------------------
+
 
     def _norm(self, x: torch.Tensor, spec: dict) -> torch.Tensor:
         # Reproduces RMSNorm.forward_torch exactly for any arch: normalize in fp32,
@@ -2430,7 +2707,26 @@ class NativeLlamaQLoRA(nn.Module):
             eb = self.embed_lora_b.to(self.compute_dtype)
             delta = F.embedding(input_ids.to(ea.device), ea) @ eb       # [b, t, hid]
             hidden = hidden + self._module_lora_scale * delta.to(hidden.device).to(hidden.dtype)
+
+        # Trainable token rows: positions whose token is in the trained set take
+        # the trained row (with the module's multiplier / normalize applied, like
+        # the frozen path) instead of the frozen table's. masked_scatter is
+        # differentiable w.r.t. the rows; the frozen lookup carries no grad.
+        tr = getattr(self, "token_rows", None)
+        if tr is not None and not self._adapters_off:
+            rmap = self._token_row_map
+            m = rmap[input_ids.to(rmap.device)]                        # [b, t] row idx / -1
+            sel = m >= 0
+            if bool(sel.any()):
+                rows = backbone.embed_apply(self.embed, tr[m[sel]])     # [k, d] fp32
+                rows = rows.to(hidden.device).to(hidden.dtype)
+                hidden = hidden.masked_scatter(sel.to(hidden.device).unsqueeze(-1), rows)
+            else:
+                # No trained token in this batch: keep the rows on the graph so
+                # every step touches the same trainable surface (0 grad).
+                hidden = hidden + (tr.sum() * 0.0).to(hidden.device).to(hidden.dtype)
         return hidden
+
 
     def _run_block(self, meta, entry, hidden, position_ids, dev, ctx, ckpt):
         """One decoder block (trunk or MTP head) on ``hidden``, dispatching on
@@ -2907,11 +3203,13 @@ class NativeLlamaQLoRA(nn.Module):
         # A frozen softcapped head (Gemma) stays on the fused paths below, which
         # apply the tanh cap in-tile. Under adapters_disabled() the trainable/
         # LoRA head is part of the adapter, so the frozen fused path is used.
-        if (self.train_head or self.lora_head) and not self._adapters_off:
+        htr = getattr(self, "head_token_rows", None)
+        if (self.train_head or self.lora_head or htr is not None) and not self._adapters_off:
             d = hidden.shape[-1]
             hs = hidden[:, :-1, :].reshape(-1, d)                 # shift
             lbl = labels[:, 1:].reshape(-1).to(hs.device)
             valid = lbl != ignore_index
+
             # train_head -> the trainable full head; otherwise the frozen head weight
             # (a lora_head delta is added to its logits below).
             w = self.head_weight if self.train_head else self.lm_head_weight_fn()()  # [d, V]
@@ -2930,7 +3228,10 @@ class NativeLlamaQLoRA(nn.Module):
                     z = z + w.sum() * 0.0
                 if self.lora_head:
                     z = z + self.head_lora_a.sum() * 0.0 + self.head_lora_b.sum() * 0.0
+                if htr is not None:
+                    z = z + (htr.sum() * 0.0).to(z.device)
                 return z
+
             hs = backbone.to_device(hs[valid], w.device).to(w.dtype)
             # Keep logits in the head's dtype: an extra fp32 copy of [supervised
             # tokens, vocab] doubles the single biggest allocation on the head device
@@ -2949,7 +3250,15 @@ class NativeLlamaQLoRA(nn.Module):
                 ha = self.head_lora_a.to(hs.dtype)
                 hb = self.head_lora_b.to(hs.dtype)
                 logits = logits + self._module_lora_scale * ((hs @ ha) @ hb)
+            if htr is not None:
+                # Trained head columns: the logits of the trained tokens come
+                # from the trained rows (out-of-place index_copy keeps the
+                # [tokens, vocab] buffer count at one and is differentiable
+                # w.r.t. the rows). Same dtype rule as the head LoRA above.
+                cols = hs @ htr.to(hs.device).to(hs.dtype).t()        # [tokens, n]
+                logits = logits.index_copy(1, self.token_ids.to(logits.device), cols)
             if self.final_softcap:
+
                 # In place: the out-of-place chain (`cap * tanh(logits / cap)`)
                 # holds three [supervised, vocab] buffers at its peak; div_/tanh_
                 # reuse the logits buffer so the peak is two. Safe: matmul/add
@@ -3162,9 +3471,25 @@ class NativeLlamaQLoRA(nn.Module):
                 ps += [w.lora_a, w.lora_b]
         # Embed/head LoRA adapters are small and GPU-resident (never offloaded), so
         # they ride with the per-linear LoRA: optimized by the main optimizer and
-        # included in the grad clip.
+        # included in the grad clip. Trained token rows likewise.
         ps += self.module_lora_parameters()
+        ps += self.trainable_token_parameters()
         return [p for p in ps if p.requires_grad]
+
+    def trainable_token_parameters(self) -> list[nn.Parameter]:
+        """The trained embedding rows (``trainable_tokens``) and, when the head
+        columns train separately, those too. A tied head shares the embedding
+        rows (one Parameter), listed once. Read via getattr so a headless
+        instance returns []."""
+        ps: list[nn.Parameter] = []
+        tr = getattr(self, "token_rows", None)
+        if tr is not None:
+            ps.append(tr)
+        htr = getattr(self, "head_token_rows", None)
+        if htr is not None and htr is not tr:
+            ps.append(htr)
+        return [p for p in ps if p.requires_grad]
+
 
     def module_lora_parameters(self) -> list[nn.Parameter]:
         """LoRA adapters on the embedding / LM head (lora_embed / lora_head), if any.
@@ -3199,33 +3524,82 @@ class NativeLlamaQLoRA(nn.Module):
         return self.lora_parameters() + self.modules_to_save_parameters()
 
     def lora_param_groups(self, weight_decay: float, base_lr: float | None = None,
-                          module_lora_lr_mul: float = 1.0) -> list[dict]:
+                          module_lora_lr_mul: float = 1.0,
+                          lr_groups: Optional[list[dict]] = None,
+                          trainable_tokens_lr: float | None = None) -> list[dict]:
         """LoRA-only param groups. With ``module_lora_lr_mul != 1`` the embed/head
         LoRA adapters get their OWN group at ``base_lr * module_lora_lr_mul``
         (S64: at the shared LR the head LoRA lands ~8x short of its optimum on
         its own descent direction). The per-linear group stays group 0, whose LR
-        the log line and the offload-optimizer mirror read."""
+        the log line and the offload-optimizer mirror read.
+
+        ``lr_groups`` (axolotl's ``lr_groups``): per-linear adapters whose
+        module matches a group spec leave group 0 for that group's own LR --
+        see :func:`resolve_lr_groups` for the spec format (``modules``
+        substrings / ``re:`` regexes, ``layers`` indices, the
+        ``global_attention`` / ``sliding_attention`` keywords). Those groups
+        follow group 0 in spec order, each carrying its ``name``. Trained token
+        rows (``trainable_tokens``) get a weight-decay-free group of their own
+        (at ``trainable_tokens_lr`` when given, else the base LR), last."""
         per_linear: list[nn.Parameter] = []
         for w in self._wrappers:
             if w.r > 0 and w.lora_a.requires_grad:
                 per_linear += [w.lora_a, w.lora_b]
+        extra: list[dict] = []
+        if lr_groups:
+            assert base_lr is not None, "lr_groups need base_lr"
+            per_linear, extra = resolve_lr_groups(
+                [w for w in self._wrappers if w.r > 0 and w.lora_a.requires_grad],
+                getattr(self, "_block_meta", None), lr_groups, base_lr, weight_decay)
         mod = self.module_lora_parameters()
         if not mod or module_lora_lr_mul == 1.0:
-            return [{"params": per_linear + mod, "weight_decay": weight_decay}]
-        assert base_lr is not None, "module_lora_lr_mul != 1 needs base_lr"
-        return [{"params": per_linear, "weight_decay": weight_decay},
-                {"params": mod, "weight_decay": weight_decay,
-                 "lr": base_lr * module_lora_lr_mul}]
+            groups = [{"params": per_linear + mod, "weight_decay": weight_decay}]
+        else:
+            assert base_lr is not None, "module_lora_lr_mul != 1 needs base_lr"
+            groups = [{"params": per_linear, "weight_decay": weight_decay},
+                      {"params": mod, "weight_decay": weight_decay,
+                       "lr": base_lr * module_lora_lr_mul}]
+        groups += extra
+        tok = self.trainable_token_parameters()
+        if tok:
+            g = {"params": tok, "weight_decay": 0.0, "name": "trainable_tokens"}
+            if trainable_tokens_lr is not None:
+                g["lr"] = float(trainable_tokens_lr)
+            groups.append(g)
+        return groups
 
     def param_groups(self, weight_decay: float, base_lr: float | None = None,
-                     module_lora_lr_mul: float = 1.0) -> list[dict]:
+                     module_lora_lr_mul: float = 1.0,
+                     lr_groups: Optional[list[dict]] = None,
+                     trainable_tokens_lr: float | None = None) -> list[dict]:
         """Optimizer param groups: weight decay on the LoRA params, but NONE on
         the full embed/head (weight-decaying a whole embedding table is harmful)."""
-        groups = self.lora_param_groups(weight_decay, base_lr, module_lora_lr_mul)
+        groups = self.lora_param_groups(weight_decay, base_lr, module_lora_lr_mul,
+                                        lr_groups, trainable_tokens_lr)
         ms = self.modules_to_save_parameters()
         if ms:
             groups.append({"params": ms, "weight_decay": 0.0})
         return groups
+
+    @torch.no_grad()
+    def trainable_token_stats(self) -> list[dict]:
+        """Per trained token: cosine to its init row, relative move
+        ``|row - init| / |init|`` and ``|row| / |init|`` -- the three numbers
+        to watch on a new-vocabulary stage (an untouched row reads 1 / 0 / 1;
+        a row that has drifted far from a description init may be forgetting
+        it). Empty without trainable tokens."""
+        tr = getattr(self, "token_rows", None)
+        if tr is None:
+            return []
+        cur = tr.detach().float().cpu()
+        init = self._token_init_rows.float()
+        cos = F.cosine_similarity(cur, init, dim=-1)
+        move = (cur - init).norm(dim=-1) / init.norm(dim=-1).clamp_min(1e-12)
+        nrm = cur.norm(dim=-1) / init.norm(dim=-1).clamp_min(1e-12)
+        return [{"token_id": int(t), "cos_to_init": float(c), "rel_move": float(m),
+                 "norm_ratio": float(n)}
+                for t, c, m, n in zip(self.token_ids.tolist(), cos, move, nrm)]
+
 
     def num_trainable(self) -> int:
         return sum(p.numel() for p in self.trainable_parameters())
@@ -3276,6 +3650,48 @@ class NativeLlamaQLoRA(nn.Module):
             # trainer's master is [in, r].
             backbone.set_runtime_lora(w.linear, self, a.t().contiguous().to(torch.float16),
                                       b.to(torch.float16))
+        self._apply_token_rows_to_native(scaling)
+
+    # Backup of the native embedding's original rows while the trained rows
+    # are swapped in (apply_to_native); None when not applied.
+    _native_token_rows_backup = None
+
+    @torch.no_grad()
+    def _apply_token_rows_to_native(self, scaling: float = 1.0) -> None:
+        """Push the trained token rows into the native model so generation
+        reflects them: the embedding rows are overwritten in place (backed up
+        for :meth:`remove_from_native`), and trained head columns ride the
+        head Linear's runtime LoRA slot as a rank-n adapter -- A = the column
+        deltas ``[n, d]``, B = a one-hot column selector ``[n, V]`` -- so no
+        full head copy is needed. ``scaling`` interpolates the delta from the
+        base (0) to the trained rows (1)."""
+        tr = getattr(self, "token_rows", None)
+        if tr is None:
+            return
+        table = getattr(self.embed, "embedding", None)
+        w = getattr(table, "weight", None)
+        if w is None:
+            if not getattr(self, "_warned_token_rows_apply", False):
+                self._warned_token_rows_apply = True
+                print(" -- warning: the native embedding is a streamed/quantized table; "
+                      "live samples will NOT reflect the trained token rows.")
+            return
+        ids = self.token_ids.to(w.device)
+        if self._native_token_rows_backup is None:
+            self._native_token_rows_backup = w.data[ids].clone()
+        base = self._native_token_rows_backup.to(torch.float32)
+        new = base + scaling * (tr.detach().to(base.device).to(torch.float32) - base)
+        w.data[ids] = new.to(w.dtype)
+        htr = getattr(self, "head_token_rows", None)
+        if htr is not None and self.trainable_tokens_head != "off":
+            hw = backbone.head_weight_closure(self.lm_head)()                  # [d, V]
+            hid, vocab = hw.shape
+            hids = self.token_ids.to(hw.device)
+            base_cols = hw[:, hids].t().to(torch.float32)                      # [n, d]
+            delta = scaling * (htr.detach().to(base_cols.device).to(torch.float32) - base_cols)
+            sel = torch.zeros(len(self.token_ids), vocab, dtype=torch.float16, device=hw.device)
+            sel[torch.arange(len(self.token_ids), device=hw.device), hids] = 1.0
+            backbone.set_runtime_lora(self.lm_head, self, delta.to(torch.float16).contiguous(), sel)
 
     @torch.no_grad()
     def remove_from_native(self) -> None:
@@ -3284,6 +3700,13 @@ class NativeLlamaQLoRA(nn.Module):
             if w.r <= 0:
                 continue
             backbone.clear_runtime_lora(w.linear, self)
+        if self._native_token_rows_backup is not None:
+            w = self.embed.embedding.weight
+            w.data[self.token_ids.to(w.device)] = self._native_token_rows_backup.to(w.dtype)
+            self._native_token_rows_backup = None
+            if getattr(self, "head_token_rows", None) is not None:
+                backbone.clear_runtime_lora(self.lm_head, self)
+
 
     # --- idle offload (serve-only VRAM squeeze) -----------------------------
 
@@ -3481,8 +3904,22 @@ class NativeLlamaQLoRA(nn.Module):
         if ml_state:
             save_file(ml_state, os.path.join(directory, "lora_modules.safetensors"))
 
-        if not (state or ms_state or ml_state):
+        # Trained token rows (trainable_tokens): a third SEPARATE file -- the
+        # ids and the fp32 rows (exact for resume; tiny: n x hidden), plus the
+        # head columns when they train separately. A tied head shares the
+        # embedding rows and is marked in the config instead of duplicated.
+        tt_state: dict[str, torch.Tensor] = {}
+        tr = getattr(self, "token_rows", None)
+        if tr is not None:
+            tt_state["embed_tokens.token_ids"] = self.token_ids.detach().cpu()
+            tt_state["embed_tokens.rows"] = tr.detach().to(torch.float32).cpu()
+            if self.trainable_tokens_head == "separate":
+                tt_state["lm_head.rows"] = self.head_token_rows.detach().to(torch.float32).cpu()
+            save_file(tt_state, os.path.join(directory, "trainable_tokens.safetensors"))
+
+        if not (state or ms_state or ml_state or tt_state):
             raise ValueError("No trainable adapters to save.")
+
 
         config = {
             "peft_type": "LORA",
@@ -3507,7 +3944,13 @@ class NativeLlamaQLoRA(nn.Module):
             # the module scale explicitly so a loader never has to guess.
             **({"module_lora_scale": self._module_lora_scale} if module_lora else {}),
             "tie_word_embeddings": self.tie_word_embeddings,
+            # Trained token rows (trainable_tokens.safetensors): the ids and
+            # whether the head columns for them are the same rows (tied), their
+            # own tensor (separate) or frozen (off).
+            **({"trainable_tokens": self.token_ids.tolist(),
+                "trainable_tokens_head": self.trainable_tokens_head} if tt_state else {}),
             "base_model_name_or_path": base_model_name_or_path,
+
             # Provenance: how the adapter was initialized. For pissa the
             # exported r/alpha above describe the CONVERTED rank-2r tensors;
             # init_lora_r is the rank that actually trained.
@@ -3528,6 +3971,9 @@ class NativeLlamaQLoRA(nn.Module):
             json.dump(config, f, indent=2)
         extra = f" + modules_to_save {modules_to_save}" if modules_to_save else ""
         extra += f" + module_lora {module_lora}" if module_lora else ""
+        extra += (f" + {len(self.token_ids)} trained token rows"
+                  f" (head: {self.trainable_tokens_head})") if tt_state else ""
+
         print(f" -- saved native QLoRA adapter ({len(target_leaves)} target types"
               f"{extra}) to {directory}")
 
@@ -3665,8 +4111,30 @@ class NativeLlamaQLoRA(nn.Module):
                     restored_extra += 1
             print(f" -- resumed embed/head LoRA from {directory}")
 
+        # Restore trained token rows if present and currently enabled. The id
+        # set must match (the rows are positional); a different set is a
+        # config change, not a resume.
+        tt_path = os.path.join(directory, "trainable_tokens.safetensors")
+        if os.path.exists(tt_path) and getattr(self, "token_rows", None) is not None:
+            tt = load_file(tt_path)
+            saved_ids = tt["embed_tokens.token_ids"].tolist()
+            if saved_ids != self.token_ids.tolist():
+                raise ValueError(
+                    f"trainable_tokens in {directory} ({len(saved_ids)} ids) do not "
+                    f"match the current set ({len(self.token_ids)} ids); resume with "
+                    f"the same --trainable-tokens")
+            with torch.no_grad():
+                self.token_rows.copy_(tt["embed_tokens.rows"].to(
+                    self.token_rows.dtype).to(self.token_rows.device))
+                if self.trainable_tokens_head == "separate" and "lm_head.rows" in tt:
+                    self.head_token_rows.copy_(tt["lm_head.rows"].to(
+                        self.head_token_rows.dtype).to(self.head_token_rows.device))
+            restored_extra += 1
+            print(f" -- resumed {len(saved_ids)} trained token rows from {directory}")
+
         if loaded == 0 and restored_extra == 0:
             raise ValueError("No trainable adapters matched the checkpoint.")
+
 
         if fresh_mtp:
             print(f" -- note: {directory} carries no MTP head adapters; {fresh_mtp} "

@@ -811,6 +811,163 @@ def test_mtp_head_matches_reference_and_trains_head_only():
     print("[mtp] freeze_trunk: trunk adapters drop out of the trainable set, head stays")
 
 
+def test_lr_groups_param_groups():
+    # --lr-groups: adapted wrappers matched by module substring / regex / block
+    # index / attention kind leave group 0 for a group at their own LR; first
+    # match wins; the spec parser accepts JSON and the compact NAME:LR:SEL form.
+    parse = _nl.parse_lr_group_specs
+    resolve = _nl.resolve_lr_groups
+    d, r = 8, 2
+    wrappers, meta = [], []
+    for bi in range(6):
+        meta.append({"sliding_window": -1 if bi % 3 == 2 else 65})   # blocks 2, 5 global
+        for leaf in ("self_attn.q_proj", "mlp.down_proj"):
+            w = DiffLinear(MockLinear(d, d, f"model.language_model.layers.{bi}.{leaf}",
+                                      dtype=torch.float32), r=r, compute_dtype=torch.float32)
+            w.block_index = bi
+            wrappers.append(w)
+
+    specs = parse(['{"name": "global_attn", "lr": 1e-5, "layers": ["global_attention"]}',
+                   "mlp_lo:x0.5:down_proj",
+                   "early:2e-4:L0-1"])
+    assert specs[0] == {"name": "global_attn", "lr": 1e-5, "layers": ["global_attention"]}
+    assert specs[1] == {"name": "mlp_lo", "lr_mul": 0.5, "modules": ["down_proj"]}
+    assert specs[2] == {"name": "early", "lr": 2e-4, "layers": ["0-1"]}
+    default, groups = resolve(wrappers, meta, specs, base_lr=4e-5, weight_decay=0.01)
+    by_name = {g["name"]: g for g in groups}
+    assert by_name["global_attn"]["lr"] == 1e-5 and by_name["mlp_lo"]["lr"] == 2e-5
+    # blocks 2 and 5 (both linears) -> global_attn; remaining down_projs -> mlp_lo;
+    # q_proj of blocks 0, 1 -> early; q_proj of blocks 3, 4 -> default.
+    assert len(by_name["global_attn"]["params"]) == 2 * 2 * 2
+    assert len(by_name["mlp_lo"]["params"]) == 4 * 2
+    assert len(by_name["early"]["params"]) == 2 * 2
+    assert len(default) == 2 * 2
+    assert all(g["weight_decay"] == 0.01 for g in groups)
+    # Dotted substrings are literal: "layers.1." must not catch layer 10+.
+    w10 = DiffLinear(MockLinear(d, d, "model.layers.10.self_attn.q_proj", dtype=torch.float32),
+                     r=r, compute_dtype=torch.float32)
+    w10.block_index = 10
+    w1 = wrappers[2]
+    dflt, grp = resolve([w1, w10], meta + [{}] * 5,
+                        [{"name": "l1", "lr": 1e-6, "modules": ["layers.1."]}], 4e-5, 0.0)
+    assert grp[0]["params"] == [w1.lora_a, w1.lora_b] and dflt == [w10.lora_a, w10.lora_b]
+    # Regex selector, AND across modules + layers, and a group matching nothing errors.
+    _, grp = resolve(wrappers, meta, [{"name": "re", "lr": 1.0,
+                                       "modules": [r"re:layers\.[01]\.mlp"], "layers": [1]}],
+                     4e-5, 0.0)
+    assert len(grp[0]["params"]) == 2
+    for bad in ([{"name": "typo", "lr": 1e-5, "modules": ["layers.99."]}],
+                [{"name": "nolr", "modules": ["q_proj"]}],
+                [{"name": "both", "lr": 1.0, "lr_mul": 1.0, "modules": ["q_proj"]}]):
+        try:
+            resolve(wrappers, meta, bad, 4e-5, 0.0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad}")
+
+    # Through the net: param_groups keeps group 0 first, then the named groups,
+    # then the (no weight decay) token-row group; the optimizer takes them.
+    net = NativeLlamaQLoRA.__new__(NativeLlamaQLoRA)
+    nn.Module.__init__(net)
+    net._wrappers = wrappers
+    net._block_meta = meta
+    net.embed_weight = net.head_weight = None
+    net.token_rows = nn.Parameter(torch.zeros(3, d))
+    net.head_token_rows = net.token_rows          # tied: listed once
+    groups = net.param_groups(0.01, base_lr=4e-5, lr_groups=specs[:1], trainable_tokens_lr=1e-3)
+    assert [g.get("name") for g in groups] == [None, "global_attn", "trainable_tokens"]
+    assert groups[2]["params"] == [net.token_rows] and groups[2]["lr"] == 1e-3 \
+        and groups[2]["weight_decay"] == 0.0
+    assert sum(len(g["params"]) for g in groups) == 2 * len(wrappers) + 1
+    opt = torch.optim.AdamW(groups, lr=4e-5)
+    assert [g["lr"] for g in opt.param_groups] == [4e-5, 1e-5, 1e-3]
+    assert _nl.describe_lr_groups(specs).startswith("global_attn=1.00e-05[global_attention]")
+    print("[lr_groups] module/layer/attention-kind selection, parsing, param groups PASSED")
+
+
+def test_trainable_token_rows_embed_and_head():
+    # --trainable-tokens: the embedding positions whose token is in the set take
+    # the trained row (through the module's multiplier); the frozen table gets
+    # no gradient, the rows do, and a batch without any trained token still
+    # keeps the rows on the graph. On the head side (tied), the logits of the
+    # trained tokens come from the same rows -- against a plain-torch
+    # reference with those head columns replaced.
+    torch.manual_seed(3)
+    V, d, n = 20, 6, 3
+    table = nn.Embedding(V, d)
+    table.weight.requires_grad_(False)
+    ids_trained = torch.tensor([4, 9, 17])
+    rows = nn.Parameter(torch.randn(n, d))
+    net = _headless_net()
+    nn.Module.__init__(net)
+    net.compute_dtype = torch.float32
+    net._adapters_off = False
+    net.embed_weight = None
+    net.embed_lora_a = net.embed_lora_b = None
+    net.embed = types.SimpleNamespace(embedding=table, multiplier=2.0, normalize=False)
+    net.token_ids = ids_trained
+    net.token_rows = rows
+    rmap = torch.full((V,), -1, dtype=torch.long)
+    rmap[ids_trained] = torch.arange(n)
+    net._token_row_map = rmap
+    net._token_init_rows = rows.detach().clone()
+
+    ids = torch.tensor([[1, 4, 9, 2], [17, 17, 3, 0]])
+    out = net._embed(ids, torch.device("cpu"))
+    ref = 2.0 * table.weight[ids]
+    for b in range(2):
+        for t in range(4):
+            tok = int(ids[b, t])
+            if tok in ids_trained.tolist():
+                ref[b, t] = 2.0 * rows[rmap[tok]]
+    assert torch.allclose(out, ref, atol=1e-6)
+    out.pow(2).sum().backward()
+    assert rows.grad is not None and rows.grad.abs().sum() > 0
+    assert rows.grad[rmap[17]].abs().sum() > 0 and table.weight.grad is None
+    rows.grad = None
+    # No trained token in the batch: finite, exact frozen lookup, rows still on the graph.
+    out2 = net._embed(torch.tensor([[1, 2, 3]]), torch.device("cpu"))
+    assert torch.allclose(out2, 2.0 * table.weight[torch.tensor([[1, 2, 3]])])
+    assert out2.requires_grad
+    # Adapter disabled -> pure frozen path.
+    net._adapters_off = True
+    assert torch.allclose(net._embed(ids, torch.device("cpu")), 2.0 * table.weight[ids])
+    net._adapters_off = False
+    # Stats: untouched rows read cos 1 / move 0 / norm 1.
+    st = net.trainable_token_stats()
+    assert [s["token_id"] for s in st] == [4, 9, 17]
+    assert all(abs(s["cos_to_init"] - 1) < 1e-6 and s["rel_move"] < 1e-6 for s in st)
+
+    # Head: tied rows replace the head columns of the trained tokens.
+    W = torch.randn(d, V) * 0.3                        # frozen head [hidden, vocab]
+    net.train_head = net.lora_head = False
+    net.final_softcap = 0.0
+    net.head_vocab_chunk = 0
+    net._head_slice = None
+    net._head_device = torch.device("cpu")
+    net.lm_head_weight_fn = lambda: (lambda: W.clone())
+    net.head_token_rows = rows
+    hidden = torch.randn(2, 5, d, requires_grad=True)
+    labels = torch.tensor([[-100, 4, 7, 9, 1], [-100, -100, 17, 2, 3]])
+    loss = net._head_loss(hidden, labels)
+    W_ref = W.clone()
+    W_ref[:, ids_trained] = rows.detach().t()
+    logits = hidden[:, :-1].reshape(-1, d) @ W_ref
+    lbl = labels[:, 1:].reshape(-1)
+    ref_loss = F.cross_entropy(logits[lbl != -100], lbl[lbl != -100])
+    assert torch.allclose(loss, ref_loss, atol=1e-6), (loss.item(), ref_loss.item())
+    loss.backward()
+    assert rows.grad is not None and rows.grad.abs().sum() > 0 and hidden.grad is not None
+    # Softcap applies after the column swap (Gemma).
+    net.final_softcap = 30.0
+    loss_c = net._head_loss(hidden.detach(), labels)
+    ref_c = F.cross_entropy((30.0 * torch.tanh(logits / 30.0))[lbl != -100], lbl[lbl != -100])
+    assert torch.allclose(loss_c, ref_c, atol=1e-6)
+    print("[trainable_tokens] embed row swap + tied head columns match reference, "
+          "rows get gradient, table frozen PASSED")
+
+
 def main():
     from util import run_timed
     run_timed([
@@ -826,6 +983,8 @@ def main():
         test_modules_to_save_param_groups,
         test_head_logits_vocab_chunked,
         test_mtp_head_matches_reference_and_trains_head_only,
+        test_lr_groups_param_groups,
+        test_trainable_token_rows_embed_and_head,
     ], label="native-llama")
     print("\nAll native-Llama differentiable-forward checks passed.")
 

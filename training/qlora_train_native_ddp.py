@@ -46,6 +46,7 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qlora_train_native import (  # noqa: E402
     build_sft_examples, build_lm_examples, pack_examples, collate, make_lr_scheduler,
+    parse_lr_group_specs,
     resolve_steps_and_warmup, ThroughputMeter, StepTimer, append_run_log,
     checkpoint_dir, prune_checkpoints,
     save_trainer_state, load_trainer_state, restore_optimizer_state,
@@ -141,8 +142,13 @@ def _run_main():
                     help="Token budget for the --init-lora eva activation "
                          "pre-pass (rank 0 only; result is broadcast).")
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr-groups", "--lr-group", nargs="*", default=None, dest="lr_groups",
+                    metavar="SPEC",
+                    help="Per-module-group learning rates; same SPEC syntax as the "
+                         "single-GPU trainer (JSON object or NAME:LR:SEL[,SEL...]).")
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
+
     ap.add_argument("--scheduler", choices=["none", "linear", "cosine"],
                     default="none",
                     help="LR schedule after warmup: none/linear/cosine (to 0).")
@@ -707,7 +713,15 @@ def _run_main():
             print(f"\n\U0001f3ad  baseline (step 0): {args.sample_prompt}\n     -> {base}\n")
         dist.barrier()
 
-    opt = torch.optim.AdamW(net.param_groups(args.weight_decay), lr=args.lr)
+    lr_groups = parse_lr_group_specs(args.lr_groups)
+    opt = torch.optim.AdamW(net.param_groups(args.weight_decay, base_lr=args.lr,
+                                             lr_groups=lr_groups), lr=args.lr)
+    if is_main(rank):
+        for g in opt.param_groups:
+            if g.get("name"):
+                print(f" -- param group '{g['name']}': {len(g['params'])} tensors at "
+                      f"lr {g['lr']:.2e}")
+
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
 
     # Restore optimizer/schedule/step from the resumed checkpoint (every rank loads

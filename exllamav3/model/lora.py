@@ -108,7 +108,9 @@ class LoRA:
         # can revert them (head full-weight override; restored embedding weight).
         self._full_weight_targets = []          # [Linear] -- reset .lora_full_weight
         self._embed_restore = []                # [(Embedding, original_weight)]
+        self._embed_row_restore = []            # [(Embedding, ids, original_rows)]
         self.name = os.path.basename(os.path.dirname(config_path))
+
 
         # Read adapter config
         with open(config_path, encoding="utf8") as f:
@@ -380,6 +382,57 @@ class LoRA:
                           f"and/or exported through pissa, that guess is WRONG "
                           f"(pass module_lora_scale=alpha/sqrt(r) explicitly).")
 
+        # --- trained token rows (--trainable-tokens) ---
+        # trainable_tokens.safetensors: a handful of embedding rows (raw table
+        # units) and, per adapter_config "trainable_tokens_head", the head
+        # columns for the same tokens: "tied" = the same rows, "separate" =
+        # their own lm_head.rows tensor, "off" = frozen. The embedding rows are
+        # written in place (originals kept for unload); the head columns ride
+        # the LM-head Linear's runtime LoRA slot as a rank-n adapter -- A = the
+        # column deltas [n, in], B = a one-hot column selector [n, out] -- so no
+        # full head copy is needed and the graph paths see an ordinary LoRA.
+        tt_path = os.path.join(directory, "trainable_tokens.safetensors")
+        if os.path.exists(tt_path):
+            tt = safe_load_file(tt_path, device="cpu")
+            ids = tt["embed_tokens.token_ids"].to(torch.long)
+            rows = tt["embed_tokens.rows"].to(torch.float32)                  # [n, d]
+            with open(os.path.join(directory, "adapter_config.json"), encoding="utf8") as f:
+                head_mode = json.load(f).get("trainable_tokens_head", "off")
+            applied = []
+            w = getattr(getattr(embed, "embedding", None), "weight", None) if embed is not None else None
+            if w is not None:
+                dev_ids = ids.to(w.device)
+                self._embed_row_restore.append((embed, dev_ids, w.data[dev_ids].clone()))
+                w.data[dev_ids] = rows.to(w.dtype).to(w.device)
+                applied.append(f"embed_tokens[{len(ids)} rows]")
+            elif embed is not None:
+                print(f" -- LoRA '{self.name}': WARNING -- the embedding is a streamed/"
+                      f"quantized table; trained token rows NOT applied to the input embedding")
+            head_rows = None
+            if head_mode == "tied":
+                head_rows = rows
+            elif head_mode == "separate" and "lm_head.rows" in tt:
+                head_rows = tt["lm_head.rows"].to(torch.float32)
+            if head_rows is not None and head is not None and not head.is_sliced:
+                hw = head.inner.get_weight_tensor()                            # [in, out] (padded)
+                in_f, out_f = hw.shape
+                hids = ids.to(hw.device)
+                base_cols = hw[:, hids].t().to(torch.float32)                  # [n, in]
+                delta = (head_rows.to(hw.device) - base_cols[:, :head_rows.shape[1]])
+                if delta.shape[1] < in_f:
+                    delta = torch.nn.functional.pad(delta, (0, in_f - delta.shape[1]))
+                sel = torch.zeros(len(ids), out_f, dtype=torch.float16, device=hw.device)
+                sel[torch.arange(len(ids), device=hw.device), hids] = 1.0
+                head.lora_a_tensors[self] = (self.user_scaling * delta).to(torch.float16).contiguous()
+                head.lora_b_tensors[self] = sel
+                bump_runtime_lora_epoch()
+                self.target_modules.setdefault("lm_head", head)
+                del hw
+                applied.append(f"lm_head[{len(ids)} columns, {head_mode}]")
+            if applied:
+                print(f" -- LoRA '{self.name}': applied trained token rows {applied}")
+
+
     def _module_scaling(self, full_path: str, module_r: int) -> float:
         """
         Effective B pre-scale for one module: ``user_scaling * alpha / r`` with
@@ -434,9 +487,13 @@ class LoRA:
             linear.lora_full_weight = None
         bump_runtime_lora_epoch()
         self._sync_graphs()
+        for embed, ids, original_rows in reversed(self._embed_row_restore):
+            embed.embedding.weight.data[ids] = original_rows
         for embed, original in reversed(self._embed_restore):
             embed.embedding.weight.data = original
 
         self.target_modules = {}
         self._full_weight_targets = []
         self._embed_restore = []
+        self._embed_row_restore = []
+

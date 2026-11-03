@@ -140,7 +140,24 @@ quant_aware_ref_model: null  # ORIGINAL unquantized HF dir to MEASURE the error 
 # Optimization
 # ---------------------------------------------------------------------------
 lr: 0.0002
+# Per-group learning rates (axolotl's lr_groups, all backends): adapters whose module
+# matches a group leave the default group for one at that group's lr, same schedule
+# and weight decay. Selection keys (AND across keys, OR within one): `modules` =
+# substrings of the module key (`layers.5.`, `q_proj`; dots literal) or `re:<regex>`;
+# `layers` = block indices, "a-b" ranges, or `global_attention` / `sliding_attention`
+# (Gemma's full-attention layers, by the block's own attention kind -- no need to list
+# the 10 indices). `lr` is absolute, `lr_mul` relative to lr. First matching group
+# wins; a group that matches nothing is an error. Resume with the same groups.
+lr_groups: null
+#  - name: global_attn       # Gemma: a gentler LR on the global-attention layers
+#    layers: [global_attention]
+#    lr: 0.00001
+#  - name: early_mlp
+#    modules: [down_proj]
+#    layers: ["0-7"]
+#    lr_mul: 0.5
 weight_decay: 0.01        # AdamW weight decay on the LoRA params
+
 optim: adamw              # single/split only. adamw: torch AdamW, fp32 moments = 8 bytes per
                           #   trainable param, allocated lazily at the FIRST optimizer step (why a
                           #   run can pass step 0 and OOM at step 1). adamw8bit: bitsandbytes 8-bit
@@ -372,6 +389,26 @@ lora_embed: false         # rank-r LoRA on the embedding instead (cheap, GPU-res
                           #   mutually exclusive with train_embeddings). Merge-path artifact
 lora_head: false          # rank-r LoRA on the LM head instead (tiny params; memory scales with
                           #   supervised tokens; mutually exclusive with train_head). Merge-path
+
+# Trained token ROWS (single/split only) -- the new-vocabulary stage. Train only the
+# embedding rows of a few tokens (repurposed <unusedN> tokens, see
+# training/repurpose_tokens.py) with everything else frozen: n x hidden params instead
+# of the whole 262k x hidden table, PEFT's trainable_token_indices / axolotl's
+# `embed_tokens.weight$[a:b]` unfrozen_parameters. Each entry is a token string, an id
+# or an a-b id range. Saved to trainable_tokens.safetensors; applied by
+# LoRA.from_directory and merge_lora_bf16.py. Mutually exclusive with
+# train_embeddings / lora_embed. Typically run as its own stage with `targets: []`
+# and a high lr (1e-3..1e-2), then the SFT stage on top (resume: it).
+trainable_tokens: null    # e.g. ["IceWing", "MudWing"] or ["<unused6>", "<unused7>"] or ["6-33"]
+trainable_tokens_init: null  # description init: {token: text} inline, or a .json/.yaml path.
+                          #   The row starts at the MEAN of the base rows of the text's tokens
+                          #   (a near-zero <unused> row takes far longer to become anything)
+trainable_tokens_head: auto  # auto = tied on a tie_word_embeddings model (Gemma: the head
+                          #   columns ARE the rows, HF semantics), off otherwise | tied |
+                          #   separate (own head columns) | off. Not-off routes the loss through
+                          #   the materialized supervised-position head (like lora_head)
+trainable_tokens_lr: null # LR of the rows' own param group (no weight decay); null = lr
+
 
 # ---------------------------------------------------------------------------
 # Sampling / checkpoints / resume

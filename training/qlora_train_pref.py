@@ -94,6 +94,7 @@ from qlora_train_native import (  # noqa: E402
     snapshot_datasets, resolve_resumed_datasets,
     format_prompt_and_eot, turn_end_token,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
+    parse_lr_group_specs,
     load_dataset_split, build_sft_examples, collate,
     _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
@@ -610,6 +611,11 @@ def _run_main():
     ap.add_argument("--lr", type=float, default=5e-6,
                     help="Preference LRs run ~10-100x lower than SFT (TRL DPO "
                          "default 1e-6; 5e-6..5e-5 is a common LoRA range).")
+    ap.add_argument("--lr-groups", "--lr-group", nargs="*", default=None, dest="lr_groups",
+                    metavar="SPEC",
+                    help="Per-module-group learning rates; same SPEC syntax as the "
+                         "SFT trainer (JSON object or NAME:LR:SEL[,SEL...], e.g. "
+                         "global_attn:1e-5:global_attention).")
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit"],
                     default="adamw")
@@ -959,7 +965,9 @@ def _run_main():
           f"warmup={warmup_steps}, weight_decay={args.weight_decay}")
 
     # 4. Optimizer + schedule (+ optional resumable state).
-    opt = build_optimizer(net.param_groups(args.weight_decay), args.lr, args.optim)
+    opt = build_optimizer(net.param_groups(args.weight_decay, base_lr=args.lr,
+                                           lr_groups=parse_lr_group_specs(args.lr_groups)),
+                          args.lr, args.optim)
     sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
     resume_step, resume_state = 0, None
     yaml_base_lrs = list(sched.base_lrs)  # per-group base LRs from the CONFIG

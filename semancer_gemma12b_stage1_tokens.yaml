@@ -1,0 +1,62 @@
+# EXL3 QLoRA -- Gemma-4-12B-it: STAGE 1 of the new-vocabulary recipe. Train ONLY the
+# embedding rows (and, tied, the head columns) of repurposed <unused> tokens, from a
+# description init; nothing else trains. Follow with semancer_gemma12b_stage2_lrgroups.yaml.
+#
+# Before this: rename the spare tokens in the model dir's tokenizer files
+#   python training/repurpose_tokens.py --model $MODEL --list
+#   python training/repurpose_tokens.py --model $MODEL --map-file names.json --in-place --write
+# Launch: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#           python training/qlora_train.py --config semancer_gemma12b_stage1_tokens.yaml
+
+model: /home/unstable/weights/google_gemma-4-12B-it/6.00bpw
+out: out/semancer_gemma12b_stage1_tokens
+
+parallel: split
+split_even: true
+
+# No per-linear LoRA in this stage: the rows are the only trainable tensors.
+r: 32                        # unused here (targets: []), kept so stage 2 resumes with the same shape
+alpha: 32
+targets: []
+trainable_tokens:            # the repurposed names (one token each after repurpose_tokens.py)
+  - IceWing
+  - MudWing
+  - NightWing
+  - RainWing
+  - SandWing
+  - SeaWing
+  - SkyWing
+trainable_tokens_init:       # row = mean of the base rows of the description's tokens
+  IceWing: "IceWing, a tribe of white ice dragons from the frozen north"
+  MudWing: "MudWing, a tribe of brown mud dragons that hatch in swamps"
+  NightWing: "NightWing, a tribe of black night dragons with silver scales"
+  RainWing: "RainWing, a tribe of colour-shifting rainforest dragons"
+  SandWing: "SandWing, a tribe of pale desert dragons with venomous tails"
+  SeaWing: "SeaWing, a tribe of blue ocean dragons with glowing scales"
+  SkyWing: "SkyWing, a tribe of red mountain dragons, large and fast"
+trainable_tokens_head: auto  # Gemma ties embed/head -> the rows are the head columns too
+lr: 0.005                    # rows alone want a high LR; the LoRA stage uses ~4e-5
+weight_decay: 0.0
+scheduler: cosine
+warmup_ratio: 0.05
+epochs: 2
+batch: 4
+grad_accum: 1
+max_grad_norm: 1.0
+compute_dtype: bfloat16
+
+dataset: UnstableLlama/semancy
+messages_key: messages
+prompt_format: gemma4-nothink
+seq_len: 2048
+pack: true
+shuffle: true
+
+offload_activations: true
+sample_every: 0
+checkpoint_every: 10         # each checkpoint logs cos-to-init / rel-move / norm per token
+keep_checkpoints: 0
+eval_split: test
+eval_every: 10
+save_best: true
+run_log: qlora_runs.csv
