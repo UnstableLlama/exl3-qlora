@@ -96,6 +96,8 @@ SINGLE_ONLY_KEYS = {
     # Trained token rows (the new-vocabulary stage); native single/split only.
     "trainable_tokens", "trainable_tokens_init", "trainable_tokens_head",
     "trainable_tokens_lr",
+    # Engram / PLE training (Qwen3.8-Flash-Next); native single/split only.
+    "train_ple", "ple_lr", "train_ngram_rows", "ngram_rows_lr", "ngram_rows_max",
 
     "offload_activations", "offload_mode", "vram_spillover", "use_liger",
     # Streamed routed experts (Session 59) and the PLE n-gram table in RAM
@@ -292,6 +294,11 @@ SINGLE_ONLY_DEFAULTS = {
     "trainable_tokens_init": None,
     "trainable_tokens_head": "auto",
     "trainable_tokens_lr": None,
+    "train_ple": False,
+    "ple_lr": None,
+    "train_ngram_rows": False,
+    "ngram_rows_lr": None,
+    "ngram_rows_max": None,
 
     "offload_embed_head_optim": False,
     "offload_activations": False,

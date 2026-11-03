@@ -409,6 +409,22 @@ trainable_tokens_head: auto  # auto = tied on a tie_word_embeddings model (Gemma
                           #   the materialized supervised-position head (like lora_head)
 trainable_tokens_lr: null # LR of the rows' own param group (no weight decay); null = lr
 
+# Engram training (Qwen3.8-Flash-Next's hashed n-gram PLE layer; native single/split only).
+# The layer's key/value projections take an ordinary LoRA via targets (ple_key_proj,
+# ple_value_proj, or ple_proj for both). train_ple fully fine-tunes the layer's grouped norm
+# weights + conv kernel (fp32 masters, ~0.1M params; ple_modules.safetensors).
+# train_ngram_rows trains one fp32 DELTA row per n-gram table row the training set hashes to
+# (allocated after tokenization; rows outside the set stay frozen; ngram_rows.safetensors;
+# the quantized table is never written). 16 bytes per row element with AdamW, 2.5 KB per
+# 160-wide row; ngram_rows_max refuses a larger set. Applied by LoRA.from_directory and the
+# live samples; merge_lora_bf16.py merges the PLE tensors and, onto an unquantized base
+# table, the row deltas. See training/README.md "Engram training".
+train_ple: false
+ple_lr: null              # LR of the train_ple tensors' own no-decay group; null = lr
+train_ngram_rows: false
+ngram_rows_lr: null       # LR of the row deltas' own no-decay group; null = lr (rows want 1e-3..1e-2)
+ngram_rows_max: 2000000   # cap on trained table rows (2M ~ 5 GB with AdamW)
+
 
 # ---------------------------------------------------------------------------
 # Sampling / checkpoints / resume

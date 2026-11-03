@@ -293,6 +293,84 @@ tokenizer (copy the three files into the model dir, or `--in-place`). CPU-
 tested in `tests/test_native_llama.py`
 (`test_trainable_token_rows_embed_and_head`).
 
+## Engram training: the hashed n-gram layer of Qwen3.8-Flash-Next (`train_ple`, `train_ngram_rows`)
+
+Qwen3.8-Flash-Next carries a hashed n-gram memory in front of its third block
+(`PLELayer`, the "Engram" of DeepSeek-V4.1 with a dilated conv on top): every
+token position hashes its last `ngram_size` tokens to 16 rows of a 51.2B-
+parameter table, the rows project to a key per residual stream and one
+value, a signed-sqrt gate against each stream decides how much of the value
+to inject, and a depthwise causal conv adds local context. Up to now the
+whole layer was frozen on the training path (the table is quantized and
+streamed from disk; the projections were deliberately unselectable). Three
+knobs now train it, all on the native single/split backend:
+
+- **`targets: [ple_key_proj, ple_value_proj]`** (or `ple_proj` for both) --
+  an ordinary LoRA on the key / value projections of the lookup, at the run's
+  `r` / `alpha`, selectable in `lr_groups` like any module (`modules:
+  [ple_]`). Saved in `adapter_model.safetensors` with the other targets; the
+  inference layer's fused kernel falls back to its op-by-op form while an
+  adapter sits in those projections' runtime slots, so live samples,
+  `qlora_infer_native.py` and `LoRA.from_directory` all see it, and
+  `merge_lora_bf16.py` merges it.
+- **`train_ple: true`** -- full fine-tune of the layer's small tensors: the
+  three grouped norm weights (key / query / conv, `(1 + w)` offsets) and the
+  conv kernel, ~0.1M params as fp32 masters in their own no-decay group
+  (`ple_lr`, default `lr`). Saved to `ple_modules.safetensors`;
+  `LoRA.from_directory` writes them into the module (originals restored on
+  unload), the merge script writes them over the base tensors of the same
+  name. Every checkpoint logs each tensor's relative move from its loaded
+  value.
+- **`train_ngram_rows: true`** -- the memory itself. After tokenization the
+  trainer hashes the whole training set through the layer's own n-gram
+  hashing, takes the unique table rows it touches (a resumed adapter's rows
+  join the set) and allocates one zero-initialized fp32 DELTA row per table
+  row, `[N, 160]`, on the PLE layer's device: the forward adds the delta of
+  every (position, head) whose row is in the set on top of the frozen lookup
+  and leaves every other row frozen, so an eval batch or a token pair the set
+  never had reads the base table. Only touched slots receive gradient. The
+  rows' group has no weight decay (`ngram_rows_lr`, default `lr`; like
+  embedding rows they want a high LR, 1e-3..1e-2). Cost: 16 bytes per row
+  element with AdamW (delta + grad + two moments), 2.5 KB per row;
+  `ngram_rows_max` (default 2M, ~5 GB) refuses a larger set with the count in
+  the message -- shrink the set or use `optim: adamw8bit`. Saved to
+  `ngram_rows.safetensors` as `(row id, delta)` for the rows that moved; the
+  table is never written. `LoRA.from_directory` installs the deltas in the
+  layer's `NGramEmbedding`, which adds them onto the decoded base rows of
+  those ids in every lookup (fused and reference paths alike, RAM or disk
+  streamed), so the live samples and `qlora_infer_native.py` see them; the
+  merge script adds them onto an unquantized `<table>.weight` when the base
+  index carries one and otherwise says so (deploy through the sidecar). Every
+  checkpoint logs rows seen / moved and the relative move `|delta| / |base
+  row|`.
+
+A delta on a quantized row is the same construction as a LoRA on a quantized
+linear: the base stays as converted, the correction rides beside it. Resume
+keeps the row set (`resume:` an adapter dir re-reads its `ngram_rows`
+sidecar before allocating). Not available on DDP / the preference and GRPO
+backends; sample packing is already refused on this model. CPU-tested in
+`tests/test_ple_train.py` (`test_ngram_rows_delta_training`,
+`test_train_ple_params_get_grad`, `test_row_delta_helper`); not yet run on
+hardware -- the first box run should be `qlora_validate_native.py` and a
+short `--train-ngram-rows --sample-every N` run to confirm the live install.
+
+```yaml
+# Engram stage on Qwen3.8-Flash-Next: the memory + its projections, nothing else
+model: /models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4
+parallel: single
+stream_experts: true
+sample_every: 0
+targets: [ple_key_proj, ple_value_proj]
+r: 16
+alpha: 16
+train_ple: true
+train_ngram_rows: true
+ngram_rows_lr: 0.003
+ngram_rows_max: 2000000
+lr: 0.0001
+weight_decay: 0.0
+```
+
 ## MTP (multi-token prediction) head training
 
 

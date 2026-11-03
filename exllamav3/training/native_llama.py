@@ -123,6 +123,23 @@ from .hyperconnections import (
 from .ple import ple_delta
 
 
+def _row_slots(uids, table_uids):
+    """``util.row_delta.row_slots`` (shared with the inference n-gram module).
+    Imported lazily: the relative import is unavailable when this file is
+    loaded standalone under the CPU tests' synthetic package, so fall back to
+    the file next to this package."""
+    try:
+        from ..util.row_delta import row_slots
+    except ImportError:
+        import importlib.util as _ilu
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "util", "row_delta.py")
+        spec = _ilu.spec_from_file_location("exl3_util_row_delta", path)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        row_slots = mod.row_slots
+    return row_slots(uids, table_uids)
+
+
 # FlashAttention-2 fast path. exllamav3's own FA2 usage is inference-only
 # (@torch.inference_mode kernels), so we use the upstream `flash_attn` package's
 # autograd-capable flash_attn_func instead -- it has a real backward. Imported
@@ -822,7 +839,12 @@ class NativeLlamaQLoRA(nn.Module):
     # residual. Class defaults so headless test nets take the plain path.
     hc_mult = 0
     final_mixer_spec = None     # the final GatedResidual mixer's spec, or None
-    _ple = {}                   # {block index: PLE entry} -- runs BEFORE that block
+    # NOTE: no class default for ``_ple`` (the PLE entries, an nn.ModuleDict set
+    # in __init__): nn.Module keeps submodules in ``_modules`` and reaches them
+    # only through ``__getattr__``, which a class attribute of the same name
+    # pre-empts -- a ``_ple = {}`` default here made ``self._ple`` read as the
+    # empty dict on a REAL net, silently skipping the PLE layer in the training
+    # forward. Headless nets read it through getattr with a {} fallback.
     qsa_threshold = None        # longest sequence the QSA layers attend densely
 
     def __init__(
@@ -853,8 +875,21 @@ class NativeLlamaQLoRA(nn.Module):
         trainable_tokens: Optional[Iterable[int]] = None,
         trainable_token_init: Optional[dict] = None,
         trainable_tokens_head: str = "auto",
+        train_ple: bool = False,
+        train_ngram_rows: bool = False,
     ):
         """
+        ``train_ple`` / ``train_ngram_rows`` (Qwen3.8-Flash-Next's hashed
+        n-gram "Engram" layer, ``PLELayer``): ``train_ple`` fine-tunes the
+        layer's three grouped norm weights and its depthwise conv kernel in
+        full (fp32 masters, a few hundred k params); its key/value projections
+        take an ordinary LoRA through ``target_modules`` (``ple_key_proj``,
+        ``ple_value_proj``, or ``ple_proj`` for both). ``train_ngram_rows``
+        trains a DELTA on every n-gram table row the training set touches --
+        the memory itself -- allocated by :meth:`init_ngram_rows` from the
+        tokenized examples before the optimizer is built; rows a batch hashes
+        to outside that set stay frozen. See :meth:`ngram_row_parameters`.
+
         ``trainable_tokens`` (optional): token ids whose EMBEDDING ROWS train
         (PEFT ``trainable_token_indices`` / axolotl's row-sliced
         ``unfrozen_parameters`` on ``embed_tokens``) while the rest of the
@@ -1269,18 +1304,59 @@ class NativeLlamaQLoRA(nn.Module):
         # through the inference module at forward time (backbone.ple_ngram_embed).
         self._ple_modules = {}          # {block index: inference PLELayer}
         self._ple = nn.ModuleDict()     # {str(block index): entry}
+        self.train_ple = bool(train_ple)
+        self.train_ngram_rows = bool(train_ngram_rows)
+        self._ple_init = {}             # {tensor name: fp32 CPU snapshot} (train_ple stats)
         ple_wrap = make_wrap(targets, satisfied_targets)   # trunk-side (never the MTP wrap)
         for bi, ple_mod in backbone.ple_layout(model).items():
             kp, vp = backbone.ple_projections(ple_mod)
             pe = nn.Module()
-            pe.key_proj = ple_wrap(kp, "ple_key_proj", ())
-            pe.value_proj = ple_wrap(vp, "ple_value_proj", ())
+            # The projections are selectable by name (an "Engram" LoRA on the
+            # key / value projections of the frozen hashed lookup); the fused
+            # inference path falls back to the op-by-op form while an adapter
+            # sits in their runtime slots (modules/ple.py).
+            pe.key_proj = ple_wrap(kp, "ple_key_proj", ("ple_key_proj", "ple_proj"))
+            pe.value_proj = ple_wrap(vp, "ple_value_proj", ("ple_value_proj", "ple_proj"))
             pe.spec = backbone.ple_spec(ple_mod)
             pe.device = backbone.linear_device(kp)
+            if self.train_ple:
+                # Full fp32 masters for the small per-layer tensors; the spec
+                # entries the differentiable forward reads become these
+                # Parameters, so no forward change is needed.
+                pe.ple_params = nn.ParameterDict()
+                tensors = backbone.ple_trained_tensors(ple_mod)
+                for name, live in tensors.items():
+                    self._ple_init[name] = live.detach().float().cpu().clone()
+                for nkey, nmod in (("norm_key", ple_mod.norm_key), ("norm_query", ple_mod.norm_query),
+                                   ("norm_conv", ple_mod.norm_conv)):
+                    if nmod is None:
+                        continue
+                    w = pe.spec[nkey]["weight"]
+                    prm = nn.Parameter(w.detach().float().clone().to(pe.device))
+                    pe.ple_params[nmod.tensor_key.replace(".", "/")] = prm
+                    pe.spec[nkey]["weight"] = prm
+                ck = f"{ple_mod.key}.conv1d.weight"
+                if ck in tensors:
+                    prm = nn.Parameter(pe.spec["conv_w"].detach().float().clone().to(pe.device))
+                    pe.ple_params[ck.replace(".", "/")] = prm
+                    pe.spec["conv_w"] = prm
             self._ple[str(bi)] = pe
             self._ple_modules[bi] = ple_mod
         assert not self._ple or self.hc_mult > 0, "PLE layer on a non-stream-stack decoder"
         self.has_ple = bool(self._ple)
+        if (self.train_ple or self.train_ngram_rows) and not self.has_ple:
+            raise ValueError("train_ple / train_ngram_rows: this model has no PLE (hashed "
+                             "n-gram / Engram) layer")
+        if self.train_ngram_rows and len(self._ple) != 1:
+            raise ValueError(f"train_ngram_rows supports one PLE layer, this model has "
+                             f"{len(self._ple)}")
+        # Trained n-gram row deltas: allocated by init_ngram_rows() once the
+        # tokenized training set is known (the slots are the rows it hashes to).
+        self.ngram_uids = None          # [N] int64 CPU, sorted unique table row ids
+        self.ngram_rows = None          # [N, head_dim] fp32 Parameter (DELTA on the base row)
+        self._ngram_uids_dev = None     # the same ids on the PLE device (slot lookup)
+        self._ngram_base_norm = None    # [N] fp32: |base row| of the slots seen so far (0 = unseen)
+        self._ngram_pending = None      # (uids, delta) from load_adapter before allocation
         # QSA (Qwen3.8-Flash-Next sparse attention): the native forward is
         # dense, exact up to the smallest indexer threshold over the layers;
         # _forward_trunk refuses longer sequences.
@@ -1559,7 +1635,8 @@ class NativeLlamaQLoRA(nn.Module):
                     w.lora_b.requires_grad_(False)
             for p in (self.embed_weight, self.head_weight, self.embed_lora_a,
                       self.embed_lora_b, self.head_lora_a, self.head_lora_b,
-                      self.token_rows, self.head_token_rows):
+                      self.token_rows, self.head_token_rows,
+                      *self.ple_parameters(), *self.ngram_row_parameters()):
                 if p is not None:
                     p.requires_grad_(False)
 
@@ -1575,7 +1652,8 @@ class NativeLlamaQLoRA(nn.Module):
             if w.r > 0 and id(w) not in mtp_ids and w.lora_a.requires_grad:
                 return True
         for p in (self.module_lora_parameters() + self.modules_to_save_parameters()
-                  + self.trainable_token_parameters()):
+                  + self.trainable_token_parameters() + self.ple_parameters()
+                  + self.ngram_row_parameters()):
             if p.requires_grad:
                 return True
         return False
@@ -2784,13 +2862,168 @@ class NativeLlamaQLoRA(nn.Module):
                           self._norm, self.compute_dtype)
         return streams + delta
 
+    def _ngram_slot_lookup(self, uids: torch.Tensor) -> torch.Tensor:
+        """Table row ids (any shape, CPU) -> slot in ``ngram_rows`` on the PLE
+        device, -1 where the id is not a trained row."""
+        return _row_slots(uids.to(self._ngram_uids_dev.device), self._ngram_uids_dev)
+
+    def _ngram_rows_add(self, mod, emb: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """The frozen n-gram embedding ``[b, t, H * hd]`` plus the trained row
+        deltas (``train_ngram_rows``) at every position / head whose hashed
+        row is a trained slot; rows outside the set (an eval batch, a token
+        pair the training set never had) stay frozen. The delta is on the
+        graph -- the only path a gradient reaches ``ngram_rows`` through. A
+        batch that touches no trained row still returns ``emb`` on the graph
+        (a zero contribution), so every step has the rows' gradient defined.
+        Off (pure frozen lookup) when the adapters are disabled (the DPO / KTO
+        reference forward)."""
+        rows = getattr(self, "ngram_rows", None)
+        if rows is None or self._adapters_off:
+            return emb
+        b, t, _ = emb.shape
+        uids = backbone.ple_ngram_ids(mod, input_ids)                     # [b, t, H] CPU
+        H = uids.shape[-1]
+        hd = rows.shape[1]
+        assert emb.shape[-1] == H * hd, \
+            f"n-gram embedding width {emb.shape[-1]} != {H} heads x {hd}"
+        slots = self._ngram_slot_lookup(uids).to(rows.device)              # [b, t, H]
+        hit = slots >= 0
+        if not bool(hit.any()):
+            return emb.float() + rows.sum() * 0.0
+        base = emb.float().view(b, t, H, hd)
+        with torch.no_grad():
+            # Stats: remember |base row| of every slot seen (exact, no table read).
+            bn = self._ngram_base_norm
+            if bn is not None:
+                sel = slots[hit]
+                bn[sel] = base[hit].norm(dim=-1).to(bn.dtype)
+        delta = rows[slots.clamp_min(0)] * hit.unsqueeze(-1).to(rows.dtype)  # [b, t, H, hd]
+        return (base + delta.to(base.dtype)).view(b, t, H * hd).to(emb.device)
+
+    @torch.no_grad()
+    def init_ngram_rows(self, examples, max_rows: int | None = None,
+                        extra_uids: Optional[torch.Tensor] = None) -> int:
+        """
+        Allocate the trained n-gram row deltas (``train_ngram_rows``): hash
+        every example's ``input_ids`` through the PLE layer's own n-gram
+        hashing (the ids the forward will gather), take the unique table rows
+        (plus ``extra_uids``: the rows of a resumed adapter, and any pending
+        ``load_adapter`` rows), and create one zero-initialized fp32 delta
+        row per table row -- ``[N, head_dim]`` on the PLE device, in the
+        rows' own no-weight-decay param group. Call AFTER the examples are
+        final (packed) and BEFORE the optimizer is built. ``max_rows`` bounds
+        N (param + grad + Adam moments = 16 bytes per row element). Returns N.
+        """
+        if not self.train_ngram_rows:
+            raise ValueError("init_ngram_rows without train_ngram_rows")
+        if self.ngram_rows is not None:
+            raise ValueError("ngram rows are already allocated")
+        (bi, mod), = self._ple_modules.items()
+        pe = self._ple[str(bi)]
+        table = backbone.ple_ngram_table(mod)
+        parts = []
+        for ex in examples:
+            ids = ex["input_ids"] if isinstance(ex, dict) else ex
+            ids = torch.as_tensor(ids, dtype=torch.long).view(1, -1)
+            parts.append(backbone.ple_ngram_ids(mod, ids).reshape(-1).unique())
+        if extra_uids is not None:
+            parts.append(torch.as_tensor(extra_uids, dtype=torch.long).reshape(-1))
+        if self._ngram_pending is not None:
+            parts.append(self._ngram_pending[0].reshape(-1))
+        uids = torch.cat(parts).unique() if parts else torch.zeros(0, dtype=torch.long)
+        n = int(uids.numel())
+        if n == 0:
+            raise ValueError("train_ngram_rows: the training set hashes to no n-gram rows")
+        if max_rows is not None and n > max_rows:
+            raise ValueError(
+                f"train_ngram_rows: the training set touches {n:,} n-gram table rows, "
+                f"over the cap of {max_rows:,} (ngram_rows_max). Each row costs "
+                f"{16 * table.head_dim} bytes of VRAM with AdamW (fp32 delta + grad + "
+                f"two moments); raise the cap, shrink the set, or use an 8-bit optimizer.")
+        hd = int(table.head_dim)
+        self.ngram_uids = uids
+        self._ngram_uids_dev = uids.to(pe.device)
+        self.ngram_rows = nn.Parameter(torch.zeros(n, hd, dtype=torch.float32, device=pe.device))
+        self._ngram_base_norm = torch.zeros(n, dtype=torch.float32, device=pe.device)
+        pe.ngram_rows = self.ngram_rows
+        if self._ngram_pending is not None:
+            p_uids, p_delta = self._ngram_pending
+            self._ngram_pending = None
+            slots = self._ngram_slot_lookup(p_uids)
+            assert bool((slots >= 0).all()), "pending n-gram rows not in the allocated set"
+            self.ngram_rows.data[slots] = p_delta.to(self.ngram_rows.dtype).to(pe.device)
+        return n
+
+    @torch.no_grad()
+    def ngram_row_stats(self) -> Optional[dict]:
+        """Trained n-gram rows: how many slots exist / were seen by a forward
+        / have moved, and the relative delta ``|delta| / |base row|`` (mean and
+        max over the moved rows). None without trained rows."""
+        rows = getattr(self, "ngram_rows", None)
+        if rows is None:
+            return None
+        d = rows.detach().float()
+        dn = d.norm(dim=-1)
+        moved = dn > 0
+        bn = self._ngram_base_norm
+        seen = bn > 0
+        rel = dn[moved & seen] / bn[moved & seen].clamp_min(1e-12)
+        return {
+            "rows": int(d.shape[0]),
+            "seen": int(seen.sum()),
+            "moved": int(moved.sum()),
+            "rel_move_mean": float(rel.mean()) if rel.numel() else 0.0,
+            "rel_move_max": float(rel.max()) if rel.numel() else 0.0,
+            "delta_norm_mean": float(dn[moved].mean()) if bool(moved.any()) else 0.0,
+        }
+
+    @torch.no_grad()
+    def ple_param_stats(self) -> list[dict]:
+        """Per fully-trained PLE tensor (``train_ple``): relative move from its
+        loaded value, ``|w - w0| / |w0|`` (a zero-init norm weight reads its
+        absolute move instead, marked ``abs``)."""
+        out = []
+        for name, prm in self.ple_named_parameters():
+            w0 = self._ple_init.get(name)
+            if w0 is None:
+                continue
+            w = prm.detach().float().cpu().reshape(-1)
+            w0 = w0.reshape(-1)
+            n0 = float(w0.norm())
+            mv = float((w - w0).norm())
+            out.append({"tensor": name, "rel_move": mv / n0 if n0 > 0 else mv,
+                        "abs": n0 == 0.0})
+        return out
+
+    def ple_named_parameters(self) -> list[tuple[str, nn.Parameter]]:
+        """``(checkpoint tensor name, Parameter)`` of the fully-trained PLE
+        tensors (``train_ple``); [] otherwise."""
+        out = []
+        for pe in getattr(self, "_ple", {}).values():
+            pd = getattr(pe, "ple_params", None)
+            if pd is None:
+                continue
+            for k, prm in pd.items():
+                out.append((k.replace("/", "."), prm))
+        return out
+
+    def ple_parameters(self) -> list[nn.Parameter]:
+        return [p for _, p in self.ple_named_parameters() if p.requires_grad]
+
+    def ngram_row_parameters(self) -> list[nn.Parameter]:
+        """The trained n-gram row deltas (``train_ngram_rows``), once allocated."""
+        r = getattr(self, "ngram_rows", None)
+        return [r] if r is not None and r.requires_grad else []
+
     def _run_ple(self, bi, pe, streams, input_ids, ckpt):
         """One PLE layer: the frozen n-gram lookup OUTSIDE the checkpoint (host
         hashing + table gather; no grad, and not worth redoing in the
         recompute), then the differentiable projections / gate / conv under
         the same checkpointing as a block."""
-        emb = backbone.ple_ngram_embed(self._ple_modules[bi], input_ids)
+        mod = self._ple_modules[bi]
+        emb = backbone.ple_ngram_embed(mod, input_ids)
         emb = emb.to(streams.device)
+        emb = self._ngram_rows_add(mod, emb, input_ids)
         if ckpt:
             return torch.utils.checkpoint.checkpoint(
                 self._ple_forward, pe, streams, emb, use_reentrant=False)
@@ -2965,6 +3198,7 @@ class NativeLlamaQLoRA(nn.Module):
         else:
             save_ctx = torch.autograd.graph.save_on_cpu(pin_memory=True)
         cur_device = first_device
+        ple_entries = getattr(self, "_ple", {})
         with save_ctx:
             for bi, (meta, entry, dev) in enumerate(
                     zip(self._block_meta, self.blocks, self._block_devices)):
@@ -2973,8 +3207,8 @@ class NativeLlamaQLoRA(nn.Module):
                 # list -- streams <- streams + ple(streams, ids). Runs on the
                 # layer's own device (mirroring the module order under a
                 # layer-split load); the block below then migrates as usual.
-                if str(bi) in self._ple:
-                    pe = self._ple[str(bi)]
+                if str(bi) in ple_entries:
+                    pe = ple_entries[str(bi)]
                     if pe.device != cur_device:
                         hidden = backbone.to_device(hidden, pe.device)
                         cur_device = pe.device
@@ -3474,6 +3708,8 @@ class NativeLlamaQLoRA(nn.Module):
         # included in the grad clip. Trained token rows likewise.
         ps += self.module_lora_parameters()
         ps += self.trainable_token_parameters()
+        ps += self.ple_parameters()
+        ps += self.ngram_row_parameters()
         return [p for p in ps if p.requires_grad]
 
     def trainable_token_parameters(self) -> list[nn.Parameter]:
@@ -3526,7 +3762,9 @@ class NativeLlamaQLoRA(nn.Module):
     def lora_param_groups(self, weight_decay: float, base_lr: float | None = None,
                           module_lora_lr_mul: float = 1.0,
                           lr_groups: Optional[list[dict]] = None,
-                          trainable_tokens_lr: float | None = None) -> list[dict]:
+                          trainable_tokens_lr: float | None = None,
+                          ple_lr: float | None = None,
+                          ngram_rows_lr: float | None = None) -> list[dict]:
         """LoRA-only param groups. With ``module_lora_lr_mul != 1`` the embed/head
         LoRA adapters get their OWN group at ``base_lr * module_lora_lr_mul``
         (S64: at the shared LR the head LoRA lands ~8x short of its optimum on
@@ -3566,16 +3804,35 @@ class NativeLlamaQLoRA(nn.Module):
             if trainable_tokens_lr is not None:
                 g["lr"] = float(trainable_tokens_lr)
             groups.append(g)
+        # The fully-trained PLE tensors (train_ple) and the n-gram row deltas
+        # (train_ngram_rows): their own groups, no weight decay (the norms are
+        # (1 + w) offsets and the rows are deltas on a frozen base -- decay
+        # would pull both toward "no change", not toward a prior).
+        ple = self.ple_parameters()
+        if ple:
+            g = {"params": ple, "weight_decay": 0.0, "name": "ple"}
+            if ple_lr is not None:
+                g["lr"] = float(ple_lr)
+            groups.append(g)
+        ngr = self.ngram_row_parameters()
+        if ngr:
+            g = {"params": ngr, "weight_decay": 0.0, "name": "ngram_rows"}
+            if ngram_rows_lr is not None:
+                g["lr"] = float(ngram_rows_lr)
+            groups.append(g)
         return groups
 
     def param_groups(self, weight_decay: float, base_lr: float | None = None,
                      module_lora_lr_mul: float = 1.0,
                      lr_groups: Optional[list[dict]] = None,
-                     trainable_tokens_lr: float | None = None) -> list[dict]:
+                     trainable_tokens_lr: float | None = None,
+                     ple_lr: float | None = None,
+                     ngram_rows_lr: float | None = None) -> list[dict]:
         """Optimizer param groups: weight decay on the LoRA params, but NONE on
         the full embed/head (weight-decaying a whole embedding table is harmful)."""
         groups = self.lora_param_groups(weight_decay, base_lr, module_lora_lr_mul,
-                                        lr_groups, trainable_tokens_lr)
+                                        lr_groups, trainable_tokens_lr, ple_lr,
+                                        ngram_rows_lr)
         ms = self.modules_to_save_parameters()
         if ms:
             groups.append({"params": ms, "weight_decay": 0.0})
@@ -3651,6 +3908,35 @@ class NativeLlamaQLoRA(nn.Module):
             backbone.set_runtime_lora(w.linear, self, a.t().contiguous().to(torch.float16),
                                       b.to(torch.float16))
         self._apply_token_rows_to_native(scaling)
+        self._apply_ple_to_native(scaling)
+
+    _native_ple_backup = None       # {tensor name: original live tensor copy}
+
+    @torch.no_grad()
+    def _apply_ple_to_native(self, scaling: float) -> None:
+        """Write the fully-trained PLE tensors into the inference module (in
+        place, originals kept for remove_from_native) and install the trained
+        n-gram row deltas in its table, so native generation reads them."""
+        ple_mods = getattr(self, "_ple_modules", {})
+        if not ple_mods:
+            return
+        if self.ple_named_parameters() and self._native_ple_backup is None:
+            backup = {}
+            trained = dict(self.ple_named_parameters())
+            for bi, mod in ple_mods.items():
+                for name, live in backbone.ple_trained_tensors(mod).items():
+                    prm = trained.get(name)
+                    if prm is None:
+                        continue
+                    backup[name] = live.clone()
+                    w0 = self._ple_init[name].to(live.device, torch.float32).view_as(live)
+                    new = w0 + scaling * (prm.detach().to(live.device, torch.float32).view_as(live) - w0)
+                    live.copy_(new.to(live.dtype))
+            self._native_ple_backup = backup
+        rows = getattr(self, "ngram_rows", None)
+        if rows is not None:
+            (bi, mod), = ple_mods.items()
+            backbone.ple_ngram_table(mod).set_row_delta(self.ngram_uids, rows.detach(), scaling)
 
     # Backup of the native embedding's original rows while the trained rows
     # are swapped in (apply_to_native); None when not applied.
@@ -3706,6 +3992,16 @@ class NativeLlamaQLoRA(nn.Module):
             self._native_token_rows_backup = None
             if getattr(self, "head_token_rows", None) is not None:
                 backbone.clear_runtime_lora(self.lm_head, self)
+        ple_mods = getattr(self, "_ple_modules", {})
+        if self._native_ple_backup is not None:
+            for bi, mod in ple_mods.items():
+                for name, live in backbone.ple_trained_tensors(mod).items():
+                    if name in self._native_ple_backup:
+                        live.copy_(self._native_ple_backup[name])
+            self._native_ple_backup = None
+        if getattr(self, "ngram_rows", None) is not None:
+            for mod in ple_mods.values():
+                backbone.ple_ngram_table(mod).clear_row_delta()
 
 
     # --- idle offload (serve-only VRAM squeeze) -----------------------------
@@ -3917,7 +4213,28 @@ class NativeLlamaQLoRA(nn.Module):
                 tt_state["lm_head.rows"] = self.head_token_rows.detach().to(torch.float32).cpu()
             save_file(tt_state, os.path.join(directory, "trainable_tokens.safetensors"))
 
-        if not (state or ms_state or ml_state or tt_state):
+        # Engram / PLE layer (Qwen3.8-Flash-Next), two more sidecars: the
+        # fully-trained norm / conv tensors under their checkpoint names
+        # (ple_modules.safetensors; written into the module by the loader and
+        # into the bf16 weights by the merge script), and the n-gram row
+        # deltas (ngram_rows.safetensors: the table row ids and the fp32
+        # delta per row, only the rows that moved -- a never-touched row's
+        # delta is exactly zero; the table itself is never written).
+        ple_state: dict[str, torch.Tensor] = {}
+        for name, prm in self.ple_named_parameters():
+            ple_state[name] = prm.detach().to(torch.float32).cpu()
+        if ple_state:
+            save_file(ple_state, os.path.join(directory, "ple_modules.safetensors"))
+        ng_state: dict[str, torch.Tensor] = {}
+        ngr = getattr(self, "ngram_rows", None)
+        if ngr is not None:
+            d = ngr.detach().to(torch.float32).cpu()
+            moved = d.norm(dim=-1) > 0
+            ng_state["ngram.uids"] = self.ngram_uids[moved].contiguous()
+            ng_state["ngram.delta"] = d[moved].contiguous()
+            save_file(ng_state, os.path.join(directory, "ngram_rows.safetensors"))
+
+        if not (state or ms_state or ml_state or tt_state or ple_state or ng_state):
             raise ValueError("No trainable adapters to save.")
 
 
@@ -3949,6 +4266,12 @@ class NativeLlamaQLoRA(nn.Module):
             # own tensor (separate) or frozen (off).
             **({"trainable_tokens": self.token_ids.tolist(),
                 "trainable_tokens_head": self.trainable_tokens_head} if tt_state else {}),
+            # Engram / PLE sidecars (provenance + what the loader should expect).
+            **({"train_ple": sorted(ple_state)} if ple_state else {}),
+            **({"ngram_rows": int(ng_state["ngram.uids"].numel()),
+                "ngram_rows_total": int(self.ngram_uids.numel()),
+                "ngram_table": backbone.ple_ngram_table(
+                    next(iter(self._ple_modules.values()))).key} if ng_state else {}),
             "base_model_name_or_path": base_model_name_or_path,
 
             # Provenance: how the adapter was initialized. For pissa the
@@ -3973,6 +4296,9 @@ class NativeLlamaQLoRA(nn.Module):
         extra += f" + module_lora {module_lora}" if module_lora else ""
         extra += (f" + {len(self.token_ids)} trained token rows"
                   f" (head: {self.trainable_tokens_head})") if tt_state else ""
+        extra += f" + {len(ple_state)} PLE tensors" if ple_state else ""
+        extra += (f" + {int(ng_state['ngram.uids'].numel())}/{int(self.ngram_uids.numel())} "
+                  f"n-gram row deltas") if ng_state else ""
 
         print(f" -- saved native QLoRA adapter ({len(target_leaves)} target types"
               f"{extra}) to {directory}")
@@ -4131,6 +4457,41 @@ class NativeLlamaQLoRA(nn.Module):
                         self.head_token_rows.dtype).to(self.head_token_rows.device))
             restored_extra += 1
             print(f" -- resumed {len(saved_ids)} trained token rows from {directory}")
+
+        # Fully-trained PLE tensors (train_ple): by checkpoint tensor name.
+        ple_path = os.path.join(directory, "ple_modules.safetensors")
+        if os.path.exists(ple_path) and self.ple_named_parameters():
+            ps = load_file(ple_path)
+            n_ple = 0
+            with torch.no_grad():
+                for name, prm in self.ple_named_parameters():
+                    if name in ps:
+                        prm.copy_(ps[name].to(prm.dtype).to(prm.device).view_as(prm))
+                        n_ple += 1
+            restored_extra += n_ple
+            print(f" -- resumed {n_ple} PLE tensors from {directory}")
+        # Trained n-gram row deltas (train_ngram_rows): the saved rows are a
+        # SUBSET (only the moved rows); they land in their slots when the row
+        # set is allocated (init_ngram_rows adds them to the set), or now if
+        # it already is -- then every saved row must be in it.
+        ng_path = os.path.join(directory, "ngram_rows.safetensors")
+        if os.path.exists(ng_path) and getattr(self, "train_ngram_rows", False):
+            ng = load_file(ng_path)
+            uids, delta = ng["ngram.uids"].to(torch.long), ng["ngram.delta"].to(torch.float32)
+            if self.ngram_rows is None:
+                self._ngram_pending = (uids, delta)
+            else:
+                slots = self._ngram_slot_lookup(uids)
+                if not bool((slots >= 0).all()):
+                    raise ValueError(
+                        f"{int((slots < 0).sum())} of the {int(uids.numel())} n-gram rows in "
+                        f"{directory} are not in the allocated row set; pass them to "
+                        f"init_ngram_rows(extra_uids=...) (the trainer does this on resume)")
+                with torch.no_grad():
+                    self.ngram_rows.data[slots.to(self.ngram_rows.device)] = \
+                        delta.to(self.ngram_rows.dtype).to(self.ngram_rows.device)
+            restored_extra += 1
+            print(f" -- resumed {int(uids.numel())} n-gram row deltas from {directory}")
 
         if loaded == 0 and restored_extra == 0:
             raise ValueError("No trainable adapters matched the checkpoint.")

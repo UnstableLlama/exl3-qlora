@@ -67,9 +67,27 @@ def test_trainable_tokens_forwarded():
     print("[launcher] trainable_tokens list / init mapping / head / lr forwarded PASSED")
 
 
+def test_engram_keys_forwarded():
+    cfg = {"train_ple": True, "ple_lr": 1e-4, "train_ngram_rows": True,
+           "ngram_rows_lr": 5e-3, "ngram_rows_max": 500000,
+           "targets": ["ple_proj", "q_proj"]}
+    argv = _argv(cfg)
+    assert "--train-ple" in argv and "--train-ngram-rows" in argv
+    assert float(argv[argv.index("--ple-lr") + 1]) == 1e-4
+    assert float(argv[argv.index("--ngram-rows-lr") + 1]) == 5e-3
+    assert argv[argv.index("--ngram-rows-max") + 1] == "500000"
+    i = argv.index("--targets")
+    assert argv[i + 1:i + 3] == ["ple_proj", "q_proj"]
+    # Native single/split only.
+    with pytest.raises(SystemExit):
+        _argv({**cfg, "parallel": "ddp"})
+    print("[launcher] train_ple / train_ngram_rows keys forwarded PASSED")
+
+
 def main():
     test_lr_groups_forwarded_as_json()
     test_trainable_tokens_forwarded()
+    test_engram_keys_forwarded()
     print("\nAll launcher forwarding checks passed.")
 
 

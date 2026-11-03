@@ -109,6 +109,8 @@ class LoRA:
         self._full_weight_targets = []          # [Linear] -- reset .lora_full_weight
         self._embed_restore = []                # [(Embedding, original_weight)]
         self._embed_row_restore = []            # [(Embedding, ids, original_rows)]
+        self._ple_restore = []                  # [(live tensor, original copy)] -- train_ple
+        self._ngram_tables = []                 # [NGramEmbedding] with this adapter's row deltas
         self.name = os.path.basename(os.path.dirname(config_path))
 
 
@@ -432,6 +434,63 @@ class LoRA:
             if applied:
                 print(f" -- LoRA '{self.name}': applied trained token rows {applied}")
 
+        # --- Engram / PLE layer (Qwen3.8-Flash-Next): --train-ple / --train-ngram-rows ---
+        # ple_modules.safetensors: the fully-trained grouped norm weights and conv kernel,
+        # written in place into the PLELayer (originals kept for unload); both the fused
+        # and the reference forward read them. ngram_rows.safetensors: table row ids +
+        # fp32 delta rows, installed in the layer's NGramEmbedding, which adds them onto
+        # the decoded base rows of those ids in every lookup (the table is untouched).
+        ple_path = os.path.join(directory, "ple_modules.safetensors")
+        ng_path = os.path.join(directory, "ngram_rows.safetensors")
+        if os.path.exists(ple_path) or os.path.exists(ng_path):
+            from ..modules.ple import PLELayer
+            ples = [m for m in model if isinstance(m, PLELayer) and not getattr(m, "stub", False)]
+            if not ples:
+                print(f" -- LoRA '{self.name}': WARNING -- adapter carries PLE / n-gram row "
+                      f"tensors but the model has no PLE layer; NOT applied")
+            else:
+                applied = []
+                if os.path.exists(ple_path):
+                    ps = safe_load_file(ple_path, device="cpu")
+                    live = {}
+                    for ple in ples:
+                        for n in (ple.norm_key, ple.norm_query, ple.norm_conv):
+                            if n is not None:
+                                live[n.tensor_key] = n.weight.data
+                        if ple.conv_kernel_size:
+                            live[f"{ple.key}.conv1d.weight"] = ple.conv_w
+                    n_ok = 0
+                    for name, t in ps.items():
+                        dst = live.get(name)
+                        if dst is None:
+                            print(f" -- LoRA '{self.name}': WARNING -- no PLE tensor {name} in the "
+                                  f"model; skipped")
+                            continue
+                        self._ple_restore.append((dst, dst.clone()))
+                        base = dst.to(torch.float32)
+                        new = base + self.user_scaling * (t.to(dst.device, torch.float32).view_as(dst) - base)
+                        dst.copy_(new.to(dst.dtype))
+                        n_ok += 1
+                    applied.append(f"ple[{n_ok} tensors]")
+                if os.path.exists(ng_path):
+                    ng = safe_load_file(ng_path, device="cpu")
+                    uids = ng["ngram.uids"].to(torch.long)
+                    delta = ng["ngram.delta"]
+                    with open(os.path.join(directory, "adapter_config.json"), encoding="utf8") as f:
+                        table_key = json.load(f).get("ngram_table")
+                    tables = [p.ple_embedding for p in ples
+                              if table_key is None or p.ple_embedding.key == table_key]
+                    if not tables:
+                        print(f" -- LoRA '{self.name}': WARNING -- adapter's n-gram table "
+                              f"{table_key} not in the model; row deltas NOT applied")
+                    else:
+                        table = tables[0]
+                        table.set_row_delta(uids, delta.to(torch.float16), self.user_scaling)
+                        self._ngram_tables.append(table)
+                        applied.append(f"ngram[{int(uids.numel())} row deltas]")
+                if applied:
+                    print(f" -- LoRA '{self.name}': applied Engram / PLE adapters {applied}")
+
 
     def _module_scaling(self, full_path: str, module_r: int) -> float:
         """
@@ -491,9 +550,15 @@ class LoRA:
             embed.embedding.weight.data[ids] = original_rows
         for embed, original in reversed(self._embed_restore):
             embed.embedding.weight.data = original
+        for live, original in reversed(self._ple_restore):
+            live.copy_(original)
+        for table in self._ngram_tables:
+            table.clear_row_delta()
 
         self.target_modules = {}
         self._full_weight_targets = []
         self._embed_restore = []
         self._embed_row_restore = []
+        self._ple_restore = []
+        self._ngram_tables = []
 

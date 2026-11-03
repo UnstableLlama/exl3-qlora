@@ -771,6 +771,20 @@ def print_trainable_token_stats(net, tokenizer, limit: int = 40) -> None:
         print(f"  [tokens] ... {len(stats) - limit} more")
 
 
+def print_engram_stats(net) -> None:
+    """One line per Engram / PLE trainable: the n-gram row deltas (rows seen
+    by a forward / moved, relative move vs the base row) and the fully-trained
+    PLE tensors (relative move from the loaded value). Silent without them."""
+    st = net.ngram_row_stats() if hasattr(net, "ngram_row_stats") else None
+    if st:
+        print(f"  [ngram] rows {st['rows']:,}: seen {st['seen']:,}, moved {st['moved']:,}; "
+              f"rel-move mean {st['rel_move_mean']:.4f} max {st['rel_move_max']:.4f} "
+              f"(|delta| mean {st['delta_norm_mean']:.4f})")
+    for p in (net.ple_param_stats() if hasattr(net, "ple_param_stats") else []):
+        kind = "abs-move" if p["abs"] else "rel-move"
+        print(f"  [ple] {p['tensor']}: {kind} {p['rel_move']:.5f}")
+
+
 def build_optimizer(param_groups, lr, optim="adamw"):
     """Build the optimizer over the trainable param groups.
 
@@ -2137,6 +2151,31 @@ def _run_main():
                          "group, no weight decay, same schedule). Default: --lr. "
                          "Embedding rows usually want a much higher LR than LoRA "
                          "(1e-3..1e-2 when trained alone).")
+    ap.add_argument("--train-ple", action="store_true",
+                    help="Engram / PLE layer (Qwen3.8-Flash-Next's hashed n-gram injection): "
+                         "fully fine-tune its three grouped norm weights and depthwise conv "
+                         "kernel (fp32 masters, ~0.1M params, own no-decay param group). "
+                         "The layer's key/value projections take an ordinary LoRA through "
+                         "--targets ple_key_proj ple_value_proj (or ple_proj for both). "
+                         "Saved to ple_modules.safetensors; applied by LoRA.from_directory "
+                         "and merge_lora_bf16.py.")
+    ap.add_argument("--ple-lr", type=float, default=None,
+                    help="Learning rate of the --train-ple tensors' param group. Default: --lr.")
+    ap.add_argument("--train-ngram-rows", action="store_true",
+                    help="Train the n-gram (Engram) table rows the training set touches: one "
+                         "fp32 DELTA row per unique table row the set hashes to (allocated "
+                         "after tokenization, zero-init, own no-decay param group); the "
+                         "quantized/streamed table itself is never written. Saved to "
+                         "ngram_rows.safetensors (moved rows only); applied by "
+                         "LoRA.from_directory (and the live samples). Costs 16 bytes per "
+                         "row element with AdamW: 160-wide rows -> 2.5 KB per row.")
+    ap.add_argument("--ngram-rows-lr", type=float, default=None,
+                    help="Learning rate of the n-gram row deltas' param group. Default: --lr. "
+                         "Rows are a sparse memory; like embedding rows they usually want a "
+                         "much higher LR than LoRA (1e-3..1e-2).")
+    ap.add_argument("--ngram-rows-max", type=int, default=2_000_000,
+                    help="Refuse to allocate more than this many trained n-gram rows "
+                         "(default 2M = ~5 GB of VRAM with AdamW on 160-wide rows).")
     ap.add_argument("--module-lora-lr-mul", type=float, default=1.0,
 
                     help="LR multiplier for the embed/head LoRA adapters "
@@ -2476,6 +2515,8 @@ def _run_main():
         "lr_groups": describe_lr_groups(parse_lr_group_specs(args.lr_groups)),
         "trainable_tokens": len(args.trainable_tokens) if args.trainable_tokens else "",
         "trainable_tokens_lr": "" if args.trainable_tokens_lr is None else args.trainable_tokens_lr,
+        "train_ple": int(bool(args.train_ple)),
+        "train_ngram_rows": int(bool(args.train_ngram_rows)),
         "prompt_format": args.prompt_format,
     }
 
@@ -2622,6 +2663,7 @@ def _run_main():
         lora_embed=args.lora_embed, lora_head=args.lora_head,
         trainable_tokens=trainable_tokens, trainable_token_init=token_init,
         trainable_tokens_head=args.trainable_tokens_head,
+        train_ple=args.train_ple, train_ngram_rows=args.train_ngram_rows,
         offload_activations=args.offload_activations,
         offload_mode=args.offload_mode, use_liger=args.use_liger,
         expert_r=args.expert_r, lora_dropout=args.lora_dropout,
@@ -2913,6 +2955,21 @@ def _run_main():
               f"~{real_tokens / max(1, len(examples)):.0f} real tok/block)")
         assert examples, "no training blocks after packing"
 
+    # Trained n-gram row deltas (--train-ngram-rows): the row set is the
+    # training set's own hashed rows (plus a resumed adapter's), known only
+    # now that the examples are final; allocated before the optimizer.
+    if args.train_ngram_rows:
+        _FAIL_CTX["phase"] = "ngram_rows"
+        n_rows = net.init_ngram_rows(examples, max_rows=args.ngram_rows_max)
+        hd = net.ngram_rows.shape[1]
+        print(f" -- trained n-gram rows: {n_rows:,} table rows x {hd} "
+              f"(~{n_rows * hd * 16 / 2**20:,.0f} MiB with AdamW: fp32 delta + grad + "
+              f"moments) on {net.ngram_rows.device}; rows outside the set stay frozen")
+    elif args.ngram_rows_lr is not None:
+        raise SystemExit("--ngram-rows-lr needs --train-ngram-rows.")
+    if args.ple_lr is not None and not args.train_ple:
+        raise SystemExit("--ple-lr needs --train-ple.")
+
     # eva init runs HERE (not with pissa/qerr above): it streams a no-grad
     # activation pre-pass over the actual training batches. Skipped on resume --
     # the checkpoint's A/B already carry the init, and unlike pissa there are no
@@ -2975,7 +3032,8 @@ def _run_main():
     # token rows' own group. Groups must be built identically on resume.
     lr_groups = parse_lr_group_specs(args.lr_groups)
     pg_kwargs = dict(base_lr=args.lr, module_lora_lr_mul=args.module_lora_lr_mul,
-                     lr_groups=lr_groups, trainable_tokens_lr=args.trainable_tokens_lr)
+                     lr_groups=lr_groups, trainable_tokens_lr=args.trainable_tokens_lr,
+                     ple_lr=args.ple_lr, ngram_rows_lr=args.ngram_rows_lr)
     if args.offload_embed_head_optim:
         lora_groups = net.lora_param_groups(args.weight_decay, **pg_kwargs)
         opt = build_optimizer(lora_groups, args.lr, args.optim)
@@ -3323,6 +3381,9 @@ def _run_main():
             "lr_groups": describe_lr_groups(parse_lr_group_specs(args.lr_groups)),
             "trainable_tokens": len(args.trainable_tokens) if args.trainable_tokens else "",
             "trainable_tokens_lr": "" if args.trainable_tokens_lr is None else args.trainable_tokens_lr,
+            "train_ple": int(bool(args.train_ple)),
+            "train_ngram_rows": int(bool(args.train_ngram_rows)),
+            "ngram_rows": int(net.ngram_rows.shape[0]) if getattr(net, "ngram_rows", None) is not None else "",
             "trainable_params": net.num_trainable(), "n_train": len(examples),
             "n_val": len(val_examples), "n_eval2": len(val2_examples),
             "start_loss": rnd(start_loss), "end_loss": rnd(end_loss),
@@ -3582,6 +3643,7 @@ def _run_main():
                                    ema=ema, offload_opt=offload_opt)
                 print(f"  [checkpoint] step {step} -> {cdir} (resumable)")
                 print_trainable_token_stats(net, tokenizer)
+                print_engram_stats(net)
                 prune_checkpoints(args.out, args.keep_checkpoints)
 
             if prof is not None:

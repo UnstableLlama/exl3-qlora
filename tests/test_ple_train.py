@@ -256,18 +256,37 @@ def test_ple_conv_causal_dilated_taps():
 # Trunk wiring: _run_ple + backbone.ple_ngram_embed over a mock inference layer.
 # ----------------------------------------------------------------------------
 class _MockNGram:
-    def __init__(self, ctx, eos, ple_dim, V):
+    """Stand-in for NGramEmbedding: ``H`` heads of ``head_dim`` each, position
+    ``t`` of a sequence hashing to table rows ``ids[t] * H + h`` (a stand-in
+    for the n-gram hashing: deterministic, one row per head per token)."""
+
+    def __init__(self, ctx, eos, ple_dim, V, heads=1):
         self.context_len = ctx
         self.eos_token_id = eos
-        self.rows = torch.randn(V, ple_dim)
+        self.num_heads = heads
+        self.head_dim = ple_dim // heads
+        self.key = "model.ple.ple_embedding.ngram_embedding"
+        self.table = torch.randn(V * heads, self.head_dim)       # [rows, head_dim]
+        self.rows = self.table.view(V, ple_dim)                   # token -> its H rows
         self.calls = []
+        self.row_delta = None
+
+    def compute_ngram_ids(self, history, out_len):
+        ids = history[:, -out_len:]
+        return ids.unsqueeze(-1) * self.num_heads + torch.arange(self.num_heads)
 
     def forward(self, history, params):
-        self.calls.append(history.clone())
+        self.calls.append((history.clone(), dict(params)))
         # Row per position from the current token (a stand-in for the hashed
         # n-gram gather); returns the last seq positions, half like the module.
         ids = history[:, self.context_len:]
         return self.rows[ids].half()
+
+    def set_row_delta(self, uids, delta, scale=1.0):
+        self.row_delta = (uids.clone(), delta.clone(), scale)
+
+    def clear_row_delta(self):
+        self.row_delta = None
 
 
 class _MockPLEModule:
@@ -303,7 +322,8 @@ def test_run_ple_wiring_and_history():
     # The hashing history is the fresh-sequence one: ngram_size - 1 eos tokens
     # in front of the ids (PLELayer._history), built once per forward.
     assert len(ng.calls) == 1
-    hist = ng.calls[0]
+    hist, hist_params = ng.calls[0]
+    assert hist_params.get("ngram_base_rows"), "training lookup must ask for base rows"
     assert hist.shape == (b, ngram - 1 + t) and hist.dtype == torch.int64
     assert (hist[:, :ngram - 1] == eos).all() and torch.equal(hist[:, ngram - 1:], ids)
 
@@ -326,6 +346,169 @@ def test_run_ple_wiring_and_history():
           f"(max|d|={err:.2e}), checkpoint parity + backward PASSED")
 
 
+def _load_util(name):
+    spec = importlib.util.spec_from_file_location(
+        f"exl3util_{name}", os.path.join(_ROOT, "exllamav3", "util", f"{name}.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_row_delta_helper():
+    # util/row_delta: slot lookup against a sorted id set and the out-of-place
+    # add of the matching deltas (the inference module's decode hook and the
+    # trainer's slot lookup share it).
+    rd = _load_util("row_delta")
+    table_uids = torch.tensor([3, 7, 10, 42])
+    uids = torch.tensor([[7, 8], [42, 3], [100, 0]])
+    slots = rd.row_slots(uids, table_uids)
+    assert slots.tolist() == [[1, -1], [3, 0], [-1, -1]]
+    assert rd.row_slots(uids, torch.zeros(0, dtype=torch.long)).eq(-1).all()
+    delta = torch.arange(4 * 5, dtype=torch.float32).view(4, 5)
+    rows = torch.zeros(6, 5, dtype=torch.float16)
+    out = rd.apply_row_delta(rows, uids.reshape(-1), table_uids, delta, scale=0.5)
+    assert out.dtype == torch.float16 and rows.abs().sum() == 0      # out of place
+    exp = torch.zeros(6, 5)
+    exp[0] = 0.5 * delta[1]; exp[2] = 0.5 * delta[3]; exp[3] = 0.5 * delta[0]
+    assert torch.equal(out.float(), exp)
+    # No hit: the same tensor comes back.
+    same = rd.apply_row_delta(rows, torch.tensor([1, 2]), table_uids, delta)
+    assert same is rows
+    print("[ple] row_delta slots + out-of-place add PASSED")
+
+
+def _rows_net(pe, mod, train_rows=True):
+    net = _headless_net()
+    nn.Module.__init__(net)
+    net.compute_dtype = torch.float32
+    net._adapters_off = False
+    net._ple_modules = {1: mod}
+    net._ple = nn.ModuleDict({"1": pe})
+    net.train_ple = False
+    net.train_ngram_rows = train_rows
+    net.ngram_uids = net.ngram_rows = net._ngram_uids_dev = None
+    net._ngram_base_norm = net._ngram_pending = None
+    net._ple_init = {}
+    return net
+
+
+def test_ngram_rows_delta_training():
+    # --train-ngram-rows: the row set is the training set's hashed rows; the
+    # forward adds the delta of every (position, head) whose row is in the
+    # set and leaves the others frozen; only touched slots get gradient; the
+    # reference (adapters off) forward is the pure frozen lookup; a pending
+    # load lands in its slots; stats count seen / moved rows.
+    torch.manual_seed(5)
+    b, t, H, d, heads, V, eos, ngram = 2, 7, 4, 16, 3, 30, 29, 3
+    ple_dim = 24
+    ns, lins = _make_ple(H, d, ple_dim, ngram=ngram)
+    pe = nn.Module()                      # the net's entry is an nn.Module (ModuleDict member)
+    pe.spec, pe.key_proj, pe.value_proj, pe.device = ns.spec, ns.key_proj, ns.value_proj, ns.device
+    w_key, w_val = lins["key"].frozen_weight, lins["value"].frozen_weight
+    ng = _MockNGram(ngram - 1, eos, ple_dim, V, heads=heads)
+    mod = _MockPLEModule(ng)
+    net = _rows_net(pe, mod)
+
+    train_ids = [[1, 2, 3, 4], [4, 5, 6, 7, 1]]          # tokens 1..7 -> 7 * heads rows
+    examples = [{"input_ids": x} for x in train_ids]
+    # A pending resumed delta (rows of token 9, head 0) joins the set.
+    pend_uid = torch.tensor([9 * heads])
+    pend_delta = torch.full((1, ng.head_dim), 0.25)
+    net._ngram_pending = (pend_uid, pend_delta)
+    n = net.init_ngram_rows(examples, max_rows=1000)
+    assert n == 7 * heads + 1 and net.ngram_rows.shape == (n, ng.head_dim)
+    assert net.ngram_uids.tolist() == sorted(set(i * heads + h for i in range(1, 8) for h in range(heads)) | {9 * heads})
+    slot9 = int((net.ngram_uids == 9 * heads).nonzero())
+    assert torch.allclose(net.ngram_rows[slot9], pend_delta[0]) and net._ngram_pending is None
+    # The cap is enforced with a clear message.
+    net2 = _rows_net(pe, mod)
+    try:
+        net2.init_ngram_rows(examples, max_rows=3)
+        assert False, "cap not enforced"
+    except ValueError as e:
+        assert "ngram_rows_max" in str(e)
+
+    ids = torch.tensor([[1, 2, 20, 4, 9, 3, 21], [7, 7, 22, 1, 5, 6, 2]])   # 20-22 untracked
+    streams = torch.randn(b, t, H, d)
+    frozen = net._run_ple(1, pe, streams.clone(), ids, ckpt=False).detach()
+    # Zero deltas except the pending row: positions with token 9 / head 0 shift.
+    emb_ref = ng.rows[ids].half().float().view(b, t, heads, ng.head_dim).clone()
+    emb_ref[0, 4, 0] += 0.25
+    ref = streams + _ref_ple(streams, emb_ref.view(b, t, ple_dim), pe.spec, w_key, w_val)
+    assert (frozen - ref).abs().max() < 1e-5
+
+    # Random deltas: every tracked (token, head) moves, untracked ones do not.
+    with torch.no_grad():
+        net.ngram_rows.normal_()
+    out = net._run_ple(1, pe, streams.clone(), ids, ckpt=False)
+    slots = net._ngram_slot_lookup(ng.compute_ngram_ids(mod._history(ids), t))
+    emb_ref = ng.rows[ids].half().float().view(b, t, heads, ng.head_dim).clone()
+    hit = slots >= 0
+    emb_ref[hit] += net.ngram_rows.detach()[slots[hit]]
+    ref = streams + _ref_ple(streams, emb_ref.view(b, t, ple_dim), pe.spec, w_key, w_val)
+    assert (out - ref).abs().max() < 1e-4, (out - ref).abs().max()
+    # Gradient reaches exactly the touched slots.
+    out.pow(2).mean().backward()
+    g = net.ngram_rows.grad
+    touched = torch.zeros(n, dtype=torch.bool); touched[slots[hit].unique()] = True
+    assert (g[touched].abs().sum(-1) > 0).all() and g[~touched].abs().sum() == 0
+    net.ngram_rows.grad = None
+    # Stats: the seen slots are the touched ones; all rows moved (random init).
+    st = net.ngram_row_stats()
+    assert st["rows"] == n and st["seen"] == int(touched.sum()) and st["moved"] == n
+    assert st["rel_move_mean"] > 0 and st["rel_move_max"] >= st["rel_move_mean"]
+    # Adapters off (DPO reference): the pure frozen lookup, no delta.
+    net._adapters_off = True
+    off = net._run_ple(1, pe, streams.clone(), ids, ckpt=False)
+    ref0 = streams + _ref_ple(streams, ng.rows[ids].half().float(), pe.spec, w_key, w_val)
+    assert (off - ref0).abs().max() < 1e-5
+    net._adapters_off = False
+    # A batch of only untracked rows keeps the rows on the graph (zero grad, defined).
+    out_u = net._run_ple(1, pe, streams[:, :2].clone(), torch.tensor([[20, 21], [22, 20]]), ckpt=False)
+    assert out_u.requires_grad
+    out_u.sum().backward()
+    assert net.ngram_rows.grad is not None and net.ngram_rows.grad.abs().sum() == 0
+    net.ngram_rows.grad = None
+    # Param groups: the rows' own no-decay group at their LR.
+    net._wrappers = []
+    net.embed_lora_a = net.head_lora_a = None
+    net.token_rows = net.head_token_rows = None
+    groups = net.lora_param_groups(0.1, base_lr=1e-4, ngram_rows_lr=5e-3)
+    assert groups[-1]["name"] == "ngram_rows" and groups[-1]["lr"] == 5e-3 \
+        and groups[-1]["weight_decay"] == 0.0 and groups[-1]["params"] == [net.ngram_rows]
+    # Live sample: the deltas go to the table (scaled), and come back out.
+    net._apply_ple_to_native(0.5)
+    uids_t, delta_t, sc = ng.row_delta
+    assert torch.equal(uids_t, net.ngram_uids) and sc == 0.5 and torch.allclose(delta_t, net.ngram_rows.detach())
+    net._native_token_rows_backup = None
+    net.remove_from_native()
+    assert ng.row_delta is None
+    print(f"[ple] n-gram row deltas: {n} slots, tracked rows move / untracked frozen, "
+          f"grads on touched slots only, pending load, stats, live install PASSED")
+
+
+def test_train_ple_params_get_grad():
+    # --train-ple: the three grouped norm weights and the conv kernel as fp32
+    # Parameters in the spec; the differentiable delta reaches all of them.
+    torch.manual_seed(6)
+    b, t, H, d, ple_dim = 2, 6, 3, 8, 12
+    pe, _ = _make_ple(H, d, ple_dim)
+    params = {}
+    for k in ("norm_key", "norm_query", "norm_conv"):
+        params[k] = nn.Parameter(pe.spec[k]["weight"].clone())
+        pe.spec[k]["weight"] = params[k]
+    params["conv_w"] = nn.Parameter(pe.spec["conv_w"].clone())
+    pe.spec["conv_w"] = params["conv_w"]
+    net = _headless_net()
+    streams = torch.randn(b, t, H, d)
+    emb = torch.randn(b, t, ple_dim)
+    out = _ple.ple_delta(streams, emb, pe.spec, pe.key_proj, pe.value_proj, net._norm, torch.float32)
+    out.pow(2).mean().backward()
+    for k, p in params.items():
+        assert p.grad is not None and p.grad.abs().sum() > 0, k
+    print("[ple] train_ple: norm weights + conv kernel receive gradient PASSED")
+
+
 def main():
     from util import run_timed
     run_timed([
@@ -333,6 +516,9 @@ def main():
         test_ple_gate_zero_safe_and_gradcheck,
         test_ple_conv_causal_dilated_taps,
         test_run_ple_wiring_and_history,
+        test_row_delta_helper,
+        test_ngram_rows_delta_training,
+        test_train_ple_params_get_grad,
     ], label="ple-train")
     print("\nAll PLE training checks passed.")
 

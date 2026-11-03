@@ -21,8 +21,14 @@ need per-module scales this single-scale merge would get wrong. Touches the
 linear ``lora_A``/``lora_B`` tensors and, when the adapter carries
 ``trainable_tokens.safetensors`` (``--trainable-tokens``), writes the trained
 rows into ``embed_tokens.weight`` (and ``lm_head.weight`` when the head columns
-trained separately; a tied model shares the tensor). The head/embed LoRA
-sidecars (``lora_modules`` / ``modules_to_save``) are not handled.
+trained separately; a tied model shares the tensor). Engram / PLE sidecars
+(Qwen3.8-Flash-Next): ``ple_modules.safetensors`` (``--train-ple``) is written
+over the base's norm / conv tensors of the same name; ``ngram_rows.safetensors``
+(``--train-ngram-rows``) is added onto the rows of an UNQUANTIZED
+``<table>.weight`` tensor when the base index carries one, and skipped with a
+note otherwise (deploy the rows through ``LoRA.from_directory``'s sidecar
+instead). The head/embed LoRA sidecars (``lora_modules`` /
+``modules_to_save``) are not handled.
 
 
 Usage:
@@ -93,6 +99,24 @@ def main():
         print(f"writing {len(ids)} trained token rows into {sorted(row_writes)}")
     rows_written = 0
 
+    # Engram / PLE: full tensors by name (exact key, else suffix), n-gram row deltas
+    # added onto an unquantized table tensor when the base has one.
+    ple_writes: dict[str, torch.Tensor] = {}
+    ple_path = os.path.join(args.adapter, "ple_modules.safetensors")
+    if os.path.exists(ple_path):
+        ple_writes = load_file(ple_path)
+        print(f"writing {len(ple_writes)} PLE tensors: {sorted(ple_writes)}")
+    ple_written = 0
+    ng_add = None
+    ng_path = os.path.join(args.adapter, "ngram_rows.safetensors")
+    if os.path.exists(ng_path):
+        ng = load_file(ng_path)
+        ng_key = f"{cfg.get('ngram_table', '')}.weight"
+        ng_add = (ng_key, ng["ngram.uids"].long(), ng["ngram.delta"].float())
+        print(f"adding {int(ng['ngram.uids'].numel())} n-gram row deltas onto {ng_key} "
+              f"(if the base carries it unquantized)")
+    ng_written = 0
+
 
     os.makedirs(args.out, exist_ok=True)
     idx = json.load(open(os.path.join(args.base, "model.safetensors.index.json")))
@@ -115,6 +139,23 @@ def main():
                     sd[wk] = W
                     rows_written += 1
                     touched = True
+            for pk, pt in ple_writes.items():
+                if wk == pk or wk.endswith("." + pk):
+                    W = sd[wk]
+                    assert pt.numel() == W.numel(), \
+                        f"{wk}: PLE tensor numel {pt.numel()} != base {W.numel()}"
+                    sd[wk] = pt.view_as(W).to(W.dtype).contiguous()
+                    ple_written += 1
+                    touched = True
+            if ng_add is not None and (wk == ng_add[0] or wk.endswith("." + ng_add[0])):
+                W = sd[wk].clone()
+                ids, delta = ng_add[1], ng_add[2]
+                assert delta.shape[1] == W.shape[1] and int(ids.max()) < W.shape[0], \
+                    f"{wk}: n-gram delta {tuple(delta.shape)} does not fit table {tuple(W.shape)}"
+                W[ids] = (W[ids].float() + delta).to(W.dtype)
+                sd[wk] = W
+                ng_written += 1
+                touched = True
             if wk not in weight_of_mod:
                 continue
             ab = mods[weight_of_mod[wk]]
@@ -130,6 +171,13 @@ def main():
     assert merged == len(weight_of_mod), \
         f"merged {merged} weights but adapter has {len(weight_of_mod)} " \
         f"(a target module was missing from the base index?)"
+    assert ple_written == len(ple_writes), \
+        f"wrote {ple_written} PLE tensors but the adapter has {len(ple_writes)} " \
+        f"(a PLE tensor was missing from the base index?)"
+    if ng_add is not None and ng_written == 0:
+        print(f"  note: n-gram row deltas NOT merged -- the base index has no unquantized "
+              f"{ng_add[0]} (sharded / quantized table); deploy them through the "
+              f"ngram_rows.safetensors sidecar with LoRA.from_directory instead")
     assert rows_written == len(row_writes), \
         f"wrote trained token rows into {rows_written} tensors but expected " \
         f"{sorted(row_writes)} (tied base with no lm_head.weight? then only the " \
