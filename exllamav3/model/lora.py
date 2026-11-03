@@ -81,15 +81,18 @@ class LoRA:
         config_path = os.path.join(directory, "adapter_config.json")
         weights_st = os.path.join(directory, "adapter_model.safetensors")
         weights_bin = os.path.join(directory, "adapter_model.bin")
-        modules_to_save = os.path.join(directory, "modules_to_save.safetensors")
-        lora_modules = os.path.join(directory, "lora_modules.safetensors")
+        # The native trainer's module-only adapters (targets [] with a trained
+        # embed/head, token rows or PLE layer) have no adapter_model at all,
+        # only the sidecars _load_module_adapters reads.
+        sidecars = ("modules_to_save", "lora_modules", "trainable_tokens",
+                    "ple_modules", "ngram_rows")
 
         if os.path.exists(weights_st):
             return LoRA(model, config_path, weights_st, lora_scaling, module_lora_scale)
         if os.path.exists(weights_bin):
             return LoRA(model, config_path, weights_bin, lora_scaling, module_lora_scale)
-        if os.path.exists(config_path) and (
-            os.path.exists(modules_to_save) or os.path.exists(lora_modules)
+        if os.path.exists(config_path) and any(
+            os.path.exists(os.path.join(directory, f"{s}.safetensors")) for s in sidecars
         ):
             return LoRA(model, config_path, None, lora_scaling, module_lora_scale)
         raise FileNotFoundError(f"No LoRA adapter found in {directory}")
@@ -550,8 +553,9 @@ class LoRA:
             embed.embedding.weight.data[ids] = original_rows
         for embed, original in reversed(self._embed_restore):
             embed.embedding.weight.data = original
-        for live, original in reversed(self._ple_restore):
-            live.copy_(original)
+        with torch.inference_mode():  # the PLE tensors are inference tensors
+            for live, original in reversed(self._ple_restore):
+                live.copy_(original)
         for table in self._ngram_tables:
             table.clear_row_delta()
 

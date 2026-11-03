@@ -54,7 +54,7 @@ import torch
 
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.training.native_llama import (NativeLlamaQLoRA, parse_lr_group_specs,
-                                             describe_lr_groups)
+                                             describe_lr_groups, adapter_has_no_linear)
 
 # Local run logger + self-contained HTML report -- the default logging path
 # (replaces wandb for shareable dashboards). Same dir on sys.path when this file
@@ -2472,7 +2472,19 @@ def _run_main():
         data_roles = {"dataset": args.dataset,
                       "eval_dataset": args.eval_dataset,
                       "eval2_dataset": args.eval2_dataset}
-        if args.resume:
+        if args.resume and args.targets != [] and adapter_has_no_linear(args.resume):
+            # Stage 2 of the trained-token-rows recipe: a rows-only /
+            # module-only stage-1 adapter resumed into a run WITH targets is a
+            # NEW run (fresh per-linear adapters, cold optimizer and schedule,
+            # no batch-order fast-forward), free to use different data. Every
+            # role is what the config says; stage 1's snapshot is neither
+            # checked nor substituted, and this run records its own.
+            print(f" -- dataset snapshot check skipped: {args.resume} has no "
+                  f"per-linear adapters (rows/modules-only stage 1), so this is "
+                  f"a new stage on the config's datasets, not a resume of "
+                  f"stage 1's")
+            snapshot_datasets(args.out, data_roles)
+        elif args.resume:
             resolved = resolve_resumed_datasets(args.out, args.resume, data_roles)
             args.dataset = resolved["dataset"]
             args.eval_dataset = resolved["eval_dataset"]
@@ -2709,8 +2721,12 @@ def _run_main():
         _FAIL_CTX["phase"] = "init_lora"
         net.apply_init_lora(args.init_lora, ref_model_dir=args.init_ref_model,
                             svd_niter=args.init_svd_niter)
+    # n_resumed: per-linear adapters restored; 0 for a rows-only / module-only
+    # checkpoint (stage 1 of the trained-token-rows recipe), whose stage 2
+    # still owes the fresh per-linear adapters their eva init below.
+    n_resumed = 0
     if args.resume:
-        net.load_adapter(args.resume)
+        n_resumed = net.load_adapter(args.resume)
     if args.quant_aware != "none":
         # Run configuration, not learned state: applied fresh every run
         # (including resumes -- nothing about it lives in checkpoints).
@@ -2974,7 +2990,7 @@ def _run_main():
     # activation pre-pass over the actual training batches. Skipped on resume --
     # the checkpoint's A/B already carry the init, and unlike pissa there are no
     # frozen offsets to reconstruct.
-    if args.init_lora == "eva" and not args.resume:
+    if args.init_lora == "eva" and (not args.resume or n_resumed == 0):
         _FAIL_CTX["phase"] = "init_lora"
 
         def eva_prepass():
@@ -3063,18 +3079,25 @@ def _run_main():
     # optimizer state (trunk adapters) can't apply: always a cold start there.
     if args.resume and not args.reset_optimizer and not args.freeze_trunk:
         resume_state = load_trainer_state(args.resume)
-        if resume_state is not None:
+        if resume_state is None:
+            print(f" -- {args.resume} has no trainer_state.pt; resuming weights "
+                  f"only (cold optimizer + schedule from step 0).")
+        else:
             try:
                 restore_optimizer_state(opt, resume_state["optimizer"])
             except ValueError as e:
-                if net.mtp is None:
+                if net.mtp is None and n_resumed:
                     raise
-                # A trunk checkpoint resumed into a joint trunk+MTP run: the
-                # param groups grew by the head's adapters, so the saved moments
-                # don't line up. Continue cold (weights restored, schedule from
-                # step 0) rather than die -- the same as --reset-optimizer.
+                # The trainable set grew between the checkpoint and this run
+                # -- a trunk checkpoint resumed into a joint trunk+MTP run, or
+                # a rows-only stage-1 adapter (trainable_tokens, targets [])
+                # resumed into the stage-2 SFT -- so the saved moments don't
+                # line up with the param groups. load_adapter has already
+                # checked the weights themselves against the checkpoint, so
+                # continue cold (weights restored, schedule from step 0)
+                # rather than die -- the same as --reset-optimizer.
                 print(f" -- note: optimizer state in {args.resume} does not match "
-                      f"the trunk+MTP parameter set ({e}); starting the optimizer "
+                      f"this run's parameter set ({e}); starting the optimizer "
                       f"and schedule cold (as --reset-optimizer).")
                 groups = (net.lora_param_groups(args.weight_decay, **pg_kwargs)
                           if args.offload_embed_head_optim else
@@ -3114,9 +3137,6 @@ def _run_main():
             if resume_step >= args.steps:
                 print(f" -- WARNING: resume step {resume_step} >= --steps "
                       f"{args.steps}; nothing to do. Raise --steps/--epochs.")
-        else:
-            print(f" -- {args.resume} has no trainer_state.pt; resuming weights "
-                  f"only (cold optimizer + schedule from step 0).")
 
     def batches():
         order = list(range(len(examples)))
@@ -3203,7 +3223,9 @@ def _run_main():
         # continued (doc/bug_resume_data_order.md). Yields are index lists --
         # no tokenization -- so this is microseconds. Only exact when the
         # dataset matches the original run's (enforced above by
-        # resolve_resumed_datasets unless 'current' was chosen on a mismatch).
+        # resolve_resumed_datasets unless 'current' was chosen on a mismatch;
+        # a rows-only stage-1 adapter never gets here: its optimizer state
+        # fails to restore, so resume_step stays 0).
         for _ in range(resume_step * args.grad_accum):
             next(bgen)
         print(f" -- data stream fast-forwarded {resume_step * args.grad_accum} "

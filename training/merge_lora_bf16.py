@@ -64,8 +64,10 @@ def main():
     print(f"adapter r={r} alpha={alpha} rslora={use_rslora} init={cfg.get('init_lora','default')} "
           f"-> merge scale={scale:.6f}")
 
-    # Collect lora_A/lora_B per module: base_model.model.<module>.lora_{A,B}.weight
-    ad = load_file(os.path.join(args.adapter, "adapter_model.safetensors"))
+    # Collect lora_A/lora_B per module: base_model.model.<module>.lora_{A,B}.weight.
+    # Absent for a sidecar-only adapter (trained token rows / PLE with targets []).
+    ad_path = os.path.join(args.adapter, "adapter_model.safetensors")
+    ad = load_file(ad_path) if os.path.exists(ad_path) else {}
     mods: dict[str, dict[str, torch.Tensor]] = {}
     for k, t in ad.items():
         m = re.match(r"base_model\.model\.(.+)\.lora_([AB])\.weight$", k)
@@ -116,7 +118,9 @@ def main():
         print(f"adding {int(ng['ngram.uids'].numel())} n-gram row deltas onto {ng_key} "
               f"(if the base carries it unquantized)")
     ng_written = 0
-
+    if not (weight_of_mod or row_writes or ple_writes or ng_add):
+        raise SystemExit(f" !! {args.adapter} has nothing this script merges (no "
+                         f"adapter_model / trainable_tokens / PLE sidecars)")
 
     os.makedirs(args.out, exist_ok=True)
     idx = json.load(open(os.path.join(args.base, "model.safetensors.index.json")))

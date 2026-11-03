@@ -17,11 +17,11 @@ r: 32
 alpha: 32
 use_rslora: true
 init_lora: pissa
-lr: 0.00004
+lr: 0.00001                    # 4e-5 diverged on this config (held-out 4.43 -> 2.94 -> 6.4), with or without rows
 lr_groups:
   - name: global_attn          # every full-attention block, by its attention kind
     layers: [global_attention]
-    lr: 0.00001
+    lr: 0.0000025
 trainable_tokens:              # same set as stage 1 (positional rows)
   - IceWing
   - MudWing

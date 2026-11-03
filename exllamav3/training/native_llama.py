@@ -448,6 +448,25 @@ def describe_lr_groups(groups) -> str:
     return " ".join(parts)
 
 
+def adapter_has_no_linear(directory: str) -> bool:
+    """True when ``directory`` is an adapter that trained NO per-linear
+    LoRA: ``adapter_config.json`` names no target_modules and neither
+    ``adapter_model.safetensors`` nor the pissa sidecar exists (targets []
+    with trainable_tokens / train_ple / modules_to_save -- stage 1 of the
+    trained-token-rows recipe). Resuming such a dir into a run WITH targets
+    is that recipe's stage 2, a new run from the trainer's point of view;
+    :meth:`NativeLlamaQLoRA.load_adapter` and the trainer's dataset check
+    both key off this. A config that names targets but lacks the tensors is
+    a broken checkpoint, not a rows-only one."""
+    config_path = os.path.join(directory, "adapter_config.json")
+    if not os.path.exists(config_path) \
+            or os.path.exists(os.path.join(directory, "pissa_init.safetensors")) \
+            or os.path.exists(os.path.join(directory, "adapter_model.safetensors")):
+        return False
+    with open(config_path, encoding="utf8") as f:
+        return not json.load(f).get("target_modules")
+
+
 def resolve_lr_groups(wrappers, block_meta, specs: list[dict], base_lr: float,
                       weight_decay: float) -> tuple[list, list[dict]]:
     """Split the adapted wrappers' LoRA params into the default group and one
@@ -4330,7 +4349,20 @@ class NativeLlamaQLoRA(nn.Module):
         # note; a missing TRUNK tensor is still an error.
         mtp_ids = {id(w) for w in getattr(self, "_mtp_wrappers", [])}
         fresh_mtp = 0
-        if os.path.exists(sidecar_path):
+        # A checkpoint that trained NO per-linear adapters (adapter_has_no_linear:
+        # stage 1 of the trained-token-rows recipe) resumed into a run WITH
+        # targets is that recipe's stage 2: the wrappers keep the init this
+        # run just gave them (default, or the pissa offsets computed above)
+        # and only the sidecars below are restored. A config that names
+        # targets but lacks the tensors is a broken checkpoint and still
+        # fails below.
+        if adapter_has_no_linear(directory):
+            n_fresh = sum(1 for w in self._wrappers if w.r > 0)
+            if n_fresh:
+                print(f" -- note: {directory} carries no per-linear adapters; {n_fresh} "
+                      f"wrappers keep their fresh "
+                      f"{getattr(self, 'init_lora', 'default')} init")
+        elif os.path.exists(sidecar_path):
             sc = load_file(sidecar_path)
             with torch.no_grad():
                 for w in self._wrappers:

@@ -968,6 +968,93 @@ def test_trainable_token_rows_embed_and_head():
           "rows get gradient, table frozen PASSED")
 
 
+def test_rows_only_adapter_resume():
+    # Stage 1 of the trained-token-rows recipe saves an adapter with NO
+    # per-linear tensors (targets []): no adapter_model.safetensors, just the
+    # rows sidecar. Stage 2 resumes it into a run WITH targets (default or
+    # pissa init): the rows come back, the fresh wrappers keep their init, and
+    # a checkpoint that names targets but lacks the tensors still fails.
+    import json, tempfile, shutil
+    from safetensors.torch import load_file
+    torch.manual_seed(5)
+    d, r = 6, 4
+
+    def rows_net(wrappers, init_lora="default"):
+        net = _headless_net()
+        nn.Module.__init__(net)
+        net._wrappers = wrappers
+        net.r, net.lora_alpha, net.use_rslora = r, float(r), False
+        net.init_lora = init_lora
+        net.embed_weight = net.head_weight = None
+        net.embed_lora_a = net.head_lora_a = None
+        net.lora_embed = net.lora_head = False
+        net.tie_word_embeddings = True
+        net.token_ids = torch.tensor([4, 9, 17])
+        net.token_rows = nn.Parameter(torch.randn(3, d))
+        net.head_token_rows = net.token_rows
+        net.trainable_tokens_head = "tied"
+        return net
+
+    def wrapper(pissa=False):
+        dl = DiffLinear(MockLinear(8, 8, key="model.layers.0.self_attn.q_proj",
+                                   dtype=torch.float32),
+                        r=r, alpha=float(r), compute_dtype=torch.float32)
+        if pissa:
+            dl.set_init_offset(torch.randn(8, r), torch.randn(r, 8))
+        return dl
+
+    stage1 = rows_net([])
+    td = tempfile.mkdtemp()
+    try:
+        stage1.save_adapter(td)
+        assert not os.path.exists(os.path.join(td, "adapter_model.safetensors"))
+        cfg = json.load(open(os.path.join(td, "adapter_config.json")))
+        assert cfg["target_modules"] == [] and cfg["trainable_tokens"] == [4, 9, 17]
+        # The signal the trainer's dataset check shares with load_adapter.
+        assert _nl.adapter_has_no_linear(td)
+        assert not _nl.adapter_has_no_linear(os.path.join(td, "missing"))
+
+        # Stage 2, default init: 0 per-linear adapters resumed, B still zero.
+        dl = wrapper()
+        a_init = dl.lora_a.detach().clone()
+        net2 = rows_net([dl])
+        assert net2.load_adapter(td) == 0
+        assert torch.equal(net2.token_rows, stage1.token_rows)
+        assert torch.equal(dl.lora_a, a_init) and dl.lora_b.abs().max() == 0
+
+        # Stage 2, pissa init: the offsets this run computed are kept.
+        dl = wrapper(pissa=True)
+        a0 = dl.init_a0.clone()
+        net3 = rows_net([dl], init_lora="pissa")
+        assert net3.load_adapter(td) == 0
+        assert net3.init_lora == "pissa" and torch.equal(dl.init_a0, a0)
+        assert torch.equal(net3.token_rows, stage1.token_rows)
+
+        # A run without trainable tokens has nothing to take from this dir.
+        net4 = rows_net([wrapper()])
+        net4.token_rows = net4.head_token_rows = None
+        try:
+            net4.load_adapter(td)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("rows-only dir resumed into a run without rows")
+
+        # The config naming targets whose tensors are missing is still an error.
+        cfg["target_modules"] = ["q_proj"]
+        json.dump(cfg, open(os.path.join(td, "adapter_config.json"), "w"))
+        assert not _nl.adapter_has_no_linear(td)
+        try:
+            rows_net([wrapper()]).load_adapter(td)
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("missing per-linear tensors did not raise")
+    finally:
+        shutil.rmtree(td)
+    print("[trainable_tokens] rows-only adapter resumes into default/pissa stage 2 PASSED")
+
+
 def main():
     from util import run_timed
     run_timed([
@@ -985,6 +1072,7 @@ def main():
         test_mtp_head_matches_reference_and_trains_head_only,
         test_lr_groups_param_groups,
         test_trainable_token_rows_embed_and_head,
+        test_rows_only_adapter_resume,
     ], label="native-llama")
     print("\nAll native-Llama differentiable-forward checks passed.")
 

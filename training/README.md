@@ -279,7 +279,12 @@ before the ordinary SFT:
    ratio.
 3. **Stage 2, the SFT** -- `resume:` the stage-1 adapter dir, keep
    `trainable_tokens` (the rows keep training and are re-exported) and set
-   the usual `targets` (+ `lr_groups` above).
+   the usual `targets` (+ `lr_groups` above). The per-linear adapters start
+   fresh (`init_lora: pissa` works), and the optimizer and schedule start
+   cold since stage 1's optimizer state covers only the rows. It is a new
+   run on the config's own `dataset` / `eval_dataset` (they may differ from
+   stage 1's): the resume-time dataset snapshot check is skipped with a
+   note, and stage 2 writes its own snapshot to its `out`.
 
 The rows are saved to `trainable_tokens.safetensors` next to the adapter;
 `LoRA.from_directory` writes them into the embedding at load time and

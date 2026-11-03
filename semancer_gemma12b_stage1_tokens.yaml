@@ -1,6 +1,9 @@
 # EXL3 QLoRA -- Gemma-4-12B-it: STAGE 1 of the new-vocabulary recipe. Train ONLY the
 # embedding rows (and, tied, the head columns) of repurposed <unused> tokens, from a
 # description init; nothing else trains. Follow with semancer_gemma12b_stage2_lrgroups.yaml.
+# The names below are an example: they do not occur in semancy, so point `dataset` at a set
+# that contains your names, or list names it does contain. A row with no occurrences gets no
+# gradient. Stage 2 may use a different dataset.
 #
 # Before this: rename the spare tokens in the model dir's tokenizer files
 #   python training/repurpose_tokens.py --model $MODEL --list
