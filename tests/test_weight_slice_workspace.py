@@ -71,7 +71,7 @@ def check_weight_slice_transform_and_workspace(start, width):
     load_constants("exllamav3/modules/quant/exl3.py",
                    {"MAX_WEIGHT_TRANSFORM_SLICE_N", "RECONSTRUCT_SLICE_GRANULARITY_N"}, ns)
     ns.update(ext=SimpleNamespace(reconstruct_slice=reconstruct),
-              preapply_had_l=track(left), preapply_had_r=track(right))
+              preapply_had_l_=track(left), preapply_had_r_=track(right))
     load_definitions("exllamav3/modules/quant/exl3.py", {"get_weight_tensor_slice"}, ns, "LinearEXL3")
     layer = SimpleNamespace(in_features=k, out_features=n, su=None, sv=None,
                             suh=su, svh=sv, trellis=inner, K=3, mcg=False, mul1=False)

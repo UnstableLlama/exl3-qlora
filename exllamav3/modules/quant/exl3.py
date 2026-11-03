@@ -328,9 +328,9 @@ class LinearEXL3:
             start = n_start + offset
             w = torch.empty((self.in_features, width), dtype = torch.half, device = self.trellis.device)
             ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, start)
-            w = preapply_had_l(w, had_k)
+            w = preapply_had_l_(w, had_k)
             w *= suh
-            w = preapply_had_r(w, had_n)
+            w = preapply_had_r_(w, had_n)
             w *= svh[:, start:start + width]
             result[:, offset:offset + width].copy_(w)
             del w
