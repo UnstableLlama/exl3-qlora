@@ -79,6 +79,7 @@ from qlora_train_native import (  # noqa: E402
     save_trainer_state, load_trainer_state, restore_optimizer_state,
     snapshot_datasets, resolve_resumed_datasets,
     build_optimizer, make_lr_scheduler, resolve_steps_and_warmup,
+    parse_lr_group_specs,
     compute_even_split_budgets,
     _FAIL_CTX, _log_failure, _REPORT, _finish_report,
 )
@@ -428,6 +429,11 @@ def _run_main():
     # Optimization
     ap.add_argument("--lr", type=float, default=1e-5,
                     help="Paper full-FT LR 1e-6; LoRA 1e-5 .. 5e-5.")
+    ap.add_argument("--lr-groups", "--lr-group", nargs="*", default=None, dest="lr_groups",
+                    metavar="SPEC",
+                    help="Per-module-group learning rates; same SPEC syntax as the "
+                         "SFT trainer (JSON object or NAME:LR:SEL[,SEL...], e.g. "
+                         "global_attn:1e-5:global_attention).")
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit"],
                     default="adamw")
@@ -740,7 +746,9 @@ def _run_main():
 
     # 4. Optimizer + schedule.
     betas = tuple(float(b) for b in args.adam_betas.split(","))
-    opt = build_optimizer(net.param_groups(args.weight_decay), args.lr, args.optim)
+    opt = build_optimizer(net.param_groups(args.weight_decay, base_lr=args.lr,
+                                           lr_groups=parse_lr_group_specs(args.lr_groups)),
+                          args.lr, args.optim)
     for g in opt.param_groups:
         g["betas"] = betas
     sched = make_lr_scheduler(opt, args.scheduler, args.steps * args.num_iterations,

@@ -6,6 +6,7 @@ from ..ext import exllamav3_ext as ext
 from . import Module
 from .row_table import RowTable, PREFETCH_MIN_TOKENS
 from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, words_per_row
+from ..util.row_delta import apply_row_delta
 
 """
 Hashed n-gram embedding table (Qwen3.8-Flash-Next ple_embedding and kin): maps each token position
@@ -82,6 +83,33 @@ class NGramEmbedding(Module):
         self.codebook = None
 
         self.caps.update({"prefer_cpu": True})
+
+        # Trained row deltas (the adapter sidecar ngram_rows.safetensors / the trainer's live
+        # rows): (sorted unique int64 row ids on the device, [N, head_dim] deltas on the device,
+        # scale). Added onto the decoded base rows of those ids in every lookup, unless the
+        # caller asks for base rows (params["ngram_base_rows"]: the training forward, which adds
+        # its own live deltas). The table itself is never written
+        self.row_delta = None
+
+    def set_row_delta(self, uids: torch.Tensor, delta: torch.Tensor, scale: float = 1.0):
+        """Install row deltas: uids [N] int64 (any order, unique), delta [N, head_dim]."""
+        assert uids.dim() == 1 and delta.dim() == 2 and delta.shape[0] == uids.shape[0], \
+            f"{self.key}: row delta shapes {tuple(uids.shape)} / {tuple(delta.shape)}"
+        assert delta.shape[1] == self.head_dim, \
+            f"{self.key}: row delta width {delta.shape[1]} != head_dim {self.head_dim}"
+        order = torch.argsort(uids.to("cpu", torch.int64))
+        dev = self.device if self.device is not None else delta.device
+        self.row_delta = (uids.to("cpu", torch.int64)[order].to(dev), delta[order.to(delta.device)].to(dev),
+                          float(scale))
+
+    def clear_row_delta(self):
+        self.row_delta = None
+
+    def _with_row_delta(self, rows: torch.Tensor, uids: torch.Tensor) -> torch.Tensor:
+        if self.row_delta is None:
+            return rows
+        t_uids, delta, scale = self.row_delta
+        return apply_row_delta(rows, uids.to(t_uids.device), t_uids, delta, scale)
 
     @property
     def mode(self):
@@ -187,6 +215,7 @@ class NGramEmbedding(Module):
         self.table = None
         self.scale = None
         self.device = None
+        self.row_delta = None
         self.K = None
         self.head_bias = None
         self.head_offsets = None
@@ -249,9 +278,11 @@ class NGramEmbedding(Module):
             module.codebook = mul1_codebook(device)
         return module
 
-    def fetch_rows(self, uids: torch.Tensor, out_dtype: torch.dtype = torch.half) -> torch.Tensor:
+    def fetch_rows(self, uids: torch.Tensor, out_dtype: torch.dtype = torch.half,
+                   base_rows: bool = False) -> torch.Tensor:
         """Unique row indices (any device) -> decoded (N, 160) rows on the module's device.
-        Reference form of the row pipeline (torch codec); forward() runs the fast path."""
+        Reference form of the row pipeline (torch codec); forward() runs the fast path.
+        base_rows: skip the installed row deltas."""
         raw = self.table.fetch(uids.to("cpu", torch.int64)).to(self.device)
         if self.K:
             heads = (torch.searchsorted(self.head_offsets.to(self.device),
@@ -260,6 +291,8 @@ class NGramEmbedding(Module):
             rows = dequant_rows(raw, self.K, self.codebook, self.head_bias.float()[heads])
         else:
             rows = raw.float()
+        if not base_rows:
+            rows = self._with_row_delta(rows, uids)
         return rows.to(out_dtype)
 
     def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
@@ -300,13 +333,14 @@ class NGramEmbedding(Module):
             blocks.append(torch.remainder(mixed.unsqueeze(-1), sizes.view(1, 1, -1)) + offsets.view(1, 1, -1))
         return torch.cat(blocks, dim = -1)[:, -out_len:]
 
-    def embed_ids(self, ngram_ids: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+    def embed_ids(self, ngram_ids: torch.Tensor, out_dtype: torch.dtype | None = None,
+                  base_rows: bool = False) -> torch.Tensor:
         """(bsz, seq_len, num_heads) row indices -> (bsz, seq_len, ple_embed_dim) on device.
         Reference form; forward() runs the fast path."""
         bsz, seq_len, H = ngram_ids.shape
         flat = ngram_ids.reshape(-1)
         uids, inverse = torch.unique(flat, return_inverse = True)
-        rows = self.fetch_rows(uids, out_dtype or self.out_dtype or torch.half)
+        rows = self.fetch_rows(uids, out_dtype or self.out_dtype or torch.half, base_rows = base_rows)
         out = rows[inverse.to(self.device)]
         return out.view(bsz, seq_len, H * ROW_DIM)
 
@@ -315,7 +349,7 @@ class NGramEmbedding(Module):
         """Pure-torch reference pipeline (hashing + codec), kept for tests and A/B."""
         out_len = x.shape[1] - self.context_len
         ngram_ids = self.compute_ngram_ids(x, out_len)
-        return self.embed_ids(ngram_ids, out_dtype)
+        return self.embed_ids(ngram_ids, out_dtype, base_rows = bool(params.get("ngram_base_rows")))
 
     # ---- fast path -----------------------------------------------------------------------------
     #
@@ -346,6 +380,11 @@ class NGramEmbedding(Module):
         ext.ngram_dequant(packed, self.K, heads, self.head_bias, rows, False)
         return rows
 
+    def _decode_with_delta(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
+        # _decode, then the trained row deltas on the unique rows (pin.uids[:U] are their ids)
+        rows = self._decode(packed, pin, U)
+        return self._with_row_delta(rows, pin.uids[:U])
+
     def prefetch(self, history: torch.Tensor):
         """
         Stage the rows for a coming forward over `history`, the exact (bsz, context + seq) id
@@ -372,5 +411,7 @@ class NGramEmbedding(Module):
         ids = x.to("cpu", torch.int64).contiguous()
         bsz = ids.shape[0]
         H = self.num_heads
-        out = self.table.lookup(ids, bsz * out_len * H, self._resolve, self._decode, self.device)
+        decode = self._decode if (self.row_delta is None or params.get("ngram_base_rows")) \
+            else self._decode_with_delta
+        out = self.table.lookup(ids, bsz * out_len * H, self._resolve, decode, self.device)
         return out.view(bsz, out_len, H * self.head_dim).to(out_dtype or self.out_dtype or torch.half)

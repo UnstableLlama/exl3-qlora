@@ -1,0 +1,44 @@
+# EXL3 QLoRA -- Qwen3.8-Flash-Next (2.05bpw), Engram stage: train the hashed n-gram
+# memory (row deltas on the rows the set touches), the PLE layer's norms + conv, and a
+# LoRA on its key/value projections. Nothing else trains. Built, not yet box-tested:
+# run `python training/qlora_validate_native.py --model <model> --parallel single` first.
+# Launch: python training/qlora_train.py --config qwen38_flash_next_engram.yaml
+
+model: /models/Qwen3.8-Flash-Next-exl3-2.05bpw_h4_ng4
+out: out/qwen38-engram
+
+parallel: single
+stream_experts: true        # routed experts in host RAM (see README); needs ~48 GB host RAM
+sample_every: 0             # live samples run the inference forward, which needs resident experts
+ngram_ram: false            # true with >= 64 GB host RAM: the n-gram table in RAM instead of disk
+
+# The Engram layer
+targets: [ple_key_proj, ple_value_proj]   # LoRA on the lookup's key / value projections
+r: 16
+alpha: 16
+train_ple: true             # grouped norms + conv kernel, full fp32
+train_ngram_rows: true      # delta per touched n-gram table row (zero-init, no weight decay)
+ngram_rows_lr: 0.003        # rows are a sparse memory: high LR, like embedding rows
+ngram_rows_max: 2000000     # ~5 GB of VRAM with AdamW at 160-wide rows; lower it on 16 GB
+
+lr: 0.0001                  # the projection LoRA + PLE tensors
+weight_decay: 0.0
+scheduler: cosine
+warmup_ratio: 0.05
+epochs: 2
+batch: 1
+grad_accum: 8
+max_grad_norm: 1.0
+compute_dtype: bfloat16
+
+dataset: /data/my-set.jsonl
+messages_key: messages
+prompt_format: chatml
+seq_len: 2048               # QSA is exact up to 2051 tokens on this model
+pack: false                 # no sample packing on PLE / GDN models
+shuffle: true
+
+checkpoint_every: 50        # each checkpoint logs rows seen / moved and the PLE tensors' move
+save_best: true
+val_frac: 0.05
+eval_every: 25

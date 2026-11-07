@@ -486,8 +486,50 @@ def ple_ngram_embed(module, input_ids: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         ids = module._prepare_ids(input_ids)
         history = module._history(ids)
-        emb = module.ple_embedding.forward(history, {})
+        # Base rows only: a row delta installed in the inference module (apply_to_native
+        # for a live sample, or a LoRA loaded on the same model) must not reach the
+        # training forward, which adds its own live deltas (ngram_rows)
+        emb = module.ple_embedding.forward(history, {"ngram_base_rows": True})
     return emb
+
+
+def ple_ngram_ids(module, input_ids: torch.Tensor) -> torch.Tensor:
+    """
+    The table row ids ``[b, t, num_heads]`` (int64, CPU) that the n-gram lookup of
+    :func:`ple_ngram_embed` gathers for the same batch -- the hashing of the
+    same eos-padded history through the module's own torch reference
+    (``NGramEmbedding.compute_ngram_ids``; the fast C++ hash resolves the same
+    ids). ``[b, t, h, :]`` of the embedding is row ``ids[b, t, h]``. Used by the
+    trained row deltas (``train_ngram_rows``) to find each position's slots.
+    """
+    with torch.no_grad():
+        ids = module._prepare_ids(input_ids)
+        history = module._history(ids)
+        return module.ple_embedding.compute_ngram_ids(history, ids.shape[1])
+
+
+def ple_ngram_table(module):
+    """The ``NGramEmbedding`` of a ``PLELayer`` (row deltas install there)."""
+    return module.ple_embedding
+
+
+def ple_trained_tensors(module) -> dict[str, torch.Tensor]:
+    """
+    The small per-layer tensors of a ``PLELayer`` that ``train_ple`` fine-tunes
+    in full, keyed by their checkpoint tensor names: the three grouped norm
+    weights (``[hc_mult * hidden]``, stored flat as the module holds them) and
+    the depthwise conv kernel ``[hc_mult * hidden, 1, kernel]``. These are the
+    LIVE tensors of the inference module (write in place to deploy; read to
+    snapshot).
+    """
+    assert _is_ple_layer(module) and not getattr(module, "stub", False)
+    out = {}
+    for n in (module.norm_key, module.norm_query, module.norm_conv):
+        if n is not None:
+            out[n.tensor_key] = n.weight.data
+    if module.conv_kernel_size:
+        out[f"{module.key}.conv1d.weight"] = module.conv_w
+    return out
 
 
 # --- MTP (multi-token prediction) head ---------------------------------------

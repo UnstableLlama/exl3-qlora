@@ -81,15 +81,18 @@ class LoRA:
         config_path = os.path.join(directory, "adapter_config.json")
         weights_st = os.path.join(directory, "adapter_model.safetensors")
         weights_bin = os.path.join(directory, "adapter_model.bin")
-        modules_to_save = os.path.join(directory, "modules_to_save.safetensors")
-        lora_modules = os.path.join(directory, "lora_modules.safetensors")
+        # The native trainer's module-only adapters (targets [] with a trained
+        # embed/head, token rows or PLE layer) have no adapter_model at all,
+        # only the sidecars _load_module_adapters reads.
+        sidecars = ("modules_to_save", "lora_modules", "trainable_tokens",
+                    "ple_modules", "ngram_rows")
 
         if os.path.exists(weights_st):
             return LoRA(model, config_path, weights_st, lora_scaling, module_lora_scale)
         if os.path.exists(weights_bin):
             return LoRA(model, config_path, weights_bin, lora_scaling, module_lora_scale)
-        if os.path.exists(config_path) and (
-            os.path.exists(modules_to_save) or os.path.exists(lora_modules)
+        if os.path.exists(config_path) and any(
+            os.path.exists(os.path.join(directory, f"{s}.safetensors")) for s in sidecars
         ):
             return LoRA(model, config_path, None, lora_scaling, module_lora_scale)
         raise FileNotFoundError(f"No LoRA adapter found in {directory}")
@@ -108,7 +111,11 @@ class LoRA:
         # can revert them (head full-weight override; restored embedding weight).
         self._full_weight_targets = []          # [Linear] -- reset .lora_full_weight
         self._embed_restore = []                # [(Embedding, original_weight)]
+        self._embed_row_restore = []            # [(Embedding, ids, original_rows)]
+        self._ple_restore = []                  # [(live tensor, original copy)] -- train_ple
+        self._ngram_tables = []                 # [NGramEmbedding] with this adapter's row deltas
         self.name = os.path.basename(os.path.dirname(config_path))
+
 
         # Read adapter config
         with open(config_path, encoding="utf8") as f:
@@ -380,6 +387,114 @@ class LoRA:
                           f"and/or exported through pissa, that guess is WRONG "
                           f"(pass module_lora_scale=alpha/sqrt(r) explicitly).")
 
+        # --- trained token rows (--trainable-tokens) ---
+        # trainable_tokens.safetensors: a handful of embedding rows (raw table
+        # units) and, per adapter_config "trainable_tokens_head", the head
+        # columns for the same tokens: "tied" = the same rows, "separate" =
+        # their own lm_head.rows tensor, "off" = frozen. The embedding rows are
+        # written in place (originals kept for unload); the head columns ride
+        # the LM-head Linear's runtime LoRA slot as a rank-n adapter -- A = the
+        # column deltas [n, in], B = a one-hot column selector [n, out] -- so no
+        # full head copy is needed and the graph paths see an ordinary LoRA.
+        tt_path = os.path.join(directory, "trainable_tokens.safetensors")
+        if os.path.exists(tt_path):
+            tt = safe_load_file(tt_path, device="cpu")
+            ids = tt["embed_tokens.token_ids"].to(torch.long)
+            rows = tt["embed_tokens.rows"].to(torch.float32)                  # [n, d]
+            with open(os.path.join(directory, "adapter_config.json"), encoding="utf8") as f:
+                head_mode = json.load(f).get("trainable_tokens_head", "off")
+            applied = []
+            w = getattr(getattr(embed, "embedding", None), "weight", None) if embed is not None else None
+            if w is not None:
+                dev_ids = ids.to(w.device)
+                self._embed_row_restore.append((embed, dev_ids, w.data[dev_ids].clone()))
+                w.data[dev_ids] = rows.to(w.dtype).to(w.device)
+                applied.append(f"embed_tokens[{len(ids)} rows]")
+            elif embed is not None:
+                print(f" -- LoRA '{self.name}': WARNING -- the embedding is a streamed/"
+                      f"quantized table; trained token rows NOT applied to the input embedding")
+            head_rows = None
+            if head_mode == "tied":
+                head_rows = rows
+            elif head_mode == "separate" and "lm_head.rows" in tt:
+                head_rows = tt["lm_head.rows"].to(torch.float32)
+            if head_rows is not None and head is not None and not head.is_sliced:
+                hw = head.inner.get_weight_tensor()                            # [in, out] (padded)
+                in_f, out_f = hw.shape
+                hids = ids.to(hw.device)
+                base_cols = hw[:, hids].t().to(torch.float32)                  # [n, in]
+                delta = (head_rows.to(hw.device) - base_cols[:, :head_rows.shape[1]])
+                if delta.shape[1] < in_f:
+                    delta = torch.nn.functional.pad(delta, (0, in_f - delta.shape[1]))
+                sel = torch.zeros(len(ids), out_f, dtype=torch.float16, device=hw.device)
+                sel[torch.arange(len(ids), device=hw.device), hids] = 1.0
+                head.lora_a_tensors[self] = (self.user_scaling * delta).to(torch.float16).contiguous()
+                head.lora_b_tensors[self] = sel
+                bump_runtime_lora_epoch()
+                self.target_modules.setdefault("lm_head", head)
+                del hw
+                applied.append(f"lm_head[{len(ids)} columns, {head_mode}]")
+            if applied:
+                print(f" -- LoRA '{self.name}': applied trained token rows {applied}")
+
+        # --- Engram / PLE layer (Qwen3.8-Flash-Next): --train-ple / --train-ngram-rows ---
+        # ple_modules.safetensors: the fully-trained grouped norm weights and conv kernel,
+        # written in place into the PLELayer (originals kept for unload); both the fused
+        # and the reference forward read them. ngram_rows.safetensors: table row ids +
+        # fp32 delta rows, installed in the layer's NGramEmbedding, which adds them onto
+        # the decoded base rows of those ids in every lookup (the table is untouched).
+        ple_path = os.path.join(directory, "ple_modules.safetensors")
+        ng_path = os.path.join(directory, "ngram_rows.safetensors")
+        if os.path.exists(ple_path) or os.path.exists(ng_path):
+            from ..modules.ple import PLELayer
+            ples = [m for m in model if isinstance(m, PLELayer) and not getattr(m, "stub", False)]
+            if not ples:
+                print(f" -- LoRA '{self.name}': WARNING -- adapter carries PLE / n-gram row "
+                      f"tensors but the model has no PLE layer; NOT applied")
+            else:
+                applied = []
+                if os.path.exists(ple_path):
+                    ps = safe_load_file(ple_path, device="cpu")
+                    live = {}
+                    for ple in ples:
+                        for n in (ple.norm_key, ple.norm_query, ple.norm_conv):
+                            if n is not None:
+                                live[n.tensor_key] = n.weight.data
+                        if ple.conv_kernel_size:
+                            live[f"{ple.key}.conv1d.weight"] = ple.conv_w
+                    n_ok = 0
+                    for name, t in ps.items():
+                        dst = live.get(name)
+                        if dst is None:
+                            print(f" -- LoRA '{self.name}': WARNING -- no PLE tensor {name} in the "
+                                  f"model; skipped")
+                            continue
+                        self._ple_restore.append((dst, dst.clone()))
+                        base = dst.to(torch.float32)
+                        new = base + self.user_scaling * (t.to(dst.device, torch.float32).view_as(dst) - base)
+                        dst.copy_(new.to(dst.dtype))
+                        n_ok += 1
+                    applied.append(f"ple[{n_ok} tensors]")
+                if os.path.exists(ng_path):
+                    ng = safe_load_file(ng_path, device="cpu")
+                    uids = ng["ngram.uids"].to(torch.long)
+                    delta = ng["ngram.delta"]
+                    with open(os.path.join(directory, "adapter_config.json"), encoding="utf8") as f:
+                        table_key = json.load(f).get("ngram_table")
+                    tables = [p.ple_embedding for p in ples
+                              if table_key is None or p.ple_embedding.key == table_key]
+                    if not tables:
+                        print(f" -- LoRA '{self.name}': WARNING -- adapter's n-gram table "
+                              f"{table_key} not in the model; row deltas NOT applied")
+                    else:
+                        table = tables[0]
+                        table.set_row_delta(uids, delta.to(torch.float16), self.user_scaling)
+                        self._ngram_tables.append(table)
+                        applied.append(f"ngram[{int(uids.numel())} row deltas]")
+                if applied:
+                    print(f" -- LoRA '{self.name}': applied Engram / PLE adapters {applied}")
+
+
     def _module_scaling(self, full_path: str, module_r: int) -> float:
         """
         Effective B pre-scale for one module: ``user_scaling * alpha / r`` with
@@ -434,9 +549,20 @@ class LoRA:
             linear.lora_full_weight = None
         bump_runtime_lora_epoch()
         self._sync_graphs()
+        for embed, ids, original_rows in reversed(self._embed_row_restore):
+            embed.embedding.weight.data[ids] = original_rows
         for embed, original in reversed(self._embed_restore):
             embed.embedding.weight.data = original
+        with torch.inference_mode():  # the PLE tensors are inference tensors
+            for live, original in reversed(self._ple_restore):
+                live.copy_(original)
+        for table in self._ngram_tables:
+            table.clear_row_delta()
 
         self.target_modules = {}
         self._full_weight_targets = []
         self._embed_restore = []
+        self._embed_row_restore = []
+        self._ple_restore = []
+        self._ngram_tables = []
+

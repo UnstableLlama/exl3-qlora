@@ -5,7 +5,7 @@ import os
 import torch
 import torch.nn.functional as F
 from .module import Module
-from .linear import Linear
+from .linear import Linear, has_runtime_lora
 from .rmsnorm import RMSNorm
 from .ngram_embedding import NGramEmbedding
 from .hyperconnections import hc_flush
@@ -445,7 +445,11 @@ class PLELayer(Module):
         bsz, seq = streams.shape[:2]
         H, D = self.hc_mult, self.hidden_size
         emb = self.ple_embedding.forward(token_history, params)               # (bsz, seq, ple_dim)
-        if self.key_proj is not None and self.conv_kernel_size \
+        # The fused ext paths read the projection weights directly, so an adapter in the
+        # projections' runtime LoRA slots (a trained --targets ple_key_proj / ple_value_proj) takes
+        # the op-by-op reference, whose Linear.forward applies it
+        adapted = has_runtime_lora(self.key_proj, self.value_proj, self.kv_proj)
+        if self.key_proj is not None and self.conv_kernel_size and not adapted \
                 and self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
                 and streams.dtype == torch.float and streams.is_contiguous() \
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None:
@@ -482,7 +486,7 @@ class PLELayer(Module):
                 streams[:, t0:t1].add_(delta)
                 cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
             return None, conv_stream
-        if self.kv_proj is not None and not self.conv_kernel_size \
+        if self.kv_proj is not None and not self.conv_kernel_size and not adapted \
                 and self.kv_proj.quant_type == "fp16" and self.kv_proj.inner.bias is None \
                 and streams.dtype == torch.float and streams.is_contiguous():
             # Conv-less, one fused projection (DeepSeek-V4.1 Engram): the ext call runs the whole gate and

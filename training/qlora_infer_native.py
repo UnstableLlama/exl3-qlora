@@ -11,8 +11,12 @@ If the run also trained the embedding / LM head (--lora-head, --lora-embed,
 lora_modules.safetensors / modules_to_save.safetensors, and LoRA.from_directory
 applies them here automatically (head LoRA via the LM-head's runtime LoRA slot,
 a fully-trained head via a full-weight override, embed deltas folded into the
-embedding weight). So this before/after demo reflects a trained head/embed too,
-not just the per-linear LoRA.
+embedding weight). Trained token rows (--trainable-tokens, in
+trainable_tokens.safetensors) are written into the embedding rows and, for
+the head columns, ride the LM-head's runtime LoRA slot as a rank-n adapter.
+So this before/after demo reflects a trained head/embed too, not just the
+per-linear LoRA.
+
 
 Usage:
     # base model only (no adapter loaded at all -- a true control)
