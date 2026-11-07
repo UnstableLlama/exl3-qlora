@@ -355,9 +355,14 @@ keeps the row set (`resume:` an adapter dir re-reads its `ngram_rows`
 sidecar before allocating). Not available on DDP / the preference and GRPO
 backends; sample packing is already refused on this model. CPU-tested in
 `tests/test_ple_train.py` (`test_ngram_rows_delta_training`,
-`test_train_ple_params_get_grad`, `test_row_delta_helper`); not yet run on
-hardware -- the first box run should be `qlora_validate_native.py` and a
-short `--train-ngram-rows --sample-every N` run to confirm the live install.
+`test_train_ple_params_get_grad`, `test_row_delta_helper`). Box-tested
+2026-11-02 on the 2.05 bpw pack, one 24 GB card, `stream_experts` +
+`ngram_ram`: 1 epoch of a 1.7k-row chat set, held-out loss 2.20 -> 1.69,
+188k rows moved, 9 GB peak VRAM, 53 min; the saved adapter + `ngram_rows`
+sidecar load through `LoRA.from_directory` and unload cleanly. Whether the
+rows memorize *content* (facts from the training text) is not measured yet.
+`sample_every` stays 0 with `stream_experts` (live samples need resident
+experts); check the live install by generating with the adapter afterwards.
 
 ```yaml
 # Engram stage on Qwen3.8-Flash-Next: the memory + its projections, nothing else
