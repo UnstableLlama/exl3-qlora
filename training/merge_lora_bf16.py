@@ -38,6 +38,7 @@ Usage:
 """
 import argparse, json, os, shutil, re
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 
@@ -123,10 +124,20 @@ def main():
                          f"adapter_model / trainable_tokens / PLE sidecars)")
 
     os.makedirs(args.out, exist_ok=True)
-    idx = json.load(open(os.path.join(args.base, "model.safetensors.index.json")))
     shard_of: dict[str, list[str]] = {}
-    for wk, shard in idx["weight_map"].items():
-        shard_of.setdefault(shard, []).append(wk)
+    idx_path = os.path.join(args.base, "model.safetensors.index.json")
+    if os.path.exists(idx_path):
+        idx = json.load(open(idx_path))
+        for wk, shard in idx["weight_map"].items():
+            shard_of.setdefault(shard, []).append(wk)
+    else:
+        # Single-shard checkpoint: no index, every tensor lives in model.safetensors.
+        single = os.path.join(args.base, "model.safetensors")
+        if not os.path.exists(single):
+            raise SystemExit(f" !! {args.base} has neither model.safetensors.index.json "
+                             f"nor model.safetensors")
+        with safe_open(single, framework="pt") as f:
+            shard_of["model.safetensors"] = list(f.keys())
 
     merged = 0
     for shard, keys in shard_of.items():
