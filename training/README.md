@@ -464,5 +464,3 @@ recipient header.) The vision tower is not built or trained; text only.
 
 - `doc/ebft.md` — Energy-Based Fine-Tuning: design decisions, what's verified,
   how to run, and open work. Standalone context-refresh doc for the EBFT path.
-- `doc/qlora_feasibility.md`, `doc/qlora_multigpu_plan.md`,
-  `doc/qlora_optimization_audit.md` — design rationale and plans.
