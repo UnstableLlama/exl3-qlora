@@ -526,6 +526,82 @@ def resolve_lr_groups(wrappers, block_meta, specs: list[dict], base_lr: float,
     return default, groups
 
 
+# ---------------------------------------------------------------------------
+# LoRA padding (EXL3 pads every Linear's in/out width up to a multiple of 128;
+# adapters are sized from the PADDED widths so their math matches the padded
+# activations, but the padded slice -- lora_a rows >= in_real, lora_b columns
+# >= out_real -- is outside the real model: a non-zero value there is an extra
+# hidden unit no BF16 merge can reproduce). The helpers below keep it exactly
+# zero: zeroed at creation / init / load, gradient-masked during training (a
+# zero-gradient Adam/AdamW step leaves a zero exactly zero, weight decay
+# included), asserted at save. A layer without padding never calls any of it.
+# ---------------------------------------------------------------------------
+def lora_pad_bounds(linear, in_features: int, out_features: int) -> tuple[int, int]:
+    """The wrapped Linear's REAL (unpadded) in/out widths; the padded widths
+    themselves for a layer type that does not record them (mocks)."""
+    return (int(getattr(linear, "in_features_unpadded", in_features)),
+            int(getattr(linear, "out_features_unpadded", out_features)))
+
+
+@torch.no_grad()
+def zero_lora_padding_(a: Optional[torch.Tensor], b: Optional[torch.Tensor],
+                       in_real: int, out_real: int, count: bool = True) -> float:
+    """Zero ``a[in_real:, :]`` and ``b[:, out_real:]`` in place (trainer
+    orientation: a ``[in, r]``, b ``[r, out]``). Returns the sum of squares
+    that was dropped (0.0 when ``count`` is False or nothing was padded)."""
+    dropped = 0.0
+    if a is not None and in_real < a.shape[0]:
+        s = a[in_real:, :]
+        if count:
+            dropped += float(s.float().pow(2).sum())
+        s.zero_()
+    if b is not None and out_real < b.shape[1]:
+        s = b[:, out_real:]
+        if count:
+            dropped += float(s.float().pow(2).sum())
+        s.zero_()
+    return dropped
+
+
+def lora_padding_is_zero(a: Optional[torch.Tensor], b: Optional[torch.Tensor],
+                         in_real: int, out_real: int) -> bool:
+    if a is not None and in_real < a.shape[0] and bool(a[in_real:, :].any()):
+        return False
+    if b is not None and out_real < b.shape[1] and bool(b[:, out_real:].any()):
+        return False
+    return True
+
+
+def _mask_pad_rows(n: int):
+    def hook(g: torch.Tensor) -> torch.Tensor:
+        g = g.clone()
+        g[n:, :] = 0
+        return g
+    return hook
+
+
+def _mask_pad_cols(n: int):
+    def hook(g: torch.Tensor) -> torch.Tensor:
+        g = g.clone()
+        g[:, n:] = 0
+        return g
+    return hook
+
+
+def register_lora_pad_hooks(a: torch.Tensor, b: torch.Tensor,
+                            in_real: int, out_real: int) -> None:
+    """Tensor hooks on the fp32 masters that zero the padded slice of every
+    incoming gradient. They fire inside autograd, before AccumulateGrad, so
+    every path that produces a gradient (fused Functions, the dropout branch,
+    grad accumulation, the DDP all_reduce of ``.grad``, the CPU offload
+    optimizer) only ever sees a masked one. Registered only on the padded
+    side(s)."""
+    if in_real < a.shape[0]:
+        a.register_hook(_mask_pad_rows(in_real))
+    if out_real < b.shape[1]:
+        b.register_hook(_mask_pad_cols(out_real))
+
+
 class DiffLinear(nn.Module):
     """
     Differentiable linear over a frozen native ``Linear`` module.
@@ -622,6 +698,20 @@ class DiffLinear(nn.Module):
             self.lora_a = nn.Parameter(torch.empty(self.in_features, r, dtype=torch.float32, device=dev))
             self.lora_b = nn.Parameter(torch.zeros(r, self.out_features, dtype=torch.float32, device=dev))
             init_lora_a_(self.lora_a, self.in_features)
+            # EXL3 pads in/out widths up to a multiple of 128; the padded rows
+            # of A / columns of B are outside the real model and must stay
+            # exactly zero (zeroed here, gradient-masked for the whole run,
+            # asserted at save -- see lora_pad_bounds). Unpadded layers pay
+            # nothing: no hook, no mask.
+            self.in_real, self.out_real = lora_pad_bounds(
+                linear, self.in_features, self.out_features)
+            self.has_padding = (self.in_real < self.in_features
+                                or self.out_real < self.out_features)
+            if self.has_padding:
+                zero_lora_padding_(self.lora_a, self.lora_b,
+                                   self.in_real, self.out_real, count=False)
+                register_lora_pad_hooks(self.lora_a, self.lora_b,
+                                        self.in_real, self.out_real)
             # PEFT-style lora_dropout: dropout on the LoRA branch's input only,
             # the frozen base path always sees the undropped x. Train-time only
             # (nn.Dropout is identity in eval; forward also gates on training).
@@ -630,6 +720,8 @@ class DiffLinear(nn.Module):
             self.scale = 1.0
             self.register_parameter("lora_a", None)
             self.register_parameter("lora_b", None)
+            self.in_real, self.out_real = self.in_features, self.out_features
+            self.has_padding = False
 
         # Frozen PiSSA offset (see lora_init): when set, the frozen weight is
         # served as W_q - scale·(a0@b0), realizing the PiSSA residual base
@@ -665,15 +757,44 @@ class DiffLinear(nn.Module):
             self._had = backbone.hadamard_128(suh.device, suh.dtype)
 
     @torch.no_grad()
-    def set_init_offset(self, a0: torch.Tensor, b0: torch.Tensor) -> None:
-        """Install the frozen PiSSA offset factors (fp32, adapter shapes)."""
+    def set_init_offset(self, a0: torch.Tensor, b0: torch.Tensor) -> float:
+        """Install the frozen PiSSA offset factors (fp32, adapter shapes).
+        The padded slice is zeroed first (the padded base weight is zero
+        there, so the SVD factors are only numerically ~0); returns the
+        energy dropped, 0.0 for an unpadded layer."""
         assert self.r > 0
         dev = backbone.linear_device(self.linear)
         assert a0.shape == self.lora_a.shape and b0.shape == self.lora_b.shape
-        self.init_a0_master = a0.detach().to("cpu", torch.float32).contiguous()
-        self.init_b0_master = b0.detach().to("cpu", torch.float32).contiguous()
-        self.init_a0 = a0.detach().to(dev, self.compute_dtype).contiguous()
-        self.init_b0 = b0.detach().to(dev, self.compute_dtype).contiguous()
+        self.init_a0_master = a0.detach().to("cpu", torch.float32).clone()
+        self.init_b0_master = b0.detach().to("cpu", torch.float32).clone()
+        dropped = 0.0
+        if self.has_padding:
+            dropped = zero_lora_padding_(self.init_a0_master, self.init_b0_master,
+                                         self.in_real, self.out_real)
+        self.init_a0 = self.init_a0_master.to(dev, self.compute_dtype).contiguous()
+        self.init_b0 = self.init_b0_master.to(dev, self.compute_dtype).contiguous()
+        return dropped
+
+    @torch.no_grad()
+    def zero_padding_(self) -> float:
+        """Force the adapter's padded slice back to exactly zero (after an
+        init / load wrote the whole tensor); returns the energy dropped."""
+        if self.r <= 0 or not self.has_padding:
+            return 0.0
+        return zero_lora_padding_(self.lora_a, self.lora_b, self.in_real, self.out_real)
+
+    def assert_padding_zero(self) -> None:
+        if self.r <= 0 or not self.has_padding:
+            return
+        ok = lora_padding_is_zero(self.lora_a, self.lora_b, self.in_real, self.out_real)
+        if ok and self.init_a0_master is not None:
+            ok = lora_padding_is_zero(self.init_a0_master, self.init_b0_master,
+                                      self.in_real, self.out_real)
+        if not ok:
+            raise RuntimeError(
+                f"LoRA padding is non-zero on {self.key}: adapter a{tuple(self.lora_a.shape)}/"
+                f"b{tuple(self.lora_b.shape)} has weight outside the real "
+                f"[{self.in_real}, {self.out_real}] layer -- refusing to save")
 
     def _weight_closure(self):
         wfn = backbone.frozen_weight_closure(self.linear, self.compute_dtype)
@@ -1570,6 +1691,14 @@ class NativeLlamaQLoRA(nn.Module):
             self.head_lora_a = nn.Parameter(torch.empty(hid, r, dtype=torch.float32, device=dev))
             self.head_lora_b = nn.Parameter(torch.zeros(r, vocab, dtype=torch.float32, device=dev))
             init_lora_a_(self.head_lora_a, hid)
+            # Same padding rule as the per-linear adapters: the head is an
+            # EXL3 Linear with padded widths (a non-multiple-of-128 vocab).
+            self._head_lora_real = lora_pad_bounds(self.lm_head, hid, vocab)
+            if self._head_lora_real != (hid, vocab):
+                zero_lora_padding_(self.head_lora_a, self.head_lora_b,
+                                   *self._head_lora_real, count=False)
+                register_lora_pad_hooks(self.head_lora_a, self.head_lora_b,
+                                        *self._head_lora_real)
 
         # --- trainable token rows (new-vocabulary stage) -----------------------
         # A small set of embedding ROWS trains while the table stays frozen: the
@@ -4123,6 +4252,7 @@ class NativeLlamaQLoRA(nn.Module):
         for w in self._wrappers:
             if w.r <= 0:
                 continue
+            w.assert_padding_zero()      # no weight outside the real layer
             if ".experts." in w.key:
                 expert_ranks.add(w.r)
             else:
@@ -4213,6 +4343,12 @@ class NativeLlamaQLoRA(nn.Module):
             ml_state["embed_tokens.lora_b"] = self.embed_lora_b.detach().to(torch.float16).cpu()
             module_lora.append("embed_tokens")
         if self.head_lora_a is not None:
+            if not lora_padding_is_zero(self.head_lora_a, self.head_lora_b,
+                                        *self._head_lora_real):
+                raise RuntimeError(
+                    "LoRA padding is non-zero on lm_head: the head adapter has "
+                    f"weight outside the real {self._head_lora_real} layer -- "
+                    "refusing to save")
             ml_state["lm_head.lora_a"] = self.head_lora_a.detach().to(torch.float16).cpu()
             ml_state["lm_head.lora_b"] = self.head_lora_b.detach().to(torch.float16).cpu()
             module_lora.append("lm_head")
@@ -4343,6 +4479,9 @@ class NativeLlamaQLoRA(nn.Module):
         # recomputed (randomized SVD is not deterministic across runs).
         sidecar_path = os.path.join(directory, "pissa_init.safetensors")
         loaded = 0
+        # Energy an OLD checkpoint carried in the EXL3 padding region (trained
+        # before the padding was pinned to zero); dropped on load, reported once.
+        dropped_pad = 0.0
         # MTP head wrappers may legitimately be absent from the checkpoint:
         # the two-stage recipe resumes a finished TRUNK adapter (freeze_trunk)
         # and fits a fresh head to it. Those start from init (B = 0) with a
@@ -4388,7 +4527,8 @@ class NativeLlamaQLoRA(nn.Module):
                             f"match the checkpoint?")
                     w.lora_a.copy_(a.to(w.lora_a.dtype).to(w.lora_a.device))
                     w.lora_b.copy_(b.to(w.lora_b.dtype).to(w.lora_b.device))
-                    w.set_init_offset(a0, b0)
+                    dropped_pad += w.zero_padding_()
+                    dropped_pad += w.set_init_offset(a0, b0)
                     loaded += 1
             self.init_lora = "pissa"
             print(f" -- resumed {loaded} pissa adapters (+frozen offsets) from "
@@ -4430,6 +4570,7 @@ class NativeLlamaQLoRA(nn.Module):
                 with torch.no_grad():
                     w.lora_a.copy_(a.to(w.lora_a.dtype).to(w.lora_a.device))
                     w.lora_b.copy_(b.to(w.lora_b.dtype).to(w.lora_b.device))
+                dropped_pad += w.zero_padding_()
                 loaded += 1
 
         # Restore fully-trained embed/head if present and currently enabled.
@@ -4466,8 +4607,15 @@ class NativeLlamaQLoRA(nn.Module):
                         self.head_lora_a.dtype).to(self.head_lora_a.device))
                     self.head_lora_b.copy_(ml["lm_head.lora_b"].to(
                         self.head_lora_b.dtype).to(self.head_lora_b.device))
+                    dropped_pad += zero_lora_padding_(
+                        self.head_lora_a, self.head_lora_b, *self._head_lora_real)
                     restored_extra += 1
             print(f" -- resumed embed/head LoRA from {directory}")
+        if dropped_pad > 0.0:
+            print(f" -- WARNING: {directory} was trained before the EXL3 padding "
+                  f"region was pinned to zero; dropped adapter weight outside the "
+                  f"real layers (sum of squares {dropped_pad:.3e}). The resumed "
+                  f"adapter is not the same function as the checkpoint.")
 
         # Restore trained token rows if present and currently enabled. The id
         # set must match (the rows are positional); a different set is a

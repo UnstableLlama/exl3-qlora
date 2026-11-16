@@ -262,6 +262,7 @@ def _apply_eva(net, batches, svd_niter: int, verbose: bool) -> None:
             raise
         w.lora_a.copy_(a.to(w.lora_a.device, w.lora_a.dtype))
         w.lora_b.zero_()
+        w.zero_padding_()       # EXL3 padding region stays exactly zero
         var_fracs.append(captured / max(total, 1e-30))
 
     net.init_lora = "eva"
@@ -373,6 +374,9 @@ def apply_init_lora(
             b0 = b0 / root_s
             w.lora_a.copy_(a0)
             w.lora_b.copy_(b0)
+            # The padded base rows/cols are zero, so the SVD factors are only
+            # ~0 there; pin the adapter AND the frozen offset exactly.
+            w.zero_padding_()
             w.set_init_offset(a0, b0)
         else:  # qerr
             name = f"{w.key}.weight"
@@ -402,6 +406,7 @@ def apply_init_lora(
             root_s = w.scale ** 0.5
             w.lora_a.copy_(a / root_s)
             w.lora_b.copy_(b / root_s)
+            w.zero_padding_()
         del base
         var_fracs.append(cap / max(tot, 1e-30))
         n += 1
