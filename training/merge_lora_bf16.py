@@ -51,19 +51,27 @@ def main():
     ap.add_argument("--scaling", type=float, default=1.0,
                     help="Extra user scaling on top of alpha/r (matches "
                          "LoRA.from_directory's lora_scaling; default 1.0)")
+    ap.add_argument("--truncate-padding", action="store_true",
+                    help="An adapter trained on an EXL3 base can be wider than the "
+                         "bf16 weight (the quant pads MLP widths to a multiple of "
+                         "128). Drop the padded rows/cols of the delta instead of "
+                         "refusing. Lossy if the LoRA learned in the padding: the "
+                         "dropped share is printed.")
     args = ap.parse_args()
 
     cfg = json.load(open(os.path.join(args.adapter, "adapter_config.json")))
-    if cfg.get("rank_pattern") or cfg.get("alpha_pattern"):
-        raise SystemExit(
-            " !! adapter has a rank_pattern/alpha_pattern (mixed-rank, e.g. MoE "
-            "expert_r) -- this single-scale merge would mis-scale those modules. "
-            "Not supported.")
+    if cfg.get("alpha_pattern"):
+        raise SystemExit(" !! adapter has an alpha_pattern -- not supported.")
     r = int(cfg["r"]); alpha = float(cfg["lora_alpha"])
     use_rslora = bool(cfg.get("use_rslora", False))
-    scale = args.scaling * (alpha / (r ** 0.5 if use_rslora else r))
+
+    def scale_for(module_r):
+        # Same as LoRA._module_scaling: each module's rank comes from its own
+        # tensor shape, so rank_pattern adapters (e.g. expert_r) scale right.
+        return args.scaling * alpha / (module_r ** 0.5 if use_rslora else module_r)
+
     print(f"adapter r={r} alpha={alpha} rslora={use_rslora} init={cfg.get('init_lora','default')} "
-          f"-> merge scale={scale:.6f}")
+          f"rank_pattern={cfg.get('rank_pattern') or {}} -> scale at r={r}: {scale_for(r):.6f}")
 
     # Collect lora_A/lora_B per module: base_model.model.<module>.lora_{A,B}.weight.
     # Absent for a sidecar-only adapter (trained token rows / PLE with targets []).
@@ -76,13 +84,44 @@ def main():
             print(f"  note: skipping non-lora_A/B tensor {k}")
             continue
         mods.setdefault(m.group(1), {})[m.group(2)] = t
-    weight_of_mod = {}  # HF weight key -> module key
+    shard_of: dict[str, list[str]] = {}
+    idx_path = os.path.join(args.base, "model.safetensors.index.json")
+    if os.path.exists(idx_path):
+        idx = json.load(open(idx_path))
+        for wk, shard in idx["weight_map"].items():
+            shard_of.setdefault(shard, []).append(wk)
+    else:
+        # Single-shard checkpoint: no index, every tensor lives in model.safetensors.
+        single = os.path.join(args.base, "model.safetensors")
+        if not os.path.exists(single):
+            raise SystemExit(f" !! {args.base} has neither model.safetensors.index.json "
+                             f"nor model.safetensors")
+        with safe_open(single, framework="pt") as f:
+            shard_of["model.safetensors"] = list(f.keys())
+    base_keys = {wk for keys in shard_of.values() for wk in keys}
+
+    # HF weight key -> [(module key, slot)]. slot None = the whole [out,in] weight;
+    # (expert, "gate"|"up"|"down") = one expert of a fused 3D tensor
+    # (<..>.experts.gate_up_proj [E, 2*I, H], gate rows first; .down_proj [E, H, I]),
+    # which is how HF stores Gemma 4 routed experts.
+    fused_re = re.compile(r"^(.*\.experts)\.(\d+)\.(gate|up|down)_proj$")
+    targets: dict[str, list] = {}
     for mod, ab in mods.items():
         assert "A" in ab and "B" in ab, f"{mod}: missing lora_A or lora_B"
         assert ab["A"].shape[0] == ab["B"].shape[1], \
             f"{mod}: rank mismatch A{tuple(ab['A'].shape)} B{tuple(ab['B'].shape)}"
-        weight_of_mod[f"{mod}.weight"] = mod
-    print(f"merging {len(weight_of_mod)} weights")
+        if f"{mod}.weight" in base_keys:
+            targets.setdefault(f"{mod}.weight", []).append((mod, None))
+            continue
+        m = fused_re.match(mod)
+        if m:
+            fk = m.group(1) + (".down_proj" if m.group(3) == "down" else ".gate_up_proj")
+            if fk in base_keys:
+                targets.setdefault(fk, []).append((mod, (int(m.group(2)), m.group(3))))
+                continue
+        raise SystemExit(f" !! {mod}: no matching tensor in the base")
+    n_mods = sum(len(v) for v in targets.values())
+    print(f"merging {n_mods} LoRA modules into {len(targets)} weights")
 
     # Trained token rows: {HF weight key suffix: (ids, rows)} -- matched by suffix
     # (model.embed_tokens.weight / model.language_model.embed_tokens.weight ...).
@@ -119,25 +158,30 @@ def main():
         print(f"adding {int(ng['ngram.uids'].numel())} n-gram row deltas onto {ng_key} "
               f"(if the base carries it unquantized)")
     ng_written = 0
-    if not (weight_of_mod or row_writes or ple_writes or ng_add):
+    if not (targets or row_writes or ple_writes or ng_add):
         raise SystemExit(f" !! {args.adapter} has nothing this script merges (no "
                          f"adapter_model / trainable_tokens / PLE sidecars)")
 
     os.makedirs(args.out, exist_ok=True)
-    shard_of: dict[str, list[str]] = {}
-    idx_path = os.path.join(args.base, "model.safetensors.index.json")
-    if os.path.exists(idx_path):
-        idx = json.load(open(idx_path))
-        for wk, shard in idx["weight_map"].items():
-            shard_of.setdefault(shard, []).append(wk)
-    else:
-        # Single-shard checkpoint: no index, every tensor lives in model.safetensors.
-        single = os.path.join(args.base, "model.safetensors")
-        if not os.path.exists(single):
-            raise SystemExit(f" !! {args.base} has neither model.safetensors.index.json "
-                             f"nor model.safetensors")
-        with safe_open(single, framework="pt") as f:
-            shard_of["model.safetensors"] = list(f.keys())
+
+    trunc = {"n": 0, "kept": 0.0, "dropped": 0.0}
+
+    def fit(delta, shape, what):
+        """Return delta shaped like the target, dropping quant padding if allowed."""
+        shape = tuple(shape)
+        if tuple(delta.shape) == shape:
+            return delta
+        if delta.shape[0] >= shape[0] and delta.shape[1] >= shape[1]:
+            if not args.truncate_padding:
+                raise SystemExit(
+                    f" !! {what}: delta{tuple(delta.shape)} is wider than the base "
+                    f"{shape} (EXL3 padding). Pass --truncate-padding to drop it.")
+            kept = delta[:shape[0], :shape[1]]
+            trunc["n"] += 1
+            trunc["kept"] += kept.pow(2).sum().item()
+            trunc["dropped"] += delta.pow(2).sum().item() - kept.pow(2).sum().item()
+            return kept
+        raise SystemExit(f" !! {what}: delta{tuple(delta.shape)} does not fit {shape}")
 
     merged = 0
     for shard, keys in shard_of.items():
@@ -171,21 +215,37 @@ def main():
                 sd[wk] = W
                 ng_written += 1
                 touched = True
-            if wk not in weight_of_mod:
+            if wk not in targets:
                 continue
-            ab = mods[weight_of_mod[wk]]
-
-            delta = scale * (ab["B"].float() @ ab["A"].float())   # [out,in]
-            W = sd[wk]
-            assert delta.shape == W.shape, f"{wk}: delta{tuple(delta.shape)} != W{tuple(W.shape)}"
-            sd[wk] = (W.float() + delta).to(W.dtype)
-            merged += 1
+            dtype = sd[wk].dtype
+            Wf = sd[wk].float()
+            for mod, slot in targets[wk]:
+                ab = mods[mod]
+                s = scale_for(ab["A"].shape[0])
+                delta = s * (ab["B"].float() @ ab["A"].float())   # [out,in]
+                if slot is None:
+                    Wf += fit(delta, Wf.shape, wk)
+                else:
+                    e, kind = slot
+                    if kind == "down":
+                        Wf[e] += fit(delta, Wf[e].shape, f"{wk}[{e}]")
+                    else:
+                        half = Wf.shape[1] // 2
+                        off = 0 if kind == "gate" else half
+                        Wf[e, off:off + half] += fit(delta, (half, Wf.shape[2]),
+                                                     f"{wk}[{e}].{kind}")
+                merged += 1
+            sd[wk] = Wf.to(dtype)
+            del Wf
             touched = True
         save_file(sd, os.path.join(args.out, shard), metadata={"format": "pt"})
         print(f"  wrote {shard} ({'merged' if touched else 'verbatim'})")
-    assert merged == len(weight_of_mod), \
-        f"merged {merged} weights but adapter has {len(weight_of_mod)} " \
-        f"(a target module was missing from the base index?)"
+    assert merged == n_mods, \
+        f"merged {merged} LoRA modules but adapter has {n_mods}"
+    if trunc["n"]:
+        tot = trunc["kept"] + trunc["dropped"]
+        print(f"  truncated padding on {trunc['n']} modules: dropped "
+              f"{100 * trunc['dropped'] / tot:.2f}% of the delta energy (sum of squares)")
     assert ple_written == len(ple_writes), \
         f"wrote {ple_written} PLE tensors but the adapter has {len(ple_writes)} " \
         f"(a PLE tensor was missing from the base index?)"
