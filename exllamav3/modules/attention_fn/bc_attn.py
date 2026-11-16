@@ -158,7 +158,8 @@ class BCAttn:
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
         self.sm_scale = module.sm_scale
-        self.window_size = module.sliding_window
+        wr = getattr(module, "window_right", 0)
+        self.window_size = (module.sliding_window, wr) if wr and module.sliding_window >= 0 else module.sliding_window
         self.softcap = module.logit_softcapping
 
         self.quant = k_bits > 0
@@ -524,7 +525,7 @@ class BCAttn:
             wts.fill_(1.0)
             cap = self.qsa_layer.pooled.shape[0] * self.qsa_layer.pooled.shape[1]
             s_max = -(-cap // 128) * 128
-            scores = sbuf("bca_qsa_scores", R, s_max)
+            scores = sbuf("bca_qsa_scores", R, s_max, dtype = idx.SCORE_DTYPE)
             # The scoring kernel writes only [0, T); the graphed warmup top-k scans the full
             # static width, so the tail must hold -inf from this one-time fill (the captured
             # graph patches the top-k scan width to T afterwards; eager calls narrow it to T)
@@ -534,7 +535,8 @@ class BCAttn:
 
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel,
                 {"q_idx": "*fp16:16", "w": "*fp16:16", "k_idx": "*fp16:16",
-                 "scores": "*fp16:16", "T": "i32", "R": "i32", "q_pos0": "i32",
+                 "scores": "*fp32:16" if idx.SCORE_DTYPE == torch.float else "*fp16:16",
+                 "T": "i32", "R": "i32", "q_pos0": "i32",
                  "bound_max": "i32", "block_table": "*i32:16", "num_pages_per_row": "i32"}
                 | {n: "constexpr" for n in (
                     "H_i", "H_pad", "D_i", "S_stride", "compress_rate", "scale", "BLOCK_N",

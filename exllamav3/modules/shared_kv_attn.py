@@ -121,7 +121,7 @@ class SharedKVAttention(Module):
         self.bc_attn.clear()
 
 
-    def _bc_step(self, x, cache_k, cache_v, block_table, cache_seqlens, params):
+    def _bc_step(self, x, cache_k, cache_v, block_table, cache_seqlens, params, qc = None):
         """
         Native path: projections, q-norm/RoPE and the paged attention over the source pages as one C++ call
         (one replayed CUDA graph per batch shape after warmup). None when the configuration is unsupported
@@ -129,7 +129,7 @@ class SharedKVAttention(Module):
         key = (cache_k.data_ptr(), cache_v.data_ptr())
         bca = self.bc_attn.get(key)
         if bca is None:
-            bca = self.bc_attn[key] = (build_bc_shared_kv(self, cache_k, cache_v) or False)
+            bca = self.bc_attn[key] = (build_bc_shared_kv(self, cache_k, cache_v, qc = qc) or False)
         if bca is False:
             return None
         return bca.step(
@@ -172,13 +172,20 @@ class SharedKVAttention(Module):
         assert self.source_kind is not None, f"{self.key}: not attached to a target layer"
         assert params.get("attn_mode", "flash_attn") == "flash_attn", "SharedKVAttention runs in decode mode only"
         bsz, seqlen, _ = x.shape
-        # Source pages and their addressing, shared by the native and the python path
+        # Source pages and their addressing, shared by the native and the python path. A quantized source layer
+        # is read in place (QCK/QCV in the native kernels, online dequant in the triton decode) when its format
+        # allows it, instead of get_kv() materializing full-size fp16 K/V every draft step
+        qc = None
         if self.source_kind == "paged":
             cache = params["cache"]
             block_table = get_for_device(params, "block_table", self.device)
             cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
             layer = cache.layers[self.source_layer_idx, params.get("layer_instance") or 0]
-            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, -1)
+            if getattr(layer, "qk", None) is not None and getattr(layer, "compand_a", 0.0) == 0.0 and self.head_dim % 32 == 0:
+                k_cache, sk, v_cache, sv, k_bits, v_bits = layer.get_qkv()
+                qc = (sk, sv, k_bits, v_bits)
+            else:
+                k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, -1)
             max_kv_len = None
         else:
             rsg = params.get("source_recurrent_states")
@@ -188,7 +195,7 @@ class SharedKVAttention(Module):
             _bc_attn_enable and x.dtype == torch.float16 and x.is_contiguous() and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
-            o = self._bc_step(x, k_cache, v_cache, block_table, cache_seqlens, params)
+            o = self._bc_step(x, k_cache, v_cache, block_table, cache_seqlens, params, qc = qc)
             if o is not None:
                 return to2(o, out_dtype, self.out_dtype)
         q = self.q_proj.forward(x, params, out_dtype = torch.half)
@@ -210,6 +217,8 @@ class SharedKVAttention(Module):
             window_size = (self.sliding_window, 0) if self.sliding_window > 0 else None,
             softcap = self.logit_softcapping,
             max_kv_len = max_kv_len,
+            qc = qc,
+            n_kv_heads_override = self.num_kv_heads if qc is not None else None,
         )
         o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         o = self.o_proj.forward(o, params)
