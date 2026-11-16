@@ -122,7 +122,10 @@ disabled; no second model copy):
     ``[(text, supervised)]`` prompt segments rendered WITH the generation
     prompt; ``realtime_chat.py`` wires the chat template). ``chosen`` /
     ``rejected`` are completion strings or single-turn assistant message
-    lists; ``config.eot_text`` is appended to each. Loss: ``config.dpo_loss``
+    lists; ``config.eot_text`` is appended to each. A message that carries
+    ``reasoning_content`` or ``tool_calls`` is rendered by the chat template
+    instead (needs a message-list prompt and both render callables), so the
+    reasoning and tool-call markup are part of the scored completion. Loss: ``config.dpo_loss``
     (sigmoid / hinge / ipo) at ``config.beta``, cDPO ``label_smoothing`` --
     or, with ``config.pair_objective = "orpo"``, the reference-free ORPO
     objective (NLL on chosen + odds-ratio term at ``config.beta`` = the
@@ -618,6 +621,24 @@ def completion_text(value) -> str:
                  if (m.get("role") or "").lower() == "assistant"]
         return "\n".join(p for p in parts if p).strip()
     return ""
+
+
+def completion_is_structured(value) -> bool:
+    """True for a message-list completion that carries more than plain
+    assistant text (``reasoning_content``, ``tool_calls``, a tool turn, a
+    content-parts list): only the chat template knows how to write those."""
+    if not isinstance(value, list):
+        return False
+    for m in value:
+        if not isinstance(m, dict):
+            return False
+        if m.get("reasoning_content") or m.get("tool_calls"):
+            return True
+        if (m.get("role") or "").lower() != "assistant":
+            return True
+        if m.get("content") is not None and not isinstance(m["content"], str):
+            return True
+    return False
 
 
 def coerce_label(value) -> bool:
@@ -1468,27 +1489,20 @@ class RealtimeQLoRA:
                                         cfg.add_bos)
             return {"kind": "sft", **ex}
         if "prompt" in sample and "chosen" in sample and "rejected" in sample:
-            chosen = completion_text(sample["chosen"])
-            rejected = completion_text(sample["rejected"])
-            if not chosen or not rejected:
+            chosen_ids = self._completion_ids(sample, sample["chosen"])
+            rejected_ids = self._completion_ids(sample, sample["rejected"])
+            if not chosen_ids or not rejected_ids:
                 raise ValueError("a DPO sample needs non-empty chosen and "
                                  "rejected completions")
             prompt_ids, images = self._encode_prompt_ids(sample, base_dir)
-            return self._fit_pair(
-                prompt_ids,
-                encode_completion(self.tokenizer, chosen, cfg.eot_text),
-                encode_completion(self.tokenizer, rejected, cfg.eot_text),
-                images)
+            return self._fit_pair(prompt_ids, chosen_ids, rejected_ids, images)
         if "prompt" in sample and "completion" in sample and "label" in sample:
-            completion = completion_text(sample["completion"])
-            if not completion:
+            completion_ids = self._completion_ids(sample, sample["completion"])
+            if not completion_ids:
                 raise ValueError("a KTO sample needs a non-empty completion")
             label = coerce_label(sample["label"])
             prompt_ids, images = self._encode_prompt_ids(sample, base_dir)
-            return self._fit_kto(
-                prompt_ids,
-                encode_completion(self.tokenizer, completion, cfg.eot_text),
-                label, images)
+            return self._fit_kto(prompt_ids, completion_ids, label, images)
         if "prompt" in sample and "response" in sample:
             segments = [(sample["prompt"], False),
                         (sample["response"] + cfg.eot_text, True)]
@@ -1504,6 +1518,52 @@ class RealtimeQLoRA:
             f"input_ids[/labels], messages, prompt+response, text, "
             f"prompt+chosen+rejected (DPO), prompt+completion+label (KTO), or "
             f"their pre-tokenized prompt_ids forms")
+
+    def _completion_ids(self, sample: dict, value) -> list:
+        """A preference completion field -> token ids (empty = nothing to
+        score). A string or a plain-text assistant message is the text plus
+        ``config.eot_text``. A message list carrying ``reasoning_content`` /
+        ``tool_calls`` is rendered by the chat template: the conversation
+        (prompt + completion) goes through ``render_segments``, and what
+        follows the rendered prompt is the completion, exactly as the model
+        would have to produce it after the assistant-turn opener."""
+        cfg = self.config
+        if not completion_is_structured(value):
+            text = completion_text(value)
+            return encode_completion(self.tokenizer, text, cfg.eot_text) if text else []
+        prompt = sample["prompt"]
+        if not isinstance(prompt, list):
+            raise ValueError(
+                "a completion with reasoning_content / tool_calls is rendered "
+                "by the chat template together with its prompt, so the prompt "
+                "must be a list of messages (or render the completion "
+                "yourself and send it as a string)")
+        if self.render_segments is None or self.render_prompt is None:
+            raise ValueError(
+                "a completion with reasoning_content / tool_calls needs the "
+                "render_segments and render_prompt callables (see "
+                "training/realtime_chat.py); or render it yourself and send "
+                "it as a string")
+        if has_image_parts(prompt):
+            raise ValueError(
+                "a completion with reasoning_content / tool_calls is not "
+                "supported after an image prompt; render it yourself and "
+                "send it as a string")
+        head = "".join(t for t, _ in self.render_prompt(sample))
+        full = "".join(t for t, _ in self.render_segments(
+            {**sample, "messages": list(prompt) + list(value)}))
+        if not full.startswith(head):
+            raise ValueError(
+                "the chat template renders this completion differently from "
+                "the generation prompt (e.g. the prompt opens or closes a "
+                "think block the message does not have), so it cannot follow "
+                "the prompt as written; check enable_thinking / template "
+                "vars, or send the completion as a rendered string")
+        # The template closes the turn itself (and not always with eot_text:
+        # Gemma 4 ends a tool-call turn on its tool-response opener), so
+        # nothing is appended.
+        text = full[len(head):].rstrip()
+        return encode_completion(self.tokenizer, text, "") if text else []
 
     def _encode_prompt_ids(self, sample: dict,
                            base_dir: Optional[str] = None) -> tuple:

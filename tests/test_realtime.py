@@ -1018,6 +1018,74 @@ def _render_prompt(sample):
     return [(m["content"], False) for m in sample["prompt"]] + [("<a>", False)]
 
 
+def _render_conversation(sample):
+    # the same fake template for a whole conversation: an assistant turn is
+    # the opener, an optional think block, tool calls, the content, the close
+    out = []
+    for m in sample["messages"]:
+        if m["role"] != "assistant":
+            out.append((m["content"], False))
+            continue
+        text = "<a>"
+        if m.get("reasoning_content"):
+            text += "<t>" + m["reasoning_content"] + "</t>"
+        text += m.get("content") or ""
+        for call in m.get("tool_calls") or []:
+            text += "<c>" + call["function"]["name"] + "</c>"
+        out.append((text + "!\n", True))
+    return out
+
+
+def test_encode_preference_structured_completion():
+    """reasoning_content / tool_calls in a chosen / rejected / completion
+    message are rendered by the template, not dropped."""
+    ids = lambda text: [ord(ch) for ch in text]
+    rt = make_rt(RealtimeConfig(eot_text="!"), render_prompt=_render_prompt,
+                 render_segments=_render_conversation)
+    prompt = [{"role": "user", "content": "a"}]
+
+    ex = rt._encode({
+        "prompt": prompt,
+        "chosen": [{"role": "assistant", "reasoning_content": "r", "content": "c"}],
+        "rejected": [{"role": "assistant", "content": "",
+                      "tool_calls": [{"function": {"name": "f"}}]}]})
+    assert ex["prompt_ids"] == [1] + ids("a<a>")
+    # what follows the rendered prompt, closed once by the template's own eot
+    assert ex["chosen_ids"] == ids("<t>r</t>c!")
+    assert ex["rejected_ids"] == ids("<c>f</c>!")
+
+    # plain-text messages keep the old path byte for byte
+    ex = rt._encode({"prompt": prompt,
+                     "chosen": [{"role": "assistant", "content": "c"}],
+                     "rejected": [{"role": "assistant", "content": "d"}]})
+    assert ex["chosen_ids"] == ids("c!") and ex["rejected_ids"] == ids("d!")
+
+    # KTO
+    ex = rt._encode({"prompt": prompt, "label": True, "completion": [
+        {"role": "assistant", "reasoning_content": "r", "content": "c"}]})
+    assert ex["completion_ids"] == ids("<t>r</t>c!")
+
+    structured = [{"role": "assistant", "reasoning_content": "r", "content": "c"}]
+    # a rendered-string prompt cannot be re-rendered with the completion
+    for bad_rt, sample, needle in (
+            (rt, {"prompt": "ab", "chosen": structured, "rejected": "d"},
+             "list of messages"),
+            (make_rt(render_prompt=_render_prompt),
+             {"prompt": prompt, "chosen": structured, "rejected": "d"},
+             "render_segments"),
+            # the generation prompt disagrees with the rendered conversation
+            (make_rt(render_prompt=lambda s: [("a<a><t>", False)],
+                     render_segments=lambda s: [("a<a>c!", True)]),
+             {"prompt": prompt, "chosen": structured, "rejected": "d"},
+             "renders this completion differently")):
+        try:
+            bad_rt._encode(sample)
+            raise AssertionError("expected ValueError")
+        except ValueError as e:
+            assert needle in str(e), e
+    print("encode preference, structured completions: OK")
+
+
 def test_encode_preference():
     rt = make_rt(RealtimeConfig(eot_text="!"), render_prompt=_render_prompt)
 
@@ -1549,6 +1617,7 @@ if __name__ == "__main__":
     test_ingest_batching_and_callbacks()
     test_ingest_token_weighted_loss()
     test_encode_preference()
+    test_encode_preference_structured_completion()
     test_ingest_dpo()
     test_ingest_kto()
     test_ingest_mixed_kinds()
