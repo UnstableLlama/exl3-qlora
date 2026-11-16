@@ -2979,6 +2979,7 @@ struct Pool
     {
         pin_self(idx);
         int idle = 0;
+        std::chrono::steady_clock::time_point idle_since{};
         while (true) {
             const uint64_t g = dispatch.load(std::memory_order_acquire);
             if (g == seen)
@@ -2991,7 +2992,16 @@ struct Pool
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
                 if (++idle < 65536) { cpu_pause(); continue; }
 #ifdef __linux__
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                {
+                    // Nap length by time idle, so the wake penalty stays a small fraction of any gap: a decode step
+                    // with a long GPU-only window keeps 100 us naps, 10 ms naps only after seconds between requests
+                    if (idle == 65536) idle_since = std::chrono::steady_clock::now();
+                    const auto idle_for = std::chrono::steady_clock::now() - idle_since;
+                    if (idle_for < std::chrono::milliseconds(100)) std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    else if (idle_for < std::chrono::seconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    else std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    idle = 65536 + 1;
+                }
 #else
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone

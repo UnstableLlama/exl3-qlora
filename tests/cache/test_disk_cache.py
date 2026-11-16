@@ -229,6 +229,46 @@ def test_index_is_rebuilt_from_files(device, tmp_path):
     tier2.close()
 
 
+def test_pages_and_checkpoints_of_another_process_are_adopted_without_a_reopen(device, tmp_path):
+    # Two tiers open on one directory, as two processes sharing a root. What the first writes after the second
+    # opened is found by the hashes of a coming allocation: the pages, their chain metadata and the checkpoint
+    # they anchor; a hash not asked for stays unknown, and the adopted pages restore like any other
+    tier_a, disk_a, tensor_a = build(8, device, tmp_path)
+    tier_b, disk_b, tensor_b = build(8, device, tmp_path)
+    for tag in range(1, 4):
+        fill(tensor_a, tag, float(tag))
+        tier_a.store(page(tag, tag, prev = phash(tag - 1) if tag > 1 else None), serial = tag)
+    stashed = {"position": 96, "checkpoint_size": 4096, "layer.a": torch.full((8,), 2.0)}
+    disk_a.write_state(phash(3), stashed)
+    disk_a.flush()
+    assert not disk_b.has_page(phash(1)) and not disk_b.has_state(phash(3))
+
+    disk_b.prefetch([phash(1), phash(2)], serial = 1)
+    assert disk_b.has_page(phash(1)) and disk_b.has_page(phash(2)) and not disk_b.has_page(phash(3))
+    assert disk_b.page_prev_hash(phash(2)) == phash(1) and disk_b.chain_prev(phash(2)) == phash(1)
+    assert disk_b.metrics["pages_adopted"] == 2 and disk_b.metrics["states_adopted"] == 0
+    assert disk_b.total_size == disk_a.pages[phash(1)]["size"] + disk_a.pages[phash(2)]["size"]
+    for tag in (1, 2):
+        if phash(tag) not in tier_b:
+            assert tier_b.promote(phash(tag), serial = 20) is not None
+        e = tier_b.fetch(phash(tag), 0, serial = 20)
+        assert e is not None and e["pending"].is_set()
+        torch.cuda.synchronize()
+        assert torch.all(tensor_b[0] == float(tag))
+
+    disk_b.prefetch([phash(3)], serial = 2)
+    assert disk_b.has_page(phash(3)) and disk_b.has_state(phash(3))
+    assert disk_b.metrics["states_adopted"] == 1
+    back = disk_b.read_state(phash(3))
+    assert back["position"] == 96 and torch.equal(back["layer.a"], stashed["layer.a"])
+    host_pool.give(back)
+    # Asking again finds nothing new
+    assert disk_b.adopt([phash(1), phash(2), phash(3)]) == 0
+    for disk, tier in ((disk_a, tier_a), (disk_b, tier_b)):
+        disk.close()
+        tier.close()
+
+
 def test_root_budget_evicts_least_recently_used_sibling_directories(device, tmp_path):
     # Three configurations share one root. The budget is the root's; the newest open removes the oldest
     # sibling whole and keeps the one used more recently
@@ -649,8 +689,13 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
         prev = phash(tag)
     disk_a.flush()
     page_bytes = disk_a.image_size + 512
-    # Root: what A holds plus half a page, so B's share cannot take a page until something of A's goes
+    # Root: what A holds plus half a page, so B's share cannot take a page until something of A's goes. Processes
+    # on one root must agree on the budget: A's declaration is set to the root B will use, as if A had been
+    # started with it (a reopen would change A's directory size through the WAL checkpoint)
     root = DiskPageCache._dir_size(disk_a.dir) + page_bytes // 2
+    disk_a._retract_budget()
+    disk_a.root_size = disk_a.max_size = root
+    disk_a._declare_budget()
     tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
     assert os.path.isdir(disk_a.dir) and 0 <= disk_b.max_size < page_bytes
     # Over B's share but within the reclaim chunk: written, with the reclaim queued behind it
@@ -671,7 +716,7 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
     disk_b.close(); tier_b.close()
     disk_a.close(); tier_a.close()
     # Reopened, A's index agrees with its files
-    tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "aaaa")
     assert not disk_a2.has_page(phash(4)) and disk_a2.has_page(phash(1))
     disk_a2.close(); tier_a2.close()
 
@@ -772,3 +817,26 @@ def test_idle_flush_ends_when_vram_holds_more_pages_than_the_disk_budget(device,
     # The pages the pass kept are the most recently used ones
     assert all(disk.has_page(phash(t)) or phash(t) in tier for t in (10, 11, 12))
     disk.close(); tier.close()
+
+
+def test_processes_sharing_a_root_must_agree_on_the_budget(device, tmp_path):
+    # Each directory records the budget of the process using it. A second tier on the root with a different budget
+    # is refused while the first is open (same directory or a sibling), accepted with the same budget; a closed
+    # tier retracts its declaration, and a declaration of a process that no longer runs does not count
+    import json
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 30, fingerprint = "model_a")
+    with pytest.raises(ValueError, match = "same disk cache size"):
+        build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_a")
+    with pytest.raises(ValueError, match = "same disk cache size"):
+        build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_b")
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 30, fingerprint = "model_b")
+    disk_b.close(); tier_b.close()
+    assert not os.path.exists(os.path.join(tmp_path, "model_b", "budget.json"))
+    disk_a.close(); tier_a.close()
+    tier_c, disk_c, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_c")
+    disk_c.close(); tier_c.close()
+    # A declaration left by a process that died (a pid nothing runs under, fresh file) is ignored
+    with open(os.path.join(tmp_path, "model_a", "budget.json"), "w") as f:
+        json.dump({"root_size": 1 << 20, "pid": 2 ** 22 - 1, "time": time.time()}, f)
+    tier_d, disk_d, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_d")
+    disk_d.close(); tier_d.close()
