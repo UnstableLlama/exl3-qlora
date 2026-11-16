@@ -997,7 +997,19 @@ class Job:
 
         # Decode and buffer output
         id_to_piece = self.generator.tokenizer.get_id_to_piece_list(self.decode_special_tokens)
-        new_text = id_to_piece[next_token.item()]
+        token_id = next_token.item()
+        if not 0 <= token_id < len(id_to_piece):
+            # The sampler masks every id past the vocabulary, so finite logits cannot produce
+            # one: this is NaN/Inf logits on a step the first-token check does not cover
+            raise NonFiniteLogits(
+                f"Job {self.identifier!r} (serial {self.serial_number}) sampled token id {token_id}, outside "
+                f"the vocabulary ({len(id_to_piece)} pieces), at step {self.new_tokens}. Ids past the vocabulary "
+                f"are masked before sampling, so the logits were NaN/Inf. With a LoRA that was just trained or "
+                f"loaded, suspect the adapter first (a learning rate that is too high overflows in half "
+                f"precision). Otherwise A/B the fused decode paths: EXL3_BC_MLA=0, EXL3_BC_GDN=0, "
+                f"EXL3_BC_ATTN=0, EXL3_BC_DSA=0, EXL3_GRAPHS=0."
+            )
+        new_text = id_to_piece[token_id]
 
         if self.new_tokens == 0:
             unhealed = id_to_piece[self.prefix_token[0].item()]
