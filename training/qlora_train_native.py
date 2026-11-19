@@ -785,6 +785,10 @@ def print_engram_stats(net) -> None:
         print(f"  [ple] {p['tensor']}: {kind} {p['rel_move']:.5f}")
 
 
+# Param groups (by name) that muon / adamuon leave on AdamW: not hidden matrices.
+NON_MATRIX_GROUPS = ("trainable_tokens", "ple", "ngram_rows", "modules_to_save")
+
+
 def build_optimizer(param_groups, lr, optim="adamw"):
     """Build the optimizer over the trainable param groups.
 
@@ -800,9 +804,21 @@ def build_optimizer(param_groups, lr, optim="adamw"):
     negligible quality cost (the QLoRA paper trains with paged 8-bit Adam). The
     ``paged_`` variant additionally offloads optimizer state to host memory on a
     spike, smoothing transient peaks. Both need ``bitsandbytes`` importable.
+
+    ``muon`` / ``adamuon`` (exllamav3/training/muon.py) step the LoRA matrices
+    along their orthogonalized momentum; trained token rows, PLE / n-gram
+    tensors and a fully-trained embed/head stay on AdamW inside the same
+    optimizer. State is fp32: 4 bytes/param for ``muon`` (momentum only), 8 for
+    ``adamuon`` (momentum + second moment). Both scale the update to an RMS of
+    0.2 * lr, so an AdamW learning rate is the starting point.
     """
     if optim == "adamw":
         return torch.optim.AdamW(param_groups, lr=lr)
+    if optim in ("muon", "adamuon"):
+        from exllamav3.training.muon import MuonAdamW
+        for g in param_groups:
+            g["matrix"] = g.get("name") not in NON_MATRIX_GROUPS
+        return MuonAdamW(param_groups, lr=lr, adaptive=(optim == "adamuon"))
     try:
         import bitsandbytes as bnb
     except Exception as e:
@@ -1865,14 +1881,17 @@ def _run_main():
     ap.add_argument("--weight-decay", type=float, default=0.01,
                     help="AdamW weight decay on the LoRA params (default 0.01).")
 
-    ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit"],
+    ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit", "muon", "adamuon"],
                     default="adamw",
                     help="Optimizer. 'adamw' = torch AdamW (fp32 moments, 8 "
                          "bytes/param). 'adamw8bit' / 'paged_adamw8bit' = "
                          "bitsandbytes 8-bit AdamW (~2 bytes/param) -- cuts "
                          "optimizer state ~4x, the lever for fitting bigger r / "
                          "longer context on tight VRAM. 'paged_' offloads optimizer "
-                         "state to host on spikes (needs bitsandbytes installed).")
+                         "state to host on spikes (needs bitsandbytes installed). "
+                         "'muon' / 'adamuon' = orthogonalized-momentum updates on "
+                         "the LoRA matrices, AdamW on everything else (fp32 state: "
+                         "4 / 8 bytes/param); start from the AdamW learning rate.")
     ap.add_argument("--scheduler", choices=["none", "linear", "cosine"],
                     default="none",
                     help="LR schedule after warmup: none (constant), linear "
