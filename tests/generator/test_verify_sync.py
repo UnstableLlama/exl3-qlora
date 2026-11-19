@@ -90,7 +90,7 @@ class _PrefilledJob:
 def _mtp_generator(monkeypatch, calls, verify):
     """A stand-in MTP generator for one iterate(): `verify` stands in for iterate_gen"""
     g = Generator.__new__(Generator)
-    g.pipeline = g.draft_cache = g.recurrent_cache = g.visualizer = g.sparse_head = g.disk_page_cache = None
+    g.pipeline = g.draft_cache = g.recurrent_cache = g.visualizer = g.sparse_head = g.disk_page_cache = g.memt_memory = None
     g.cache = SimpleNamespace(initialized = True)
     g.pagetable = SimpleNamespace(num_unreferenced_pages = lambda: 0)
     g.pending_jobs, g.active_jobs = [], [_PrefilledJob()]

@@ -1961,7 +1961,7 @@ class Generator:
         # MemT memory: one snapshot per batch row, stacked per layer in compact-batch order. Rows of jobs
         # without a snapshot read zeros (exactly the plain backbone). A lone row passes its cached copy
         # through unstacked. The attention module leaves the graph-captured decode path while this is set
-        memt_read = self.memt_batch_read(batch_jobs) if self.model.caps.get("memt") else None
+        memt_read = self.memt_batch_read(batch_jobs) if "memt" in self.model.caps else None
 
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
         for job in batch_jobs:
