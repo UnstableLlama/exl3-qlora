@@ -163,6 +163,9 @@ optim: adamw              # single/split only. adamw: torch AdamW, fp32 moments 
                           #   run can pass step 0 and OOM at step 1). adamw8bit: bitsandbytes 8-bit
                           #   moments, ~4x smaller -- the first lever on tight VRAM.
                           #   paged_adamw8bit: same, plus the moments page to host RAM on pressure
+                          #   muon | adamuon: orthogonalized-momentum updates on the LoRA matrices,
+                          #   AdamW on everything else. fp32 state, 4 / 8 bytes per param. Start
+                          #   from the AdamW lr (both scale the update to an RMS of 0.2 * lr).
 scheduler: none           # none (constant after warmup) | linear | cosine (decay to 0)
 warmup_ratio: 0.0         # fraction of total steps warming LR from 0 (e.g. 0.05); ignored if
 warmup_steps: 0           #   warmup_steps > 0, which sets the warmup length directly

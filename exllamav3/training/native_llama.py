@@ -3983,7 +3983,7 @@ class NativeLlamaQLoRA(nn.Module):
                                         ngram_rows_lr)
         ms = self.modules_to_save_parameters()
         if ms:
-            groups.append({"params": ms, "weight_decay": 0.0})
+            groups.append({"params": ms, "weight_decay": 0.0, "name": "modules_to_save"})
         return groups
 
     @torch.no_grad()

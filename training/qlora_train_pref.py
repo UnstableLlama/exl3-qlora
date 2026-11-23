@@ -617,7 +617,7 @@ def _run_main():
                          "SFT trainer (JSON object or NAME:LR:SEL[,SEL...], e.g. "
                          "global_attn:1e-5:global_attention).")
     ap.add_argument("--weight-decay", type=float, default=0.01)
-    ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit"],
+    ap.add_argument("--optim", choices=["adamw", "adamw8bit", "paged_adamw8bit", "muon", "adamuon"],
                     default="adamw")
     ap.add_argument("--scheduler", choices=["none", "linear", "cosine"], default="none")
     ap.add_argument("--warmup-ratio", type=float, default=0.0)
