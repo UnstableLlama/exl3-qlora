@@ -92,6 +92,7 @@ COMMON_KEYS = {
 SINGLE_ONLY_KEYS = {
     "device", "parallel", "reserve_per_device", "use_per_device", "split_even", "optim",
     "inspect", "lora_embed", "lora_head", "module_lora_lr_mul",
+    "dataset_bits",
     "offload_embed_head_optim",
     # Trained token rows (the new-vocabulary stage); native single/split only.
     "trainable_tokens", "trainable_tokens_init", "trainable_tokens_head",
@@ -290,6 +291,7 @@ SINGLE_ONLY_DEFAULTS = {
     "lora_embed": False,
     "lora_head": False,
     "module_lora_lr_mul": 1.0,
+    "dataset_bits": 256,
     "trainable_tokens": None,
     "trainable_tokens_init": None,
     "trainable_tokens_head": "auto",
