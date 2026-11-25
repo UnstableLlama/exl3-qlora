@@ -2358,7 +2358,7 @@ def _run_main():
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
                          "--val-frac > 0). 0 = only at the end.")
-    ap.add_argument("--dataset-bits", type=int, default=256, metavar="N",
+    ap.add_argument("--dataset-bits", type=int, default=0, metavar="N",
                     help="Measure the training set's size in bits under the frozen "
                          "base model (its negative log-likelihood on the supervised "
                          "tokens) from N randomly chosen examples before training, "
@@ -2366,7 +2366,8 @@ def _run_main():
                          "the rank that would fit it, and log capacity/* metrics "
                          "(bits stored, share of the dataset, bits per trainable "
                          "parameter) each step. Costs N forward passes at startup. "
-                         "-1 = every example (exact), 0 = off. See "
+                         "-1 = every example (exact), 0 = off (default); 256 "
+                         "is a reasonable sample. See "
                          "training/lora_capacity.py for what the numbers mean.")
     ap.add_argument("--save-best", action="store_true",
                     help="Save the adapter only when held-out loss improves "

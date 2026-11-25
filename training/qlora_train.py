@@ -291,7 +291,7 @@ SINGLE_ONLY_DEFAULTS = {
     "lora_embed": False,
     "lora_head": False,
     "module_lora_lr_mul": 1.0,
-    "dataset_bits": 256,
+    "dataset_bits": 0,
     "trainable_tokens": None,
     "trainable_tokens_init": None,
     "trainable_tokens_head": "auto",

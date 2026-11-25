@@ -127,7 +127,7 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   live view dies with the trainer process.
 - `lora_capacity.py` — dataset size vs. adapter capacity, in bits (after
   Engram's "Predicting LoRA size for any dataset"). With `--dataset-bits N`
-  (default 256 examples; `-1` = all, `0` = off) the SFT trainer
+  (off by default; e.g. `256` examples, `-1` = all) the SFT trainer
   (`qlora_train_native.py`, single/split) sizes the training set under the
   frozen base model before step 1, prints the adapter's estimated capacity
   and the rank range that would fit the set, and logs `capacity/stored_kb`,
