@@ -62,6 +62,7 @@ from exllamav3.training.native_llama import (NativeLlamaQLoRA, parse_lr_group_sp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_report import (RunLogger, decode_example_docs,  # noqa: E402
                         start_live_monitor)
+import lora_capacity  # noqa: E402
 from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
                         trim_trailing_context, make_segment_builder,
                         encode_segments, encode_completion,
@@ -2357,6 +2358,17 @@ def _run_main():
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Also report held-out loss every N steps (needs "
                          "--val-frac > 0). 0 = only at the end.")
+    ap.add_argument("--dataset-bits", type=int, default=0, metavar="N",
+                    help="Measure the training set's size in bits under the frozen "
+                         "base model (its negative log-likelihood on the supervised "
+                         "tokens) from N randomly chosen examples before training, "
+                         "then print it next to the adapter's estimated capacity and "
+                         "the rank that would fit it, and log capacity/* metrics "
+                         "(bits stored, share of the dataset, bits per trainable "
+                         "parameter) each step. Costs N forward passes at startup. "
+                         "-1 = every example (exact), 0 = off (default); 256 "
+                         "is a reasonable sample. See "
+                         "training/lora_capacity.py for what the numbers mean.")
     ap.add_argument("--save-best", action="store_true",
                     help="Save the adapter only when held-out loss improves "
                          "(needs --val-frac + --eval-every), so a long run keeps "
@@ -2401,6 +2413,13 @@ def _run_main():
                          "inference reconstruct_hgemm math). legacy: the original "
                          "full get_weight_tensor per reconstruction, kept for A/B "
                          "and reproducing old runs.")
+    ap.add_argument("--expert-loop", action="store_true",
+                    help="MoE: run each routed expert through its own three "
+                         "projection calls, as the trainer did before the "
+                         "stacked path (exllamav3/training/expert_bank.py), "
+                         "which runs a projection of every routed expert at "
+                         "once. Several times slower on a large MoE, a little "
+                         "less VRAM; kept for A/B and reproducing old runs.")
     ap.add_argument("--dequant-cache", action="store_true",
                     help="Opt-in: reuse each frozen weight between the checkpoint-"
                          "recompute forward and its backward (3 -> 2 dequants per "
@@ -2480,6 +2499,8 @@ def _run_main():
 
     from exllamav3.training import backbone as _backbone_cfg
     _backbone_cfg.set_dequant_mode(args.dequant_mode)
+    if args.expert_loop:
+        NativeLlamaQLoRA.expert_bank_enabled = False
 
     # Dataset-mix continuity: a fresh run snapshots its data files into
     # <out>/dataset/ (copy + sha256); a resume verifies the config's paths
@@ -3364,6 +3385,82 @@ def _run_main():
         if wandb_run is not None:
             wandb_run.log(base_eval, step=0)
 
+    # Dataset size in bits under the frozen base (--dataset-bits), the unit the
+    # adapter's capacity is measured in (training/lora_capacity.py). Adapters
+    # are disabled for the pass so a resumed or SVD-initialized run still
+    # measures the base model. The mean nats/token comes from a sample; the
+    # supervised-token total is counted exactly, so only the mean is estimated.
+    cap = None
+    if args.dataset_bits != 0 and examples and net.trunk_trainable():
+        _FAIL_CTX["phase"] = "dataset_bits"
+        n_sup_of = lambda ex: sum(1 for l in ex["labels"][1:] if l != -100)
+        total_sup = sum(n_sup_of(ex) for ex in examples)
+        n_meas = len(examples) if args.dataset_bits < 0 \
+            else min(args.dataset_bits, len(examples))
+        picked = (examples if n_meas == len(examples)
+                  else random.Random(0).sample(examples, n_meas))
+        t_bits = time.time()
+        nats, n_tok = 0.0, 0
+        net.eval()
+        with torch.no_grad(), net.adapters_disabled():
+            for ex in picked:
+                k = n_sup_of(ex)
+                if k == 0:
+                    continue
+                input_ids, labels, attn, pos_ids, seg_ids = collate([ex], pad_id)
+                l = net.compute_loss(input_ids, labels, attention_mask=attn,
+                                     chunk=args.ce_chunk,
+                                     position_ids=pos_ids, seg_ids=seg_ids,
+                                     mm=collate_mm([ex], input_ids)).item()
+                # Joint trunk+MTP: the dataset is sized by the trunk's loss.
+                l = getattr(net, "last_losses", {}).get("trunk", l)
+                nats += l * k
+                n_tok += k
+        net.train()
+        if n_tok and total_sup:
+            base_nats = nats / n_tok
+            ds_bits = lora_capacity.nats_to_bits(base_nats * total_sup)
+            shapes = [(w.in_real, w.out_real, w.r) for w in net._wrappers
+                      if w.r > 0 and w.lora_a.requires_grad]
+            cap = {"base_nats": base_nats, "total_sup": total_sup,
+                   "ds_bits": ds_bits, "ema": None,
+                   "n_params": max(net.num_trainable(), 1)}
+            fb = lora_capacity.fmt_bits
+            print(f" -- dataset size under the base model: {fb(ds_bits)} "
+                  f"({total_sup:,} supervised tokens x "
+                  f"{lora_capacity.nats_to_bits(base_nats):.3f} bits/token; "
+                  f"{'all' if n_meas == len(examples) else f'sampled {n_meas} of'} "
+                  f"{len(examples)} examples, {time.time() - t_bits:.1f}s)")
+            cap_summary = {
+                "dataset_kb": ds_bits / lora_capacity.BITS_PER_KB,
+                "dataset_bits_per_tok": lora_capacity.nats_to_bits(base_nats)}
+            if shapes:
+                c_lo, c_hi = lora_capacity.capacity_range_bits(shapes)
+                r_opt, r_cons = lora_capacity.rank_for_bits(shapes, ds_bits)
+                rtxt = lambda r: "beyond full rank" if r is None else f"r={r}"
+                verdict = ("below the dataset size: expect the loss to plateau "
+                           "before the training set is fit" if c_hi < ds_bits
+                           else "covers the dataset" if c_lo >= ds_bits
+                           else "may or may not cover the dataset")
+                print(f" -- adapter capacity estimate: {fb(c_lo)} - {fb(c_hi)} "
+                      f"({len(shapes)} adapted matrices; per-matrix theory up to "
+                      f"the x{lora_capacity.JOINT_BONUS:g} joint-training bonus) "
+                      f"-- {verdict}")
+                print(f" -- rank to memorize this dataset on these targets: "
+                      f"{rtxt(r_opt)} (optimistic) to {rtxt(r_cons)} "
+                      f"(conservative). A capacity floor for fitting the training "
+                      f"set, not a generalization optimum.")
+                cap_summary.update(
+                    adapter_capacity_kb=f"{c_lo / lora_capacity.BITS_PER_KB:.4g} - "
+                                        f"{c_hi / lora_capacity.BITS_PER_KB:.4g}",
+                    rank_to_fit=f"{rtxt(r_opt)} - {rtxt(r_cons)}")
+            if report is not None:
+                # Flushed now so the report can size the stored-bits curve
+                # against the dataset while the run is live (or after a crash).
+                report.update_summary(cap_summary, flush=True)
+            if wandb_run is not None:
+                wandb_run.summary.update(cap_summary)
+
     # Start the training timer + VRAM peak AFTER the baseline eval so neither is
     # counted against training throughput.
     t0 = time.time()
@@ -3607,6 +3704,19 @@ def _run_main():
                 "perf/sup_tok_s": sup_tps, "perf/tot_tok_s": tot_tps,
                 **{f"train/loss_{k}": v for k, v in accum_parts.items()},
             }
+            if cap is not None:
+                # Bits the adapter has taken off the dataset's code length,
+                # from the smoothed trunk loss (a single batch's loss differs
+                # from the dataset mean by far more than the per-step change).
+                trunk_loss = accum_parts.get("trunk", accum_loss)
+                cap["ema"] = trunk_loss if cap["ema"] is None \
+                    else 0.9 * cap["ema"] + 0.1 * trunk_loss
+                stored = lora_capacity.nats_to_bits(
+                    (cap["base_nats"] - cap["ema"]) * cap["total_sup"])
+                train_metrics.update({
+                    "capacity/stored_kb": stored / lora_capacity.BITS_PER_KB,
+                    "capacity/stored_frac": stored / cap["ds_bits"],
+                    "capacity/bits_per_param": stored / cap["n_params"]})
             if report is not None:
                 report.log(train_metrics, step=step)
             if wandb_run is not None:

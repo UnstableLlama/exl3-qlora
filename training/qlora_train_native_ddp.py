@@ -378,6 +378,9 @@ def _run_main():
                          "token share of the whole step (one small all-reduce of "
                          "the counts per step), so the step gradient equals one "
                          "big batch. mean: the pre-Session-11 mean-of-means.")
+    ap.add_argument("--expert-loop", action="store_true",
+                    help="MoE: per-expert loop in place of the stacked "
+                         "routed-expert path; see the SFT arm.")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
                     help="Frozen-weight dequant path (audit A1); see the "
                          "single-GPU arm. Ranks behave identically either way.")
@@ -393,6 +396,8 @@ def _run_main():
 
     from exllamav3.training import backbone as _backbone_cfg
     _backbone_cfg.set_dequant_mode(args.dequant_mode)
+    if args.expert_loop:
+        NativeLlamaQLoRA.expert_bank_enabled = False
 
     # Cleaning is opt-in (--clean-text); --no-clean-text is now a no-op kept for
     # backward compatibility (warned once, on rank 0, below after setup).

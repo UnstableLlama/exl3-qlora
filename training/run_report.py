@@ -52,6 +52,10 @@ import html as _html
 import json
 import math
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lora_capacity  # noqa: E402
 
 
 REPORT_SUBDIR = "run_report"
@@ -126,8 +130,12 @@ class RunLogger:
         self._fh.write(json.dumps(row) + "\n")
         self._fh.flush()
 
-    def update_summary(self, d):
+    def update_summary(self, d, flush=False):
+        """Merge into the summary. ``flush`` writes summary.json now instead of
+        at finish(), for values a live or crashed run's report needs."""
         self.summary.update({k: _json_safe(v) for k, v in d.items()})
+        if flush:
+            self._write_json("summary.json", self.summary)
 
     def finish(self, exit_code=0, status=None):
         if self._closed:
@@ -179,6 +187,28 @@ def _read_metrics(path):
     return rows
 
 
+def _capacity_projection(series, summary):
+    """Summary entries derived from the ``capacity/stored_kb`` curve (logged by
+    the SFT trainer under --dataset-bits): where it ends, the asymptote a
+    log-logistic fit projects, and what that says about rank vs. steps.
+    Computed at render time so it tracks a live run and needs nothing stored."""
+    pts = [p for p in series.get("capacity/stored_kb", []) if p[0] is not None]
+    if not pts:
+        return {}
+    out = {"stored_kb": pts[-1][1]}
+    dataset = summary.get("dataset_kb")
+    if isinstance(dataset, (int, float)) and dataset > 0:
+        out["stored_frac"] = pts[-1][1] / dataset
+    fit = lora_capacity.fit_log_logistic(pts)
+    if fit:
+        out["stored_projected_kb"] = fit["asymptote"]
+        verdict = lora_capacity.capacity_verdict(
+            fit, dataset if isinstance(dataset, (int, float)) else None, pts[-1][0])
+        if verdict:
+            out["capacity_verdict"] = verdict
+    return out
+
+
 def _load_run(out_dir, label=None):
     """Read one run's config/metrics/summary off disk into the payload shape the
     HTML template consumes: {meta, config, summary, series}. ``series`` maps each
@@ -201,6 +231,8 @@ def _load_run(out_dir, label=None):
             if v != v or v in (float("inf"), float("-inf")):  # NaN / inf
                 continue
             series.setdefault(k, []).append([step, v])
+
+    summary.update(_capacity_projection(series, summary))
 
     meta["label"] = (label if label is not None
                      else meta.get("run_name")

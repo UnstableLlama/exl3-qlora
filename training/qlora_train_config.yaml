@@ -483,6 +483,9 @@ eval2_max_samples: 0
 eval2_max_blocks: 0       # size eval2 to roughly match the primary eval set
 val_frac: 0.0             # no eval_split? carve this fraction off train as held-out instead
 eval_every: 0             # report held-out loss every N steps (0 = only at the end)
+dataset_bits: 0           # size the train set in bits under the base model from N examples
+                          # (e.g. 256; -1 = all, 0 = off): prints adapter capacity + the rank that
+                          # would fit it, logs capacity/* metrics (native single/split only)
 save_best: false          # save only when the PRIMARY held-out loss improves
 run_log: qlora_runs.csv   # CSV run log (one row per run: hyperparams, losses, tok/s, peak VRAM)
 no_report: false          # the local run report is the DEFAULT logging path (all backends; rank 0

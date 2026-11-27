@@ -107,6 +107,7 @@ from . import backbone
 from . import vision
 from . import quant_aware as _qa
 from .qlora_linear import EXL3LoRAFunction, EXL3LoRAHadFunction, init_lora_a_
+from .expert_bank import build_bank
 from .fused_ce import (
     fused_linear_cross_entropy, fused_linear_cross_entropy_vocab_chunked,
     DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK, IGNORE_INDEX,
@@ -2321,6 +2322,24 @@ class NativeLlamaQLoRA(nn.Module):
             mlp_out = d if mlp_out is None else mlp_out + d
         return mlp_out
 
+    # Stacked routed-expert path (training.expert_bank). The trainers' --expert-loop
+    # and EXL3_TRAIN_EXPERT_BANK=0 keep the per-expert loop.
+    expert_bank_enabled = os.environ.get("EXL3_TRAIN_EXPERT_BANK", "1") != "0"
+
+    def _expert_banks(self, entry):
+        """The layer's ``(gate, up, down)`` ``ExpertBank`` triple, built on
+        first use and kept on the entry, or ``None`` when the stacked path is
+        off or the layer's experts cannot stack."""
+        if not self.expert_bank_enabled:
+            return None
+        banks = getattr(entry, "_expert_bank_triple", None)
+        if banks is None:
+            built = [build_bank(ws) for ws in
+                     (entry.expert_gates, entry.expert_ups, entry.expert_downs)]
+            banks = tuple(built) if all(b is not None for b in built) else False
+            entry._expert_bank_triple = banks
+        return banks or None
+
     def _moe_out(self, meta, entry, normed2, residual=None, input_ids=None):
         """Block-sparse mixture of experts (BlockSparseMLP -- Qwen3-MoE /
         Qwen3.5-MoE / Gemma4 MoE / AFMoE) over the already-normed input.
@@ -2460,20 +2479,37 @@ class NativeLlamaQLoRA(nn.Module):
         w_sorted = flat_w[order]
         counts = torch.bincount(flat_idx, minlength=num_experts).tolist()
 
-        out = torch.zeros(nt, d, dtype=acc, device=y.device)
-        start = 0
-        for e in range(num_experts):
-            end = start + counts[e]
-            if end == start:
-                continue                                        # no tokens routed here
-            toks = tok_sorted[start:end]
-            w = w_sorted[start:end].unsqueeze(1)                # [c, 1] >=fp32
-            xe = ye.index_select(0, toks)                       # [c, d]
-            h = self._gated_act(act, entry.expert_gates[e](xe), entry.expert_ups[e](xe),
+        banks = self._expert_banks(entry)
+        if banks is not None and all(b.active() for b in banks):
+            # Stacked path (training.expert_bank): each projection of every
+            # routed expert in one reconstruct + grouped GEMM over the sorted
+            # rows. A token's k expert outputs are then summed in slot order,
+            # a fixed order the checkpoint recompute reproduces.
+            hit = [e for e in range(num_experts) if counts[e]]
+            row_e = flat_idx[order]
+            xs = ye.index_select(0, tok_sorted)                 # [nt*k, d]
+            bg, bu, bd = banks
+            h = self._gated_act(act, bg.forward(xs, row_e, hit, counts),
+                                bu.forward(xs, row_e, hit, counts),
                                 meta.get("act_limit", 0.0))
-            de = entry.expert_downs[e](h)                       # [c, d] compute dtype
-            out.index_add_(0, toks, de.to(acc) * w)
-            start = end
+            de = bd.forward(h, row_e, hit, counts).to(acc) * w_sorted.unsqueeze(1)
+            slots = torch.empty_like(de).index_copy(0, order, de)
+            out = slots.view(nt, top_k, d).sum(dim=1)
+        else:
+            out = torch.zeros(nt, d, dtype=acc, device=y.device)
+            start = 0
+            for e in range(num_experts):
+                end = start + counts[e]
+                if end == start:
+                    continue                                    # no tokens routed here
+                toks = tok_sorted[start:end]
+                w = w_sorted[start:end].unsqueeze(1)            # [c, 1] >=fp32
+                xe = ye.index_select(0, toks)                   # [c, d]
+                h = self._gated_act(act, entry.expert_gates[e](xe), entry.expert_ups[e](xe),
+                                    meta.get("act_limit", 0.0))
+                de = entry.expert_downs[e](h)                   # [c, d] compute dtype
+                out.index_add_(0, toks, de.to(acc) * w)
+                start = end
 
         # Gemma4: the routed output sum is normed before the shared expert is
         # added (post_feedforward_layernorm_2 in the checkpoint).

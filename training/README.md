@@ -125,6 +125,20 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   rank's shard, labeled by rank). Nothing about the dataset is written to disk
   or into `report.html`: the shareable artifact stays dataset-free, and the
   live view dies with the trainer process.
+- `lora_capacity.py` — dataset size vs. adapter capacity, in bits (after
+  Engram's "Predicting LoRA size for any dataset"). With `--dataset-bits N`
+  (off by default; e.g. `256` examples, `-1` = all) the SFT trainer
+  (`qlora_train_native.py`, single/split) sizes the training set under the
+  frozen base model before step 1, prints the adapter's estimated capacity
+  and the rank range that would fit the set, and logs `capacity/stored_kb`,
+  `capacity/stored_frac` and `capacity/bits_per_param` each step. The report
+  fits a log-logistic curve to the stored bits and says whether the run is
+  capacity-bound (raise the rank) or step-bound (train longer). The capacity
+  is a range: per-matrix theory up to a x2.5 joint-training bonus that the
+  post measured on one 0.8B full-precision model, uncalibrated for EXL3
+  bases. "Fits" means memorizing the training set, not generalizing; in the
+  first epoch the stored figure reflects loss on unseen examples. CPU-tested
+  in `tests/test_lora_capacity.py`.
 - `realtime_chat.py` — interactive demo of REAL-TIME (inference-time)
   training: one loaded model chats through the normal generator AND trains
   its LoRA adapter in place (`exllamav3.training.RealtimeQLoRA`). `/learn
@@ -212,6 +226,13 @@ routed/shared post-norms, per-expert scale). Plain
 paths only; opt in to the routed
 experts with `--targets ... expert_gate_proj expert_up_proj expert_down_proj`
 (consider a small `--expert-r` — it's one adapter pair per expert per layer).
+A layer's routed experts run stacked: one reconstruct, one pair of Hadamard
+passes and one grouped GEMM per projection over every routed expert, with the
+LoRA factors still one pair per expert (same adapter keys, same merge).
+`--expert-loop` (`expert_loop: true`) runs them one expert at a time as the
+trainer did before; quant-aware runs, `--dequant-mode legacy`, streamed
+experts and expert ranks that are not a multiple of 8 take the loop on their
+own.
 The router is always frozen and no aux load-balancing loss is added. Caveat:
 routed-expert adapters DO apply in native generation (fixed in Session 26,
 box-verified end-to-end in Session 28 — `expert_demo.py` shows the trained
