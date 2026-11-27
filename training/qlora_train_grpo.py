@@ -500,6 +500,9 @@ def _run_main():
     ap.add_argument("--offload-activations", action="store_true")
     ap.add_argument("--offload-mode", choices=["async", "sync"], default="async")
     ap.add_argument("--use-liger", action="store_true")
+    ap.add_argument("--expert-loop", action="store_true",
+                    help="MoE: per-expert loop in place of the stacked "
+                         "routed-expert path; see the SFT arm.")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast")
     ap.add_argument("--no-report", action="store_true")
     ap.add_argument("--run-name", default="")
@@ -509,6 +512,8 @@ def _run_main():
     set_strip_sys_prompt_extras(args.strip_sys_prompt_extras)
     from exllamav3.training import backbone as _backbone
     _backbone.set_dequant_mode(args.dequant_mode)
+    if args.expert_loop:
+        NativeLlamaQLoRA.expert_bank_enabled = False
 
     if not args.reward:
         raise SystemExit("--reward is required (a built-in name, path/to/file.py:func "

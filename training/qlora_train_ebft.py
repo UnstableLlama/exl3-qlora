@@ -668,6 +668,9 @@ def _run_main():
     ap.add_argument("--offload-activations", action="store_true")
     ap.add_argument("--offload-mode", choices=["async", "sync"], default="async")
     ap.add_argument("--use-liger", action="store_true")
+    ap.add_argument("--expert-loop", action="store_true",
+                    help="MoE: per-expert loop in place of the stacked "
+                         "routed-expert path; see the SFT arm.")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast")
     # Live sample generations (same knobs / native path as the SFT trainer).
     ap.add_argument("--sample-every", type=int, default=0,
@@ -701,6 +704,8 @@ def _run_main():
 
     from exllamav3.training import backbone as _backbone
     _backbone.set_dequant_mode(args.dequant_mode)
+    if args.expert_loop:
+        NativeLlamaQLoRA.expert_bank_enabled = False
 
     if args.n_samples < 2:
         raise SystemExit("--n-samples must be >= 2 (RLOO baseline); paper uses 4.")

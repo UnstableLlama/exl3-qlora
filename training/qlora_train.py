@@ -70,7 +70,7 @@ COMMON_KEYS = {
     "clean_text", "no_clean_text",
     "min_response_words", "uppercase_response", "max_samples", "shuffle",
     "shuffle_seed", "seq_len", "pack", "pack_algo", "ga_loss",
-    "profile_dequant", "dequant_mode", "dequant_cache",
+    "profile_dequant", "dequant_mode", "dequant_cache", "expert_loop",
     "targets", "train_embeddings", "lr_groups",
     "train_head", "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
 
@@ -150,6 +150,7 @@ EBFT_KEYS = {
     # runtime knobs shared with the SFT trainer
     "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk", "head_vocab_chunk",
     "offload_activations", "offload_mode", "use_liger", "dequant_mode",
+    "expert_loop",
     # live sample generations (shared with the SFT trainer)
     "sample_every", "sample_prompt",
     # local run report
@@ -187,6 +188,7 @@ GRPO_KEYS = {
     # runtime knobs shared with the SFT trainer
     "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk", "head_vocab_chunk",
     "offload_activations", "offload_mode", "use_liger", "dequant_mode",
+    "expert_loop",
     # local run report
     "no_report", "run_name",
 }
@@ -230,7 +232,7 @@ PREF_KEYS = {
     # runtime knobs shared with the SFT trainer
     "compute_dtype", "no_grad_ckpt", "attn_impl", "ce_chunk",
     "head_vocab_chunk", "offload_activations", "offload_mode", "use_liger",
-    "dequant_mode", "dequant_cache",
+    "dequant_mode", "dequant_cache", "expert_loop",
 }
 
 # Preference-only knobs at the backend's argparse defaults. Mirrors

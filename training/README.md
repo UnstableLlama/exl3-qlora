@@ -226,6 +226,13 @@ routed/shared post-norms, per-expert scale). Plain
 paths only; opt in to the routed
 experts with `--targets ... expert_gate_proj expert_up_proj expert_down_proj`
 (consider a small `--expert-r` — it's one adapter pair per expert per layer).
+A layer's routed experts run stacked: one reconstruct, one pair of Hadamard
+passes and one grouped GEMM per projection over every routed expert, with the
+LoRA factors still one pair per expert (same adapter keys, same merge).
+`--expert-loop` (`expert_loop: true`) runs them one expert at a time as the
+trainer did before; quant-aware runs, `--dequant-mode legacy`, streamed
+experts and expert ranks that are not a multiple of 8 take the loop on their
+own.
 The router is always frozen and no aux load-balancing loss is added. Caveat:
 routed-expert adapters DO apply in native generation (fixed in Session 26,
 box-verified end-to-end in Session 28 — `expert_demo.py` shows the trained

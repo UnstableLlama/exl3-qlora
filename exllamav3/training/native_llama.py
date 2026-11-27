@@ -2322,8 +2322,8 @@ class NativeLlamaQLoRA(nn.Module):
             mlp_out = d if mlp_out is None else mlp_out + d
         return mlp_out
 
-    # Stacked routed-expert path (training.expert_bank); EXL3_TRAIN_EXPERT_BANK=0
-    # keeps the per-expert loop.
+    # Stacked routed-expert path (training.expert_bank). The trainers' --expert-loop
+    # and EXL3_TRAIN_EXPERT_BANK=0 keep the per-expert loop.
     expert_bank_enabled = os.environ.get("EXL3_TRAIN_EXPERT_BANK", "1") != "0"
 
     def _expert_banks(self, entry):

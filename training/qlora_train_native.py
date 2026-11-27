@@ -2413,6 +2413,13 @@ def _run_main():
                          "inference reconstruct_hgemm math). legacy: the original "
                          "full get_weight_tensor per reconstruction, kept for A/B "
                          "and reproducing old runs.")
+    ap.add_argument("--expert-loop", action="store_true",
+                    help="MoE: run each routed expert through its own three "
+                         "projection calls, as the trainer did before the "
+                         "stacked path (exllamav3/training/expert_bank.py), "
+                         "which runs a projection of every routed expert at "
+                         "once. Several times slower on a large MoE, a little "
+                         "less VRAM; kept for A/B and reproducing old runs.")
     ap.add_argument("--dequant-cache", action="store_true",
                     help="Opt-in: reuse each frozen weight between the checkpoint-"
                          "recompute forward and its backward (3 -> 2 dequants per "
@@ -2492,6 +2499,8 @@ def _run_main():
 
     from exllamav3.training import backbone as _backbone_cfg
     _backbone_cfg.set_dequant_mode(args.dequant_mode)
+    if args.expert_loop:
+        NativeLlamaQLoRA.expert_bank_enabled = False
 
     # Dataset-mix continuity: a fresh run snapshots its data files into
     # <out>/dataset/ (copy + sha256); a resume verifies the config's paths
