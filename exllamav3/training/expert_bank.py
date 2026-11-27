@@ -122,13 +122,14 @@ class ExpertBank:
 
     def active(self) -> bool:
         """Whether the stacked path reproduces the wrappers' forward right
-        now: off under quant-aware noise, the legacy dequant mode, a PiSSA
-        residual base, or wrappers that disagree on being enabled."""
+        now: off under quant-aware noise or the legacy dequant mode, and when
+        the wrappers disagree on being enabled or on carrying a PiSSA offset."""
         if backbone.dequant_mode() != "fast":
             return False
-        enabled = self.wrappers[0].adapter_enabled
+        first = self.wrappers[0]
+        enabled, pissa = first.adapter_enabled, first.init_a0 is not None
         for w in self.wrappers:
-            if w._qa_active() or w.init_a0 is not None or w.adapter_enabled != enabled:
+            if w._qa_active() or w.adapter_enabled != enabled or (w.init_a0 is not None) != pissa:
                 return False
         return True
 
@@ -140,6 +141,10 @@ class ExpertBank:
         first = self.wrappers[0]
         x = x.to(first.compute_dtype)
         lora = self.r > 0 and first.adapter_enabled
+        # PiSSA residual base: the frozen principal component each wrapper
+        # subtracts from its weight, here as a low-rank term on the undropped
+        # rows (dropped together with the adapter in the reference view).
+        pissa = lora and first.init_a0 is not None
         drop = first.lora_drop if (lora and first.training) else None
         outs = []
         start = 0
@@ -159,6 +164,10 @@ class ExpertBank:
                 b = torch.stack([self.wrappers[e].lora_b for e in ids]).to(x.dtype)
                 xin = drop(rows) if drop is not None else rows
                 y = y + self.scale * grouped_matmul(grouped_matmul(xin, a, offsets), b, offsets)
+            if pissa:
+                a0 = torch.stack([self.wrappers[e].init_a0 for e in ids]).to(x.dtype)
+                b0 = torch.stack([self.wrappers[e].init_b0 for e in ids]).to(x.dtype)
+                y = y - self.scale * grouped_matmul(grouped_matmul(rows, a0, offsets), b0, offsets)
             outs.append(y)
             start = end
         return outs[0] if len(outs) == 1 else torch.cat(outs)

@@ -151,14 +151,37 @@ def test_bank_adapters_disabled_is_frozen_base():
     assert not entry._expert_bank_triple[0].active()
 
 
+def test_bank_pissa_offset_matches_loop():
+    net, entry, meta, experts = _block(seed=31)
+    g = torch.Generator().manual_seed(32)
+    for w in experts:
+        w.set_init_offset(torch.randn(w.lora_a.shape, generator=g, dtype=DT) * 0.1,
+                          torch.randn(w.lora_b.shape, generator=g, dtype=DT) * 0.1)
+    x = torch.randn(1, 8, D, dtype=DT) * 0.5
+    with_offset = _run(net, entry, meta, x, True)
+    assert entry._expert_bank_triple[0].active()
+    _assert_matches_loop(net, entry, meta, experts, x)
+    # The offset is live: clearing it changes the output.
+    for w in experts:
+        w.init_a0 = w.init_b0 = None
+    assert not torch.allclose(_run(net, entry, meta, x, True), with_offset)
+    # Reference view drops the offset with the adapter, as the loop does.
+    net, entry, meta, experts = _block(seed=31)
+    for w in experts:
+        w.set_init_offset(torch.randn(w.lora_a.shape, generator=g, dtype=DT) * 0.1,
+                          torch.randn(w.lora_b.shape, generator=g, dtype=DT) * 0.1)
+        w.adapter_enabled = False
+    torch.testing.assert_close(_run(net, entry, meta, x, True), _run(net, entry, meta, x, False),
+                               rtol=1e-10, atol=1e-12)
+
+
 def test_bank_refuses_what_it_cannot_stack():
     _, entry, _, _ = _block(seed=17)
     assert _eb.build_bank(entry.expert_gates) is not None
-    # A PiSSA residual base turns the stacked path off at call time.
+    # A PiSSA offset on some experts only turns the stacked path off at call time.
     w = entry.expert_gates[2]
-    w.init_a0 = torch.zeros_like(w.lora_a)
+    w.set_init_offset(torch.zeros_like(w.lora_a), torch.zeros_like(w.lora_b))
     assert not _eb.build_bank(entry.expert_gates).active()
-    w.init_a0 = None
     # A streamed expert carries an instance-level reconstruct hook.
     inner = entry.expert_ups[1].linear.inner
     inner.get_inner_weight_tensor = lambda **k: None
